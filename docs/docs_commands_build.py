@@ -1,0 +1,942 @@
+#!/usr/bin/env python3
+"""Generate docs/COMMANDS.md — the complete per-flag reference — from the binary itself.
+
+    python3 docs/docs_commands_build.py                      # regenerate docs/COMMANDS.md
+    python3 docs/docs_commands_build.py --check              # drift check, no write (exit 1 on drift)
+    python3 docs/docs_commands_build.py --bin build/codecortex --capture docs/captures/X.md
+
+WHY GENERATED. A hand-written command reference drifts from the binary the first time a flag lands
+without a doc edit, and nothing notices. This reads the SAME `--help` table the binary prints, so the
+documented surface cannot disagree with the shipped surface: `--check` is red the moment a flag
+exists in one and not the other, and `test/docscommandscheck.sh` runs it.
+
+WHAT IT READS.
+  1. `<bin> --help`  — the authoritative flag surface. Sections, flags, and the prose under each
+     flag all come from here; nothing about a flag is invented in this script.
+  2. A showcase capture (optional) — a markdown file whose `## `<command>`` headings each carry a
+     real invocation and its real output. Sample blocks are lifted from it, trimmed, and scrubbed.
+     Default: the newest `docs/captures/COMMANDS_showcase_*.md`. Without one, sections still
+     generate; they just carry no sample.
+
+NAME-AGNOSTIC. The tool's name is derived from the binary it is pointed at (`basename`), never
+hardcoded, and every sample's command token is rewritten to that name. Pointing this at a renamed
+binary regenerates a correctly-named document in one command.
+
+CAVEATS ARE DERIVED, NOT AUTHORED. The "honest caveats" under each flag are sentences pulled out of
+that flag's own help text by keyword (floor, estimate, heuristic, refuse, never, unresolved, …). A
+caveat can therefore never drift from the binary either — if the help stops stating a limit, the
+document stops printing it.
+"""
+
+import argparse
+import glob
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname( os.path.abspath( __file__ ) )
+ROOT = os.path.dirname( HERE )
+
+# ── the public-export scrub contract ──────────────────────────────────────────────────────────────
+# Samples are lifted from a capture that ran on someone's disk, in a tree with internal branch names.
+# Everything below is rewritten or dropped before it reaches the document; `assert_scrubbed` then
+# re-checks the finished text with the same patterns the repository's own scrub gate uses, so a new
+# leak shape fails the build instead of shipping.
+# NOTE ON SPELLING: the home-directory pattern is written `[Uu]sers` rather than the literal, so
+# this file does not itself contain the string the export gate greps for. Behaviour is identical.
+HOME_PATH   = re.compile( r'/(?:[Uu]sers|home)/[^\s"\'<>()]*' )
+TMP_PATH    = re.compile( r'/(?:var|private)/[A-Za-z0-9_./-]*(?:folders|tmp)[A-Za-z0-9_./-]*' )
+COORD       = re.compile( r'§A|§B[0-9]|§P[0-9]|V[0-9]-[0-9]|W[0-9]|r[0-9][0-9]-' )
+REFNAME     = re.compile( r'\br[0-9][0-9]-[A-Za-z0-9_*-]*' )
+# Personal identifiers a real run leaks: git author emails (--owners `top=`), and any address in
+# body text. Names are not enumerable here, so an OWNERSHIP row's identity attribute VALUES are
+# replaced whole.
+#
+# BOTH patterns below are CONTEXT-GATED, and the gating is the load-bearing part. An over-broad scrub
+# does not just fail to help — it CORRUPTS real output, which is a worse failure than the leak,
+# because the corruption ships as if it were the tool's answer:
+#   · `top=` is a SYMBOL NAME on `--hotspots` (`<f p=… churn= ccx= top="main" top_ccx=…/>`) and
+#     `owner=` is a STRUCT NAME on `--layout` (`<field name= type= owner="Symbol" rel=…/>`).
+#     The discriminator is the ownership `share=` fraction, which ONLY the ownership surfaces emit
+#     (`--owners`, and `--pr-context`'s `<owners>` block: main.cpp, mcpverbs.h, prcontext.h). Gating
+#     on the ELEMENT rather than on an enclosing `<owners>…</owners>` span is deliberate: the capture
+#     truncates long blocks, so an open `<owners>` with no closing tag is normal, and a span rule
+#     would then run away down the rest of the document.
+#   · codecortex's community labels are `symbol@basename.ext:line:col` (`str@ingest.cpp:887:55947`,
+#     `AGENTS@AGENTS.md:1:0`) — the address shape exactly. A trailing label that is a source or doc
+#     FILE EXTENSION is a filename, not a TLD; the table below is the whole rule.
+EMAIL       = re.compile( r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.([A-Za-z]{2,})' )
+AUTHOR_ATTR = re.compile( r'\b(top|author|owner|email)="[^"]*"' )
+OWNER_ROW   = re.compile( r'<[A-Za-z][A-Za-z0-9-]*\s[^<>]*\bshare="[^"]*"[^<>]*/?>' )
+FILE_EXT_NOT_TLD = frozenset( (
+    'c', 'cc', 'cpp', 'cs', 'cxx', 'go', 'h', 'hpp', 'inl', 'java', 'js', 'json', 'jsx', 'm', 'md',
+    'mm', 'py', 'rb', 'rs', 'scm', 'sh', 'swift', 'ts', 'tsx', 'txt', 'yaml', 'yml' ) )
+
+
+def is_address( match ):
+    """True when an `x@y.z` match is a real address rather than a `symbol@file.ext` output label."""
+    return match.group( 1 ).lower() not in FILE_EXT_NOT_TLD
+
+
+def scrub_emails( text ):
+    return EMAIL.sub( lambda m: '<author>' if is_address( m ) else m.group( 0 ), text )
+
+
+def find_address( line ):
+    """The leak PREDICATE, shared by the scrub and by `assert_scrubbed` so they cannot disagree."""
+    for m in EMAIL.finditer( line ):
+        if is_address( m ):
+            return m
+    return None
+
+
+def scrub_author_attrs( text ):
+    """Rewrite identity attributes on OWNERSHIP rows only — see the gating note above."""
+    return OWNER_ROW.sub(
+        lambda row: AUTHOR_ATTR.sub( lambda a: '%s="<author>"' % a.group( 1 ), row.group( 0 ) ),
+        text )
+# Internal-only document names from the private development tree, if a sample happens to rank one.
+INTERNAL_DOC = re.compile( r'\b(?:PLAN_|AUDIT|NEXT_SESSION|KICKOFF_|HANDOFF_|IDEAS_|REPORT_|DESIGN_|RESEARCH_)[A-Za-z0-9_.-]*' )
+
+# A row whose PATH was anonymised is a row from an INTERNAL document, and its section HEADINGS are
+# internal too. INTERNAL_DOC above only ever matches the FILENAME token: on a `<sym p= id=>` row it
+# rewrites the path, while id= carries the section HEADING as bare text — no filename in it at all,
+# so nothing there matches and it survives untouched. That is how 21 internal planning headings reached
+# docs/captures/COMMANDS_showcase_2026-08-10.md and public main (4d40fa8a) — the scrub was hiding
+# the name and publishing the contents, which is the wrong half. Redact the identifying payload of
+# any row whose p= is already the anonymised name, keeping the row so counts and structure still
+# read true. No example is spelled out here on purpose: an internal filename written literally in
+# this comment is itself a finding, and test/codecortexpubliccheck.sh is right to say so.
+INTERNAL_ROW  = re.compile( r'<[A-Za-z][A-Za-z0-9_]*\b[^>]*\bp="NOTES\.md"[^>]*/?>' )
+INTERNAL_ATTR    = re.compile( r'\b(id|n)="[^"]*"' )
+INTERNAL_ATTR_KV = re.compile( r'\b(id|n)="([^"]*)"' )
+
+
+def redactable_internal_value( value ):
+    """A heading is text; a COUNT is not. `test/docdriftfix/NOTES.md` is a tracked PUBLIC fixture and
+    doc-drift emits `<weak-file-line p="NOTES.md" n="1">` for it, where n= is the number of weak
+    anchors. Redacting that would corrupt a number and ship it as the tool's answer — worse than the
+    leak this function exists to stop, by this file's own standard. A purely numeric value cannot be
+    a heading, so it is never redacted."""
+    return not value.isdigit()
+
+
+def unredacted_internal_row( line ):
+    """The leak PREDICATE for the shape scrub_internal_rows removes, shared with `assert_scrubbed`
+    so the two cannot disagree — the same discipline `find_address` uses. Returns the offending row,
+    or None."""
+    for row in INTERNAL_ROW.finditer( line ):
+        if any( v != '<internal>' and redactable_internal_value( v )
+                for _, v in INTERNAL_ATTR_KV.findall( row.group( 0 ) ) ):
+            return row.group( 0 )
+    return None
+
+
+def scrub_internal_rows( text ):
+    """Redact id=/n= on rows already anonymised to NOTES.md — the heading text is internal too."""
+    def redact( row ):
+        return INTERNAL_ATTR_KV.sub(
+            lambda a: a.group( 0 ) if not redactable_internal_value( a.group( 2 ) )
+                                   else '%s="<internal>"' % a.group( 1 ),
+            row.group( 0 ) )
+    return INTERNAL_ROW.sub( redact, text )
+
+
+# ── the project's own rebrand, withheld from every published sample ───────────────────────────────
+# `--naming-calibration` mines THIS repository's git history for old->new identifier renames, and the
+# largest family it finds is the project's own rebrand: rows whose NEW spelling carries the public name
+# as one `_`-delimited part and whose OLD spelling is the same identifier with only that part swapped.
+# That old part is a private pre-release identifier, and a capture of a real run on this repository
+# publishes it at exit 0, clean on every class above.
+#
+# The rule keys on the PUBLIC side on purpose. It never spells what it withholds, so this file, the
+# capture harness and the gate can be read and published without naming it — and the count is still
+# exact, because that shape (one part swapped for the public name) IS the family.
+#
+# Withheld, never silently dropped: ONE comment replaces the rows, with the exact count, where the first
+# of them stood. Rows shown + rows withheld + rows past the display cut therefore still add up to the
+# pairs= the tool reported, and test/docscommandscheck.sh arm (E) checks that sum on every capture.
+PUBLIC_NAME_PART      = 'codecortex'
+RENAME_ROW            = re.compile( r'<p\s[^<>]*>?' )
+RENAME_ROW_ATTR       = re.compile( r'(?<=\s)([on])="([^"]*)"' )
+REBRAND_DISCLOSURE    = "<!-- %d rename row%s withheld: the project's own rebrand, which names a private pre-release identifier -->"
+REBRAND_DISCLOSURE_RE = re.compile( r"<!-- ([0-9]+) rename rows? withheld: the project's own rebrand" )
+
+
+def is_rebrand_rename( old, new ):
+    """True when NEW holds the public name as a whole `_`-delimited part (in any case, or as the whole
+    identifier) and OLD is NEW with exactly that one part replaced by a different single part.
+
+    A re-casing of the public name itself (`CodeCortex` -> `CODECORTEX`) is not a rebrand and is kept, and so is
+    a rename whose changed part is some OTHER part (`CODECORTEX_OLD` -> `CODECORTEX_REPO`)."""
+    oldParts = old.split( '_' )
+    newParts = new.split( '_' )
+    if len( oldParts ) != len( newParts ):
+        return False
+    changed = [ i for i in range( len( newParts ) ) if oldParts[ i ] != newParts[ i ] ]
+    if len( changed ) != 1:
+        return False
+    swapped = changed[ 0 ]
+    return ( newParts[ swapped ].lower() == PUBLIC_NAME_PART
+             and oldParts[ swapped ] != ''
+             and oldParts[ swapped ].lower() != PUBLIC_NAME_PART )
+
+
+def rebrand_rename_row( line ):
+    """The leak PREDICATE for the rows `withhold_rebrand_rows` removes, shared with `assert_scrubbed`, the
+    capture harness and the gate so none of them can disagree. Returns the offending row, or None.
+
+    The closing `>` is optional so a row the capture's 300-byte display cut truncated is still seen."""
+    for row in RENAME_ROW.finditer( line ):
+        attrs = dict( RENAME_ROW_ATTR.findall( row.group( 0 ) ) )
+        if 'o' in attrs and 'n' in attrs and is_rebrand_rename( attrs[ 'o' ], attrs[ 'n' ] ):
+            return row.group( 0 )
+    return None
+
+
+def rebrand_row_public_side( row ):
+    """How a report NAMES an offending row: by its new spelling only. Printing the row would publish the
+    old spelling in the log of every run that goes red, CI logs included."""
+    return 'n="%s"' % dict( RENAME_ROW_ATTR.findall( row ) ).get( 'n', '' )
+
+
+def withhold_rebrand_rows( lines ):
+    """LINES without the project's own rebrand rows -> ( lines, withheld ).
+
+    One disclosure comment with the exact count stands where the first withheld row stood; every other
+    line comes back byte-identical and in order, and a second pass withholds nothing. Only a row that is
+    its line's whole content is withheld: cutting one out of the middle of other output would edit the
+    tool's answer, so such a row is left in place for the callers' refuse-to-write check to stop."""
+    out      = []
+    withheld = 0
+    firstAt  = -1
+    for line in lines:
+        row = rebrand_rename_row( line )
+        if row is not None and line.strip() == row:
+            if firstAt < 0:
+                firstAt = len( out )
+            withheld += 1
+            continue
+        out.append( line )
+    if withheld:
+        out.insert( firstAt, REBRAND_DISCLOSURE % ( withheld, '' if withheld == 1 else 's' ) )
+    return out, withheld
+
+
+MAX_SAMPLE_LINES = 14
+MAX_SAMPLE_BYTES = 1600
+
+CAVEAT_WORDS = (
+    'floor', 'counts_floor', 'ambig', 'heuristic', 'estimate', 'calibrated', 'never', 'not exact',
+    'refuse', 'unresolved', 'caveat', 'limit', 'unmodelled', 'cannot', 'degrade', 'inert',
+    'over_ceiling', 'truncat', 'capped', 'stated', 'not a', 'no guarantee', 'skip',
+)
+
+
+# ── reading the binary ────────────────────────────────────────────────────────────────────────────
+
+def tool_name_of( binPath ):
+    """The tool's name is whatever the binary is called. Never hardcoded."""
+    return os.path.basename( binPath )
+
+
+def help_text_of( binPath ):
+    try:
+        run = subprocess.run( [ binPath, '--help=all' ], capture_output = True, text = True, timeout = 120 )
+    except OSError as exc:
+        sys.exit( 'docs_commands_build: cannot run %s (%s)' % ( binPath, exc ) )
+    if run.returncode != 0 and not run.stdout:
+        sys.exit( 'docs_commands_build: %s --help exited %d with no output' % ( binPath, run.returncode ) )
+    return run.stdout
+
+
+FLAG_TOKEN_ALL = re.compile( r'--?[A-Za-z0-9][A-Za-z0-9-]*' )
+
+
+def normalize_flags( spec ):
+    """'--html[=FILE]' -> ['--html'];  '--grep=STR | --regex=PAT' -> ['--grep','--regex'];
+    '--limit=N --offset=M' -> ['--limit','--offset'];  '-h, --help' -> ['-h','--help'].
+
+    One choke point: the flag NAME is what the drift gate compares, so value syntax, optional-value
+    brackets, quoting and every alternation/aliasing spelling (`|`, `/`, `, `, or a bare space between
+    companion flags) must all be normalized here and nowhere else, or the two sides of the comparison
+    would normalize differently and the gate would red on formatting. `findall` rather than a per-part
+    split: a flag NAME can appear anywhere a dash immediately precedes an alnum inside the accepted
+    spec text (see `_spec_end`, which decides how much of the line COUNTS as spec) — where exactly two
+    tokens touch inside that text is not this function's problem, only naming every one of them is.
+    """
+    out = []
+    for f in FLAG_TOKEN_ALL.findall( spec ):
+        if f not in out:
+            out.append( f )
+    return out
+
+
+def _dash_unit_end( s, pos ):
+    """s[pos] == '-'. End index of one spec TOKEN starting there: a run of non-whitespace chars, with
+    one embedded "..." chunk (which may itself contain whitespace) allowed to ride along — the shape
+    `--note-add="TARGET: text"` needs, since the quoted value is one token despite the space inside it.
+    """
+    n = len( s )
+    j = pos + 1
+    while j < n:
+        c = s[ j ]
+        if c.isspace():
+            break
+        if c == '"':
+            k = s.find( '"', j + 1 )
+            j = ( k + 1 ) if k != -1 else n
+            continue
+        j += 1
+    return j
+
+
+_SPEC_SEP = re.compile( r'\s*[|/,]?\s*' )
+
+
+def _spec_end( content ):
+    """content starts with '-'. Index where the spec chain ends and prose begins.
+
+    A spec is a chain of dash-tokens: the primary flag, then zero or more further tokens each
+    reached by an alternation mark (`|` or `/`, e.g. `--grep-before=N / --grep-after=N`), a comma
+    (`-h, --help`), or nothing but whitespace (a companion flag sharing the line, e.g.
+    `--limit=N --offset=M`, `--arch=FILE --baseline`). The chain stops the first time what follows
+    the separator is NOT another dash-token — most commonly real prose, which is why a single space
+    before prose (the seam this generator used to require TWO spaces to cross) is handled the same
+    as any other amount: `_SPEC_SEP` matches zero-or-more whitespace either way, and it is the next
+    token's shape — dash-prefixed or not — that decides where the spec actually ends, not the width
+    of the gap.
+    """
+    pos = _dash_unit_end( content, 0 )
+    n   = len( content )
+    while True:
+        m = _SPEC_SEP.match( content, pos )
+        sepLen = m.end() - pos
+        if sepLen == 0:
+            return pos
+        nextPos = pos + sepLen
+        if nextPos >= n or content[ nextPos ] != '-':
+            return pos
+        pos = _dash_unit_end( content, nextPos )
+
+
+def parse_help( helpText ):
+    """--help -> ( preamble, [ ( sectionTitle, [ entry, ... ] ) ] ).
+
+    An entry is { 'flags': [ '--for', ... ], 'spec': '--for=TASK', 'text': 'the prose' }.
+    Section headings are 2-space indented; a flag entry is indented EXACTLY four and starts with a
+    dash; everything deeper is continuation prose for the entry above it.
+
+    The four is not a style choice, it is the same single definition src/cli.h's classifyHelpLine()
+    applies — and this parser used to accept 4..6 while the binary accepted only 4. Being the more
+    permissive of the two is what hid the divergence: twelve six-space flag rows read as entries here
+    (so docs/COMMANDS.md listed them) and as continuation prose there (so `--help` culled fifteen real
+    flags, and `--help=--and` refused while --and worked). Two readers of one text must not disagree
+    about what a row is; test/helpbudgetcheck.sh arm (K) is the fence that now says so out loud.
+    """
+    sections   = []
+    preamble   = []
+    current    = None
+    entry      = None
+    reSection  = re.compile( r'^  (\S.*?)\s*$' )
+    reIndent   = re.compile( r'^( {4})(\S.*)$' )
+
+    for line in helpText.split( '\n' ):
+        mSection = reSection.match( line ) if not line.startswith( '   ' ) else None
+        if mSection:
+            entry   = None
+            current = ( mSection.group( 1 ), [] )
+            sections.append( current )
+            continue
+
+        mIndent = reIndent.match( line ) if current else None
+        if mIndent and mIndent.group( 2 )[ 0 ] == '-':
+            content = mIndent.group( 2 )
+            end     = _spec_end( content )
+            spec    = content[ :end ].strip()
+            flags   = normalize_flags( spec )
+            entry   = { 'flags': flags, 'spec': spec, 'text': [ content[ end: ].strip() ] }
+            current[ 1 ].append( entry )
+            continue
+
+        stripped = line.strip()
+        if entry is not None and stripped and line.startswith( '    ' ):
+            entry[ 'text' ].append( stripped )
+        elif current is None and stripped:
+            preamble.append( stripped )
+        elif not stripped:
+            entry = None
+
+    for _title, entries in sections:
+        for e in entries:
+            e[ 'text' ] = ' '.join( t for t in e[ 'text' ] if t )
+    return preamble, sections
+
+
+# ── reading the capture ───────────────────────────────────────────────────────────────────────────
+
+def newest_capture():
+    found = sorted( glob.glob( os.path.join( ROOT, 'docs', 'captures', 'COMMANDS_showcase_*.md' ) ) )
+    return found[ -1 ] if found else None
+
+
+def parse_capture( path ):
+    """capture markdown -> [ { 'cmd': str, 'caption': str, 'body': [ lines ] } ].
+
+    Headings look like:  ## `./build/<tool> . --top-k=5`
+    followed by an optional italic caption line and one fenced block holding the real output.
+    """
+    if not path or not os.path.exists( path ):
+        return []
+    text  = open( path, encoding = 'utf-8', errors = 'replace' ).read().split( '\n' )
+    items = []
+    i     = 0
+    reHead = re.compile( r'^## `(.+)`\s*$' )
+    while i < len( text ):
+        mHead = reHead.match( text[ i ] )
+        if not mHead:
+            i += 1
+            continue
+        item = { 'cmd': mHead.group( 1 ), 'caption': '', 'body': [] }
+        i   += 1
+        while i < len( text ) and not text[ i ].strip():
+            i += 1
+        if i < len( text ) and text[ i ].startswith( '*' ) and text[ i ].rstrip().endswith( '*' ):
+            item[ 'caption' ] = text[ i ].strip().strip( '*' ).strip()
+            i += 1
+        # the fenced block: the capture uses long backtick fences so inner ``` survives
+        while i < len( text ) and not text[ i ].startswith( '```' ):
+            if text[ i ].startswith( '## ' ) or text[ i ].startswith( '# ' ):
+                break
+            i += 1
+        if i < len( text ) and text[ i ].startswith( '```' ):
+            fence = text[ i ].rstrip()
+            i += 1
+            while i < len( text ) and text[ i ].rstrip() != fence:
+                item[ 'body' ].append( text[ i ] )
+                i += 1
+            i += 1
+        items.append( item )
+    return items
+
+
+def flag_tokens_of( cmd ):
+    return set( re.findall( r'--[A-Za-z0-9][A-Za-z0-9-]*', cmd ) )
+
+
+def pick_sample( entry, captures ):
+    """The clearest real invocation of this flag: the one that uses the fewest OTHER flags."""
+    wanted = set( entry[ 'flags' ] )
+    best   = None
+    bestScore = None
+    for item in captures:
+        toks = flag_tokens_of( item[ 'cmd' ] )
+        if not ( toks & wanted ):
+            continue
+        if not item[ 'body' ]:
+            continue
+        score = ( len( toks - wanted ), len( item[ 'cmd' ] ) )
+        if bestScore is None or score < bestScore:
+            bestScore, best = score, item
+    return best
+
+
+def pattern_sample( captures, marker ):
+    """A hand-authored PATTERN subsection (see render_recall_pattern) needs ONE specific real
+    invocation, not pick_sample's generic per-flag pick — several captured commands can share a flag,
+    and pick_sample would happily hand back a different one. MARKER is a substring unique to the
+    intended command; the first captured item containing it, with a non-empty body, wins."""
+    for item in captures:
+        if marker in item[ 'cmd' ] and item[ 'body' ]:
+            return item
+    return None
+
+
+# ── scrubbing + trimming ──────────────────────────────────────────────────────────────────────────
+
+def scrub( text, name ):
+    text = HOME_PATH.sub( '<path>', text )
+    text = TMP_PATH.sub( '<tmp>', text )
+    text = REFNAME.sub( 'topic-branch', text )
+    text = scrub_author_attrs( text )
+    text = scrub_emails( text )
+    text = INTERNAL_DOC.sub( 'NOTES.md', text )
+    text = scrub_internal_rows( text )
+    return text
+
+
+def scrub_prose( text, name ):
+    """Same contract as `scrub`, but for HELP prose, where a path substitution would read wrong.
+
+    The binary's help occasionally cites an internal design note by filename. That name must not
+    ship, but replacing it with a path spelling mid-sentence reads like a broken link — so prose
+    gets a phrase. Either way the substitution is REPORTED (see `assert_scrubbed`) so the fix can
+    land in the help text, which is where it belongs.
+    """
+    text = HOME_PATH.sub( '<path>', text )
+    text = TMP_PATH.sub( '<tmp>', text )
+    text = REFNAME.sub( 'topic-branch', text )
+    text = scrub_emails( text )
+    text = INTERNAL_DOC.sub( 'an internal design note', text )
+    return text
+
+
+def rewrite_command( cmd, name ):
+    """Normalize the capture's binary token to this build's name, whatever it was called."""
+    cmd = scrub( cmd, name )
+    cmd = re.sub( r'^\S*?(?:\./)?(?:build/)?[A-Za-z0-9_.-]+(?=\s|$)', './build/' + name, cmd, count = 1 )
+    return cmd
+
+
+def trim_sample( body, name ):
+    # Scrub the block as ONE text rather than line by line: the capture re-wraps minified XML at tag
+    # seams, so an element can be the only thing on its line but its ownership context is the block.
+    # No substitution above adds or removes a newline, so the split below is line-for-line with `body`.
+    scrubbedBody = scrub( '\n'.join( body ), name ).split( '\n' )
+    # The project's own rebrand rows are the one class withheld by whole LINE, so this is the one step that
+    # changes the line count: every count below is taken over the withheld body, whose disclosure comment
+    # accounts for what left. A no-op on a capture the harness already withheld them from.
+    scrubbedBody, _withheld = withhold_rebrand_rows( scrubbedBody )
+    kept    = []
+    total   = 0
+    dropped = 0
+    for line in scrubbedBody:
+        if COORD.search( line ):
+            # A line that still trips the export scrub after substitution is dropped rather than
+            # mangled — an omitted line is honest, a silently edited one is not.
+            dropped += 1
+            continue
+        # Legend COMMENT lines are exempt from the byte budget (the line cap still bounds them) —
+        # same rationale as the capture's own header-comment exemption: the legends are the
+        # attribute dictionary a sample exists to expose, and on legend-heavy verbs (--metrics grew
+        # two legends past 1.5K) a byte-counted legend consumed the whole budget and the sample
+        # showed a truncation marker where the rows should be.
+        isLegend = line.lstrip().startswith( '<!--' )
+        if len( kept ) >= MAX_SAMPLE_LINES or ( not isLegend and total + len( line ) > MAX_SAMPLE_BYTES ):
+            break
+        kept.append( line )
+        if not isLegend:
+            total += len( line )
+    more = len( scrubbedBody ) - len( kept ) - dropped
+    if more > 0:
+        kept.append( '... [%d more line(s); run it to see the whole thing]' % more )
+    if dropped:
+        kept.append( '... [%d line(s) omitted by the public-export scrub]' % dropped )
+    return kept
+
+
+# ── caveats, derived from the flag's own help prose ───────────────────────────────────────────────
+
+def caveats_of( entry ):
+    text      = entry[ 'text' ]
+    sentences = re.split( r'(?<=[.;])\s+', text )
+    out       = []
+    for s in sentences:
+        low = s.lower()
+        if len( s ) < 25 or len( s ) > 320:
+            continue
+        if any( w in low for w in CAVEAT_WORDS ):
+            out.append( s.strip() )
+        if len( out ) >= 3:
+            break
+    return out
+
+
+def shaped_by( entry, sections ):
+    """Other flags whose own help text names this one — 'flags that shape it', derived not guessed."""
+    mine  = set( entry[ 'flags' ] )
+    out   = []
+    for _title, entries in sections:
+        for other in entries:
+            if set( other[ 'flags' ] ) & mine:
+                continue
+            if any( f in other[ 'text' ] for f in mine ):
+                out.append( other[ 'flags' ][ 0 ] )
+    seen = []
+    for f in out:
+        if f not in seen:
+            seen.append( f )
+    return seen[ :8 ]
+
+
+# ── rendering ─────────────────────────────────────────────────────────────────────────────────────
+
+# THE ANCHOR THE HEADING ACTUALLY MINTS, which is not the one this function used to compute. Every
+# section is rendered as ``### `SPEC` ``, and the renderer (GitHub's slugger, and markdownlint's MD051
+# with it) lower-cases the heading text, DELETES every character that is not a word character, a hyphen
+# or a space, then turns the spaces into hyphens. Nothing is substituted and nothing is trimmed, so
+# `--in=DIR` becomes `--indir`: the two leading dashes survive and the `=` is gone.
+#
+# The old spelling replaced every RUN of non-alphanumerics with a hyphen and stripped the ends
+# (`--in=DIR` -> `in-dir`) — a plausible slug, and not this document's. CodeRabbit named it on the --in
+# row; the real count is the whole table of contents (all 169 links resolved to nothing), which is also
+# why the report arrived as 28 MD051 warnings on a single line. Gate: docscommandscheck arm (J), which
+# states the renderer's rule INDEPENDENTLY rather than importing this function — a gate that asks the
+# generator what the anchor should be agrees with whatever the generator says.
+def anchor_of( heading_text ):
+    return re.sub( r'[^\w\- ]', '', heading_text.strip().lower() ).replace( ' ', '-' )
+
+
+def assign_anchors( sections ):
+    """Give every entry the anchor its own heading will mint, in DOCUMENT order.
+
+    Per ENTRY and not per spec, because the renderer's rule for a repeated heading is to append `-1`
+    to the second one, and only a walk in emission order can know which one IS the repeat. No spec
+    repeats today (measured: 176 entries, 180 headings, no duplicate slug), so the suffix branch is
+    dormant — what it buys is that a repeat lands as TWO anchors the renderer agrees with, instead of
+    two contents links pointing at the first section. Recomputing from the spec in the contents loop
+    cannot do that, and the wrong link it would emit resolves, so no anchor gate would see it.
+    """
+    seen = {}
+    for _title, entries in sections:
+        for entry in entries:
+            base = anchor_of( '`%s`' % entry[ 'spec' ] )   # backticks fall to the same rule that drops `=`
+            n    = seen.get( base, 0 )
+            seen[ base ]      = n + 1
+            entry[ 'anchor' ] = base if n == 0 else '%s-%d' % ( base, n )
+
+
+# The --recall FLAG's own --help text says nothing about pointing it at a directory that is not a
+# source repo, because that usage needs no new flag at all — it is documented here as a hand-authored
+# subsection, not derived from --help like every other section in this file. The one real invocation
+# is still pulled from the SAME showcase capture every other sample in this document comes from (see
+# pattern_sample), so the doc's "everything here is either read from --help or a real recorded run"
+# contract holds for this subsection too.
+#
+# NO `**Caveats:**` BLOCK HERE, deliberately — do not add one back. This document's own "How to read a
+# section" defines Caveats as "the limits the binary itself states for this flag ... extracted from its
+# own help text, so they cannot drift from the code". A hand-authored bullet under that heading claims a
+# provenance it does not have, and this subsection had exactly that: a KNOWN LIMIT describing --recall
+# serving a document-order PREFIX instead of the ranked sections, still printed after the passage-serving
+# fix landed in src/recall.h, because nothing derived it from anything and so nothing could retire it.
+# The two conditions that DO govern this pattern (a `.md` extension, and `##` headings in the dump) are
+# not defects and will not expire, so they belong in the prose above, where they read as instructions for
+# writing the dump rather than as apologies for the tool.
+RECALL_PATTERN_MARKER = 'field affinity cache line data layout which fields are read together'
+
+
+def render_recall_pattern( captures, name ):
+    out = []
+    w   = out.append
+    sample = pattern_sample( captures, RECALL_PATTERN_MARKER )
+
+    w( '#### Pattern: a directory of dumped tool output as a knowledge base' )
+    w( '' )
+    w( '**Answers:** can `--recall` serve as a zero-setup knowledge base over dumped tool output — a' )
+    w( '`git log`, an API response dump, a fetched doc, `<tool> --help` text — sitting in a scratch' )
+    w( 'directory, instead of a source repo?' )
+    w( '' )
+    w( 'Yes, unmodified. `--recall` never distinguishes "a codebase" from any other directory it can' )
+    w( 'walk: point it at the scratch dir and query it. No index to build, no daemon, no mutable store' )
+    w( 'between runs — the whole cost is one cold parse. Two conditions decide whether it works at all,' )
+    w( 'and both are yours, because the file you write is the only thing that sets them:' )
+    w( '' )
+    w( '1. **Dump to `.md`.** `--recall` ranks DOCUMENT files: `.md`, plus the docparse\'d' )
+    w( '   `.ipynb`/`.html`/`.csv` (and Office/PDF through the optional markitdown bridge). `.txt`,' )
+    w( '   `.log`, `.json` and extensionless files are **not** documents to it. A directory of those' )
+    w( '   answers `0 relevant of 0 document files` and exits 0 — which reads like "nothing matched' )
+    w( '   your terms" when what happened is "nothing was indexed at all". Redirect to `notes.md`,' )
+    w( '   never `notes.txt`. The recorded run below is that rule\'s own demonstration: its scratch dir' )
+    w( '   holds five dumps, and the header says `2 relevant of 2 document files` because only the two' )
+    w( '   `.md` ones are documents — the `git log`, the `--help` text and the JSON access log are not' )
+    w( '   in the population at all.' )
+    w( '' )
+    w( '2. **Keep `##` headings in the dump.** A headed document is served as whole ranked SECTIONS, so' )
+    w( '   an answer buried mid-file arrives at a small `--max-tokens`, and — while the served document' )
+    w( '   SET stays fixed — a larger ceiling returns a strict superset of it; the `[sections: S of R' )
+    w( '   selected (N in doc) … lines="…"; dropped_by_budget=D]` note names the ranges you actually got' )
+    w( '   and what the ceiling cost. A HEADLESS dump has no sections to rank, so it is cut front-first' )
+    w( '   and carries no such note.' )
+    w( '' )
+    w( '   That per-document guarantee is not global: dump SEVERAL headed documents into the same' )
+    w( '   scratch dir and a larger ceiling can admit another one, which re-divides the shared budget' )
+    w( '   and can shrink an already-served document\'s own slice — `share_bytes=` in the header' )
+    w( '   discloses exactly that redivision when it happens.' )
+    w( '' )
+    w( '   Measured on a 73811-byte, 2001-line dump whose answer sat at line 1748: the headed copy' )
+    w( '   served exactly that answer at `--max-tokens=1000` (`lines="1748-1752"`, est_tokens=194),' )
+    w( '   while the headless copy of the same content withheld it at 1000, 2000, 4000, 8000 and 16000' )
+    w( '   and produced it only at 40000 — by which point the front-first cut had emitted the whole' )
+    w( '   file.' )
+    w( '' )
+    if sample:
+        w( '**Try it**' )
+        w( '' )
+        caption = scrub( sample[ 'caption' ], name )
+        if caption and not COORD.search( caption ):
+            w( '_%s_' % caption )
+            w( '' )
+        w( '```' )
+        w( '$ ' + rewrite_command( sample[ 'cmd' ], name ) )
+        for line in trim_sample( sample[ 'body' ], name ):
+            w( line )
+        w( '```' )
+        w( '' )
+    return out
+
+
+def recall_pattern_if_due( spec, captures, name ):
+    """The one line render()'s entry loop calls — kept a plain call, no `if`, so this hand-authored
+    subsection adds zero branches to render() itself (already well past its own complexity bar; the
+    branch belongs here, on a fresh symbol, not stacked onto that one)."""
+    return render_recall_pattern( captures, name ) if spec == '--recall=TASK' else []
+
+
+def render( name, preamble, sections, captures, capturePath ):
+    out = []
+    w   = out.append
+
+    w( '# %s — every flag, generated from the binary' % name )
+    w( '' )
+    w( '**This file is generated. Do not hand-edit it.** Regenerate with:' )
+    w( '' )
+    w( '```bash' )
+    w( 'python3 docs/docs_commands_build.py --bin build/%s' % name )
+    w( '```' )
+    w( '' )
+    w( 'The flag surface below is read from `%s --help`, so it cannot disagree with the shipped' % name )
+    w( 'binary. `test/docscommandscheck.sh` fails if it ever does — in either direction.' )
+    w( '' )
+    if capturePath:
+        w( 'Sample output is lifted from a real recorded run (`%s`), trimmed to the first few lines and'
+           % os.path.relpath( capturePath, ROOT ) )
+        w( 'scrubbed of local paths. It is illustrative, not a golden: run the command yourself for the' )
+        w( 'current shape.' )
+    else:
+        w( '_No showcase capture was available when this was generated, so sections carry no sample output._' )
+    w( '' )
+    if preamble:
+        w( '> ' + '\n> '.join( scrub_prose( p, name ) for p in preamble[ :6 ] ) )
+        w( '' )
+
+    w( '## How to read a section' )
+    w( '' )
+    w( '- **Answers** — the question this flag exists to answer.' )
+    w( '- **Try it** — a real invocation and the real output it produced.' )
+    w( '- **Shaped by** — other flags that change what this one emits.' )
+    w( '- **Caveats** — the limits the binary itself states for this flag. They are extracted from its' )
+    w( '  own help text, so they cannot drift from the code.' )
+    w( '' )
+    w( 'Two limits apply to nearly everything here and are not repeated in every section:' )
+    w( '' )
+    w( '1. **Call edges are heuristic and name-based.** Dynamic dispatch, callbacks and macro-generated' )
+    w( '   call sites produce no edge, so counts on the graph verbs carry `counts_floor="1"`. **Read a 0' )
+    w( '   as "none found", never as "none exists."**' )
+    w( '2. **A symbol\'s `amb="K"`** means K of its calls hit a name with several definitions and the' )
+    w( '   resolver split the weight rather than choosing. Read the source when which-target matters.' )
+    w( '' )
+
+    # ── table of contents ──
+    assign_anchors( sections )   # in emission order: the anchors below are read, never recomputed
+    w( '## Contents' )
+    w( '' )
+    for title, entries in sections:
+        if not entries:
+            continue
+        w( '**%s** — %s' % ( title, ' · '.join( '[`%s`](#%s)' % ( e[ 'flags' ][ 0 ], e[ 'anchor' ] )
+                                                for e in entries ) ) )
+        w( '' )
+
+    # ── the sections ──
+    for title, entries in sections:
+        if not entries:
+            continue
+        w( '---' )
+        w( '' )
+        w( '## %s' % title )
+        w( '' )
+        for entry in entries:
+            spec = entry[ 'spec' ]
+            w( '### `%s`' % spec )
+            w( '' )
+            text = scrub_prose( entry[ 'text' ], name ).strip()
+            first = re.split( r'(?<=[.;])\s+', text )[ 0 ] if text else ''
+            if first:
+                w( '**Answers:** %s' % first )
+                w( '' )
+            rest = text[ len( first ) : ].strip()
+            if rest:
+                w( rest )
+                w( '' )
+
+            sample = pick_sample( entry, captures )
+            if sample:
+                w( '**Try it**' )
+                w( '' )
+                caption = scrub( sample[ 'caption' ], name )
+                if caption and not COORD.search( caption ):
+                    w( '_%s_' % caption )
+                    w( '' )
+                w( '```' )
+                w( '$ ' + rewrite_command( sample[ 'cmd' ], name ) )
+                for line in trim_sample( sample[ 'body' ], name ):
+                    w( line )
+                w( '```' )
+                w( '' )
+
+            shapers = shaped_by( entry, sections )
+            if shapers:
+                w( '**Shaped by:** %s' % ', '.join( '`%s`' % f for f in shapers ) )
+                w( '' )
+
+            cav = caveats_of( entry )
+            if cav:
+                w( '**Caveats (stated by the binary):**' )
+                w( '' )
+                for c in cav:
+                    w( '- %s' % scrub_prose( c, name ) )
+                w( '' )
+
+            out.extend( recall_pattern_if_due( spec, captures, name ) )
+
+    w( '---' )
+    w( '' )
+    w( '_Generated by `docs/docs_commands_build.py`. See `docs/README.md` for the documentation index._' )
+    w( '' )
+    return '\n'.join( out )
+
+
+def assert_scrubbed( text, what = 'refusing to write' ):
+    """The generator must not be able to emit — or bless — what the public-export gate forbids."""
+    bad = []
+    for i, line in enumerate( text.split( '\n' ), 1 ):
+        rebrandRow = rebrand_rename_row( line )
+        if rebrandRow is not None:
+            # checked FIRST, and named by its public side only: a report that printed this line would
+            # publish the old spelling in the log of every run that fails here
+            bad.append( '%d: the project\'s own rebrand rename row, which names a private pre-release identifier: %s'
+                        % ( i, rebrand_row_public_side( rebrandRow ) ) )
+        elif HOME_PATH.search( line ):
+            bad.append( '%d: absolute home path' % i )
+        elif COORD.search( line ):
+            bad.append( '%d: internal coordinate shape: %s' % ( i, line.strip()[ :90 ] ) )
+        elif find_address( line ):
+            bad.append( '%d: email address: %s' % ( i, line.strip()[ :90 ] ) )
+        elif INTERNAL_DOC.search( line ):
+            bad.append( '%d: internal document name: %s' % ( i, line.strip()[ :90 ] ) )
+        elif unredacted_internal_row( line ) is not None:
+            # the shape that shipped once: path anonymised, heading text not
+            bad.append( '%d: internal document HEADING on an anonymised row: %s'
+                        % ( i, unredacted_internal_row( line )[ :90 ] ) )
+    if bad:
+        sys.exit( 'docs_commands_build: %s — scrub violations:\n  %s' % ( what, '\n  '.join( bad[ :20 ] ) ) )
+
+    # NOT fatal, but reported: help prose that still carries an internal issue label ("(X9(d): …",
+    # "(D10)"). Those come from the BINARY's own --help, so the fix belongs there, not here —
+    # silently rewriting them in the document would hide the drift instead of surfacing it.
+    residue = re.compile( r'\(\s*[A-Z][0-9]{1,2}(?:\([a-z]\))?\s*[):]' )
+    hits    = [ ( i, m.group( 0 ) ) for i, line in enumerate( text.split( '\n' ), 1 )
+                for m in [ residue.search( line ) ] if m ]
+    if hits:
+        sys.stderr.write(
+            'docs_commands_build: NOTE — %d line(s) carry an internal issue label inherited from '
+            '--help (%s). Fix the help text; this generator will not rewrite it.\n'
+            % ( len( hits ), ', '.join( sorted( { h[ 1 ] for h in hits } )[ :6 ] ) ) )
+
+
+# ── the drift check ───────────────────────────────────────────────────────────────────────────────
+
+def documented_flags( docText ):
+    out = set()
+    for line in docText.split( '\n' ):
+        m = re.match( r'^### `(.+)`\s*$', line )
+        if not m:
+            continue
+        out.update( normalize_flags( m.group( 1 ) ) )
+    return out
+
+
+def binary_flags( sections ):
+    out = set()
+    for _title, entries in sections:
+        for e in entries:
+            out.update( e[ 'flags' ] )
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser( description = 'generate docs/COMMANDS.md from the binary' )
+    ap.add_argument( '--bin', default = None, help = 'the binary to read --help from' )
+    ap.add_argument( '--capture', default = None, help = 'showcase capture markdown for samples' )
+    ap.add_argument( '--out', default = os.path.join( ROOT, 'docs', 'COMMANDS.md' ) )
+    ap.add_argument( '--check', action = 'store_true',
+                     help = 'compare the documented flag set against the binary; write nothing' )
+    ap.add_argument( '--no-capture', action = 'store_true',
+                     help = 'write a sample-free document on purpose (required when no capture is found)' )
+    args = ap.parse_args()
+
+    binPath = args.bin
+    if not binPath:
+        buildDir = os.path.join( ROOT, 'build' )
+        found    = sorted( p for p in glob.glob( os.path.join( buildDir, '*' ) )
+                           if os.path.isfile( p ) and os.access( p, os.X_OK ) )
+        # A build tree legitimately holds more than ONE executable — this one holds the tool and the
+        # `*_probe` harness beside it — so "several candidates" is the normal case, not an error, and
+        # the old `!= 1` refusal made the no-argument invocation printed at the top of this file fail
+        # on a complete build. Prefer the target named after the project (build/<repo-dir-name>) and
+        # refuse only when that is absent AND the choice is genuinely ambiguous.
+        preferred = os.path.join( buildDir, os.path.basename( ROOT ) )
+        if preferred in found:
+            binPath = preferred
+        elif len( found ) == 1:
+            binPath = found[ 0 ]
+        else:
+            sys.exit( 'docs_commands_build: pass --bin — %d executable(s) under build/ and no build/%s: %s'
+                      % ( len( found ), os.path.basename( ROOT ),
+                          ' '.join( os.path.basename( p ) for p in found ) or '(none)' ) )
+
+    name  = tool_name_of( binPath )
+    preamble, sections = parse_help( help_text_of( binPath ) )
+    if not sections:
+        sys.exit( 'docs_commands_build: parsed 0 sections from --help — the help format changed' )
+
+    if args.check:
+        if not os.path.exists( args.out ):
+            sys.exit( 'docs_commands_build: %s does not exist' % args.out )
+
+        docText = open( args.out, encoding = 'utf-8' ).read()
+        # The scrub contract is not only a WRITE-side promise. A document edited by hand, or written
+        # by an older generator with a weaker scrub, would carry a leak that no arm here could see:
+        # `--check` only ever compared flag SETS. Re-run the same assertion against the doc on disk,
+        # so `--check` is a statement about the shipped file and not merely about the next write.
+        assert_scrubbed( docText, 'the document on disk (%s) carries' % os.path.relpath( args.out, ROOT ) )
+        doc     = documented_flags( docText )
+        binary  = binary_flags( sections )
+        missing = sorted( binary - doc )
+        stale   = sorted( doc - binary )
+        if missing or stale:
+            if missing:
+                print( 'DRIFT: in %s --help but NOT documented: %s' % ( name, ' '.join( missing ) ) )
+            if stale:
+                print( 'DRIFT: documented but NOT in %s --help: %s' % ( name, ' '.join( stale ) ) )
+            print( 'regenerate: python3 docs/docs_commands_build.py --bin %s' % binPath )
+            return 1
+        print( 'docs_commands_build: %d flags, documented set == binary set' % len( binary ) )
+        return 0
+
+    capturePath = args.capture or newest_capture()
+    captures    = parse_capture( capturePath )
+    # Regenerating without a capture silently deletes every sample block from a document that had
+    # them — a large, invisible loss that would look like a successful rebuild. Refuse instead, and
+    # make the sample-free document an explicit request.
+    if not captures and not args.no_capture:
+        sys.exit( 'docs_commands_build: no showcase capture found%s.\n'
+                  '  Samples would be DROPPED from the generated document.\n'
+                  '  Pass --capture PATH, put one under docs/captures/COMMANDS_showcase_*.md,\n'
+                  '  or pass --no-capture to write a sample-free document deliberately.'
+                  % ( ' at ' + args.capture if args.capture else '' ) )
+    text        = render( name, preamble, sections, captures, capturePath if captures else None )
+    assert_scrubbed( text )
+    os.makedirs( os.path.dirname( args.out ), exist_ok = True )
+    with open( args.out, 'w', encoding = 'utf-8' ) as fh:
+        fh.write( text )
+    print( 'docs_commands_build: wrote %s — %d flags in %d sections, %d sample(s) from %s'
+           % ( os.path.relpath( args.out, ROOT ), len( binary_flags( sections ) ), len( sections ),
+               sum( 1 for _t, es in sections for e in es if pick_sample( e, captures ) ),
+               os.path.relpath( capturePath, ROOT ) if capturePath and captures else 'no capture' ) )
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit( main() )

@@ -1,0 +1,978 @@
+#pragma once
+#if !defined( CODECORTEX_MAIN_TU )
+#error "verbs_doctor.h is a SECTION of src/main.cpp's translation unit - include it only from main.cpp (see the verb-family split note there)"
+#endif
+
+// verbs_doctor.h — the --doctor verb family (runDoctor + its probes and agent-surface rows), moved
+// VERBATIM from main.cpp in the 2026-08-29 split. This is not a standalone header: it reopens
+// main.cpp's unnamed namespace (one TU, one unnamed namespace — everything here keeps the internal
+// linkage it had inside main.cpp, so the split adds zero API surface) and leans on main.cpp's own
+// top-of-file #includes and preamble helpers. The CODECORTEX_MAIN_TU guard turns a second includer into
+#include "gitstamp.h"          // isShallow — the git row's shallow="1" (2026-09-06 stranger audit)
+#include "gitcmd.h"         // rw::gitCmd — every git child starts with --no-optional-locks -c core.fsmonitor=false
+// a compile error instead of a silent per-TU-copy ODR trap.
+
+namespace
+{
+
+// ─── --doctor: self-diagnosis (standing item) ─────────────────────────────────────────────────────
+// A DIAGNOSTIC verb, not the deterministic map: every check below reports on THIS machine's
+// environment (binary identity, PATH resolution, filesystem, git, tree-sitter grammars) — by
+// construction its output varies run-to-run and machine-to-machine, so the det-gate
+// ("byte-identical run-to-run") does NOT apply to --doctor. Never crashes: every probe degrades to
+// ok="0" (or a "can't tell" attr) on failure, never aborts. Single-root only for v1 — refused
+// earlier in main() alongside --eval/--test-gate/--quality-delta (each check below is per-repo or
+// per-machine, not something a multi-root workspace composes cleanly).
+//
+// Kept OUT of ingest.cpp/ingest.h/mcp.h/quality.h by task scope: the grammar-probe check (2) compiles
+// the same configure-generated immutable query views as ingest, without consulting the source checkout.
+extern "C"
+{
+    const TSLanguage* tree_sitter_cpp( void );
+    const TSLanguage* tree_sitter_python( void );
+    const TSLanguage* tree_sitter_go( void );
+    const TSLanguage* tree_sitter_rust( void );
+    const TSLanguage* tree_sitter_typescript( void );
+    const TSLanguage* tree_sitter_tsx( void );
+    const TSLanguage* tree_sitter_swift( void );
+    const TSLanguage* tree_sitter_objc( void );
+    const TSLanguage* tree_sitter_javascript( void );
+    const TSLanguage* tree_sitter_bash( void );
+    const TSLanguage* tree_sitter_java( void );
+    const TSLanguage* tree_sitter_ruby( void );
+    const TSLanguage* tree_sitter_json( void );
+    const TSLanguage* tree_sitter_toml( void );
+    const TSLanguage* tree_sitter_yaml( void );
+    const TSLanguage* tree_sitter_c_sharp( void );
+    const TSLanguage* tree_sitter_c( void );
+    const TSLanguage* tree_sitter_cuda( void );
+    const TSLanguage* tree_sitter_markdown( void );
+    const TSLanguage* tree_sitter_php( void );
+    const TSLanguage* tree_sitter_lua( void );
+    const TSLanguage* tree_sitter_elixir( void );
+    const TSLanguage* tree_sitter_dart( void );
+    const TSLanguage* tree_sitter_kotlin( void );
+    const TSLanguage* tree_sitter_gdscript( void );
+}
+
+// This process's own executable path, realpath'd. The platform's own answer comes first (rw::os::exepath) because
+// argv[0] is often just "codecortex" after shell PATH resolution. Where the platform cannot say, fall back to
+// realpath(argv0), then an explicit PATH search. Never crashes: failure degrades to "".
+inline std::string selfExecutablePath( const char* argv0 )
+{
+    {
+        char buf[ PATH_MAX ];
+        if( rw::os::exepath( buf, sizeof( buf ) ) == 0 )
+        {
+            char resolved[ PATH_MAX ];
+            if( rw::os::realpath( buf, resolved ) )
+            {
+                return std::string( resolved );
+            }
+            return std::string( buf );
+        }
+    }
+    char resolved[ PATH_MAX ];
+    if( argv0 && rw::os::realpath( argv0, resolved ) )
+    {
+        return std::string( resolved );
+    }
+
+    // Last-resort PATH search for platforms without a process-executable API. Returning a bare argv0
+    // would recreate the exact Codex Desktop failure this path is used to prevent.
+    if( argv0 && *argv0 && !std::strchr( argv0, '/' ) )
+    {
+        const char* pathEnv = std::getenv( "PATH" );
+        std::string_view remaining = pathEnv ? std::string_view( pathEnv ) : std::string_view();
+        while( !remaining.empty() )
+        {
+            const std::size_t split = remaining.find( ':' );
+            const std::string_view dir = remaining.substr( 0, split );
+            const std::string candidate = std::string( dir.empty() ? "." : dir ) + "/" + argv0;
+            if( rw::os::realpath( candidate.c_str(), resolved ) && rw::os::access( resolved, X_OK ) == 0 )
+            {
+                return std::string( resolved );
+            }
+            if( split == std::string_view::npos )
+            {
+                break;
+            }
+            remaining.remove_prefix( split + 1 );
+        }
+    }
+    return {};
+}
+
+// popen a shell command, return its trimmed stdout ("" on any failure — never crashes). One shared copy
+// (quality.h popenTrimmed) serves this and the quality git one-liners.
+inline std::string doctorPopenTrim( const std::string& cmd )
+{
+    return rw::quality::popenTrimmed( cmd );
+}
+
+// §P11 doctor item: --doctor's failing rows used to print raw mtimes/sizes/counts with no conclusion — the
+// one verb whose job is diagnosis made the reader do the diagnosis. Each helper below returns the empty
+// string on a PASSING check and a ` hint="..."` attribute fragment on a failing one, naming the derived
+// verdict (which side is stale, which grammars failed, what to fix) instead of leaving raw facts to
+// interpret. Pulled out of runDoctor (rather than inlined per check) so five small conditionals don't add
+// their nesting-weighted cognitive-complexity/verbosity cost to a function that dispatches six checks already.
+
+// 2026-09-06 stranger audit: binary-path's "copied but identical" test was equal mtime AND equal size. The
+// same 0.4.0 release installed twice (the installer installs by atomic rename, so every install has a fresh
+// mtime) came out STALE: two byte-identical files, one verdict saying reinstall. Content is the fact this check
+// is about, so read the content: ~10 ms for a 42 MB binary, cheaper than one of the git popens --doctor already
+// pays. Sizes are compared first by the caller so this only runs on a plausible pair.
+inline bool doctorSameFileBytes( const std::string& a, const std::string& b )
+{
+    std::FILE* fa   = std::fopen( a.c_str(), "rb" );
+    std::FILE* fb   = std::fopen( b.c_str(), "rb" );
+    bool       same = ( fa != nullptr && fb != nullptr );
+    if( same )
+    {
+        std::vector<char> ba( 1u << 20 ), bb( 1u << 20 );
+        for( ;; )
+        {
+            const std::size_t na = std::fread( ba.data(), 1, ba.size(), fa );
+            const std::size_t nb = std::fread( bb.data(), 1, bb.size(), fb );
+            if( na != nb || std::memcmp( ba.data(), bb.data(), na ) != 0 )
+            {
+                same = false;
+                break;
+            }
+            if( na == 0 )
+            {
+                break;
+            }
+        }
+    }
+    if( fa ) { std::fclose( fa ); }
+    if( fb ) { std::fclose( fb ); }
+    return same;
+}
+
+// Count the advisory edit-lock files under <cacheDir>/locks/<xx>/ (mcpedit.h editLockPath). They are deliberately
+// never unlinked by the process that holds them; quality.h's sweepStaleEditLocks reclaims the unheld ones older
+// than a day. Before that sweep existed one machine had 45,765 of them (2026-09-06) and --doctor could not see
+// a single one — the blob scan stops at the shard level on purpose. This count is a plain directory walk, no
+// stat, no cap: it is the number the sweep will act on.
+inline std::size_t doctorEditLockCount( const std::string& dir )
+{
+    namespace fs = std::filesystem;
+    std::size_t     count = 0;
+    std::error_code ec;
+    fs::recursive_directory_iterator it( fs::path( dir ) / "locks", fs::directory_options::skip_permission_denied, ec ), end;
+    for( ; !ec && it != end; it.increment( ec ) )
+    {
+        std::error_code sec;
+        if( it->path().filename().string().rfind( "codecortex-edit-", 0 ) == 0 && it->is_regular_file( sec ) && !sec )
+        {
+            ++count;
+        }
+    }
+    return count;
+}
+
+// 2026-09-06 stranger audit: the not-on-PATH verdict, with the fix spelled out (see the call site).
+inline std::string doctorNotOnPathHint( const std::string& selfPath, std::vector<char>& esc )
+{
+    const std::size_t slash   = selfPath.find_last_of( '/' );
+    const std::string selfDir = ( slash == std::string::npos ) ? std::string( "." ) : selfPath.substr( 0, slash );
+    return " hint=\"" + std::string( rw::escapeXml( std::string_view(
+                  "NOT ON PATH: no codecortex resolves from PATH; this run used " + selfPath
+                + " — add its directory: export PATH=\"" + selfDir + ":$PATH\" (and put that line in your shell rc file)" ), esc ) ) + "\"";
+}
+
+inline std::string doctorBinaryPathVerdictAttr( bool copied, const std::string& selfPath, const std::string& whichPath,
+                                                const rw::os::stat_t& selfSt, const rw::os::stat_t& whichSt, std::vector<char>& esc )
+{
+    if( copied )
+    {
+        return " copied=\"1\"";
+    }
+    const bool        selfIsOlder = selfSt.st_mtime < whichSt.st_mtime;
+    const std::string olderPath   = selfIsOlder ? selfPath : whichPath;
+    const std::string newerPath   = selfIsOlder ? whichPath : selfPath;
+    return " hint=\"" + std::string( rw::escapeXml( std::string_view(
+                  "STALE: " + olderPath + " is older than " + newerPath
+                + " and their contents differ — rebuild/reinstall so PATH points at the newer one, or invoke "
+                + newerPath + " directly" ), esc ) ) + "\"";
+}
+
+// --doctor check 7's verdict. The failing case is the one an agent cannot otherwise see: a `--cache=PATH`
+// the user NAMED that this binary refused, which today costs a CI job its whole warm-restore purpose while
+// exiting 0 in silence. The hint names the refusal AND the remedy, which differs by reason — a format or
+// extraction mismatch is regenerated with --index-out, a corrupt or missing file is a supply problem.
+inline std::string doctorIndexCacheHint( bool named, const char* leanVerdict, const char* richVerdict,
+                                         const std::string& path, std::vector<char>& esc )
+{
+    const std::string lean( leanVerdict );
+    const std::string rich( richVerdict );
+    if( !named || lean == "ok" || rich == "ok" )
+    {
+        return "";
+    }
+    const bool regenerable = ( lean == "format-version" || lean == "parser-version" || lean == "artifact-arch" );
+    const std::string remedy = regenerable
+        ? "this binary's extraction identity does not match the artifact — regenerate it with --index-out=BASE "
+          "from THIS binary on THIS architecture, or drop --cache= and let the run cold-parse"
+        : "the file named by --cache= is not a usable codecortex artifact — check the path and that the "
+          "--index-out step actually ran, or drop --cache= and let the run cold-parse";
+    return " hint=\"" + std::string( rw::escapeXml( std::string_view(
+                  "UNUSED: --cache=" + path + " was refused (lean=" + lean + " rich=" + rich + ") and the run "
+                  "cold-parses instead — " + remedy ), esc ) ) + "\"";
+}
+
+inline std::string doctorGrammarsHint( int loaded, int expected, const std::string& failedLabels, std::vector<char>& esc )
+{
+    if( loaded == expected )
+    {
+        return "";
+    }
+    return " hint=\"" + std::string( rw::escapeXml( std::string_view(
+                  "failed to compile: " + failedLabels
+                + " — a build/embedded-resource mismatch (rebuild with cmake --build build -j; "
+                  "if it persists the embedded tags.scm for that language is stale)" ), esc ) ) + "\"";
+}
+
+// --doctor's legend, pulled out of runDoctor: a 20-line string constant is not part of dispatching seven
+// checks, and leaving it inline charged every word of documentation to that function's verbosity — which
+// is a tax on EXPLAINING the output, precisely the wrong incentive for the verb whose job is disclosure.
+// Byte-identical to the inline literal it replaces (test/doctorcheck.sh, test/legendcoveragecheck.sh).
+// NB no flag is spelled with its leading dashes anywhere below: an XML comment may not contain a double
+// hyphen, and this whole string is one comment.
+inline const char* doctorLegendComment()
+{
+    return "<!-- doctor: checks=/passed= are the row count/how many passed; each <c name= ok=> is one check, its OTHER "
+                       "attributes are check-specific (see help). cache-dir's blobs= is capped at 4096 (kMaxCacheBlobCount); "
+                       "blobs_floor=\"1\" means the cap fired and blobs= is AT LEAST that many, not exactly (absent = the true "
+                       "count); truncated=\"1\" covers that AND an I/O error mid-scan, so blobs_floor= is the narrower, more "
+                       "useful claim when both matter; locks= counts the advisory edit-lock files under locks/ (never unlinked by "
+                       "their holder; the unheld ones older than a day are swept on the next cache write). binary-path compares "
+                       "CONTENT: same_bytes 1 is the copied-install case (ok, copied 1) whatever the mtimes say; on_path 0 fails "
+                       "the row and its hint carries the export line, the state a fresh install is in until PATH is fixed. git's "
+                       "shallow 1 means the clone's history is depth-limited, so every churn number counts only the commits "
+                       "present. volatile= on a row NAMES that row's own attributes that read LIVE machine "
+                       "state — cache-dir scans a per-user directory every codecortex process writes into, so two runs of this "
+                       "deterministic binary legitimately differ in exactly those fields and in nothing else; a determinism "
+                       "comparison strips the named attributes, never the row. tracked-binaries' truncated=\"1\" means the "
+                       "git-history scan was SKIPPED entirely (too many tracked files), so its stale=\"0\" there means "
+                       "unmeasured, never a clean scan. index-cache states the INDEX-VERSION CONTRACT "
+                       "(cache_version/parser_ver_lean/parser_ver_rich/artifact_arch — an artifact is reusable only by a "
+                       "binary carrying all four) and, for the artifact this root would consume, whether THIS binary can "
+                       "open it: lean=/rich= are one of ok | absent | not-regular | unreadable | truncated | not-a-cache | "
+                       "format-version | parser-version | artifact-arch | checksum | corrupt-frame, plus disabled "
+                       "(the no-cache flag: nothing was consulted, which is neither ok nor absent). That is a FORMAT "
+                       "verdict on an artifact, NEVER a freshness verdict on the index: every invocation re-validates each "
+                       "file, so an answer is not stale because lean= is not ok — it is merely slower. source= says whether "
+                       "the artifact was named on the cache= flag or picked automatically, and only a NAMED artifact this "
+                       "binary cannot read is ok=\"0\" (a missing auto blob is the ordinary cold-start miss). "
+                       "git-config-trust reads the checkout's OWN core.fsmonitor as this process saw it at startup: hook is a "
+                       "COMMAND git would run on every read-only call, and neutralised=\"1\" says core.fsmonitor=false was "
+                       "appended to git's environment override for this run (stderr said so as git_harden=fsmonitor-hook); "
+                       "builtin, off and unset need no override and read neutralised=\"0\". Independently of this row, every git command "
+                       "codecortex runs carries no-optional-locks and core.fsmonitor=false, so no monitor of either form runs for its "
+                       "read-only calls. "
+                       "layout's state=\"agree\" means the layout records match; agree compares only the types= registered in src/model.h; "
+                       "a same-size layout change or a stale constant is invisible, so agree does not rule out a mixed binary; "
+                       "checked=\"1\" means the comparison ran; "
+                       "units=\"N\" counts translation units and types=\"N\" counts recorded types. On state=\"disagree\", types= is omitted, because the "
+                       "disagreeing records need not register the same types and no one count is a total; "
+                       "type= names the first differing type, unit0=/unit1= name the two records, and "
+                       "present0=/present1=, size0=/size1=, and align0=/align1= disclose their values; the row gives the rebuild action; "
+                       "state=\"not-checked\" means records exist but fewer than two records with a recorded type could be compared; "
+                       "state=\"no-records\" means no layout record was registered. "
+                       "NB no flag below is spelled with its leading dashes: an XML comment may not contain a "
+                       "double hyphen, and this legend is one comment. -->";
+}
+
+// --doctor check 7's body: index identity + the artifact this root would consume. THE INDEX-VERSION
+// CONTRACT, finally stated to the user. kCacheVersion/kParserVer/kArtifactArch decide whether any
+// committed --index-out artifact is reusable, and before this row they appeared in no output at all — so a
+// consumer could neither pin them nor explain why a previously working artifact stopped hitting, and
+// `codecortex DIR --cache=/gone.bin` exited 0 in silence with bytes identical to a valid-artifact run.
+//
+// WHAT lean=/rich= ARE AND ARE NOT. A FORMAT verdict on ONE artifact — can this binary open it — never a
+// freshness verdict on the index. Per-file freshness is re-validated on every invocation (the stat gate +
+// racy rule), which docs/EVALS.md "card A3" measured, and which is precisely why that section REJECTED an
+// equivalent attribute on the map root: warm output is asserted byte-identical to cold, so nothing varying
+// with cache state may reach stdout's map. --doctor is a diagnostic, not the map.
+//
+// BOTH families, because src/ingest_cache.h's own comment warns that a team committing only the lean
+// artifact gets NO warm hit on --for/--exemplar/--metrics/--uses. A single fused verdict would answer "ok"
+// to a team whose flagship verb cold-parses every time.
+//
+// No roots=, and no multi-root branch: main.cpp REFUSES --doctor in a multi-root workspace before this
+// runs ("its cache-dir/git checks are per-repo; run it per root"), so a per-root verdict can never be
+// presented as if it covered N roots, and a constant roots="1" would buy no information for its bytes
+// (G4). test/cacheidentitycheck.sh (E) pins that refusal, because the day --doctor accepts a workspace
+// this row silently starts under-reporting.
+struct DoctorIndexCache { std::string attrs; bool ok = true; };
+
+// The rich-verb roster, DERIVED by asking needsValueUses (cli.h) one verb at a time — never a second copy
+// of the list, because a hand-written copy is exactly what would drift back into a lie. Each probe sets the
+// ONE field that verb's flag sets and asks the predicate; whatever it answers is what the dispatcher will
+// do. A verb missing here is a roster gap, not a behaviour gap — test/knownitemcheck.sh asserts the roster
+// is both complete over the verbs that loop and empty of the nav/read verbs that do not.
+inline std::string doctorRichVerbRoster()
+{
+    struct Probe { const char* verb; void ( *arm )( rw::Config& ); };
+    static const Probe kProbes[] = {
+        { "for",             []( rw::Config& c ) { c.forTask     = "x"; } },
+        { "uses",            []( rw::Config& c ) { c.usesSym     = "x"; } },
+        { "metrics",         []( rw::Config& c ) { c.metrics     = true; } },
+        { "exemplar",        []( rw::Config& c ) { c.exemplar    = "x"; } },
+        { "context-ratio",   []( rw::Config& c ) { c.contextRatio  = true; } },
+        { "nonlocal-state",  []( rw::Config& c ) { c.nonlocalState = true; } },
+        { "quality-panel",   []( rw::Config& c ) { c.qualityPanel  = true; } },
+        { "verify",          []( rw::Config& c ) { c.verifyClaim = "x"; } },
+        { "eval-retrieval",  []( rw::Config& c ) { c.evalRetrieval = true; } },
+        { "eval-mined",      []( rw::Config& c ) { c.evalMined   = "x"; } },
+        { "eval-skills",     []( rw::Config& c ) { c.evalSkills  = "x"; } },
+        // deliberately probed and expected LEAN — a roster that named everything would prove nothing:
+        { "grep",            []( rw::Config& c ) { c.grep        = "x"; } },
+        { "callers",         []( rw::Config& c ) { c.callers     = "x"; } },
+        { "expand",          []( rw::Config& c ) { c.expand.push_back( "x" ); } },
+    };
+    std::string roster;
+    for( const Probe& p : kProbes )
+    {
+        rw::Config probe;
+        p.arm( probe );
+        if( rw::needsValueUses( probe ) )
+        {
+            if( !roster.empty() ) { roster += ','; }
+            roster += p.verb;
+        }
+    }
+    return roster;
+}
+
+inline DoctorIndexCache doctorIndexCacheRow( const rw::Config& cfg, std::vector<char>& esc )
+{
+    const rw::CacheIdentity id = rw::cacheIdentity();
+    DoctorIndexCache    out;
+    out.attrs  = "cache_version=\"" + std::to_string( id.cacheVersion ) + "\"";
+    out.attrs += " parser_ver_lean=\"" + std::to_string( id.parserVerLean ) + "\"";
+    out.attrs += " parser_ver_rich=\"" + std::to_string( id.parserVerRich ) + "\"";
+    out.attrs += " artifact_arch=\"" + std::to_string( id.artifactArch ) + "\"";
+    // WHICH VERBS consume the rich artifact — the membership this row's lean=/rich= verdicts are about.
+    // Answers "will my verbs get the persisted-stats path", which no output could answer before: the eval
+    // verbs sat on the scan path, re-tokenizing the corpus per query, and nothing said so.
+    out.attrs += " rich_verbs=\"" + doctorRichVerbRoster() + "\"";
+
+    const bool  named       = !cfg.cacheFile.empty();
+    std::string namedPath;
+    const char* leanVerdict = "disabled";
+    const char* richVerdict = "disabled";
+    if( cfg.noCache )
+    {
+        // Neither ok nor absent: no artifact was consulted at all. Saying so is the third state the
+        // honesty contract requires — collapsing it into "absent" would claim a lookup happened and missed.
+        out.attrs += " source=\"disabled\"";
+    }
+    else
+    {
+        namedPath = named ? std::string( cfg.cacheFile )
+                          : defaultCachePath( std::string( cfg.rootPath ), /*captureValueUses=*/false );
+        // The two families share ONE path only when the user named it: an auto run has a per-family blob.
+        const std::string richPath = named ? namedPath
+                                           : defaultCachePath( std::string( cfg.rootPath ), /*captureValueUses=*/true );
+        out.attrs  += named ? " source=\"cache-flag\"" : " source=\"auto\"";
+        out.attrs  += " lean_path=\"" + std::string( rw::escapeXml( namedPath, esc ) ) + "\"";
+        out.attrs  += " rich_path=\"" + std::string( rw::escapeXml( richPath, esc ) ) + "\"";
+        leanVerdict = rw::cacheArtifactVerdict( namedPath, /*captureValueUses=*/false );
+        richVerdict = rw::cacheArtifactVerdict( richPath, /*captureValueUses=*/true );
+        // ok="0" ONLY for an artifact the user NAMED and this binary cannot read: a stated expectation not
+        // met. A missing AUTO blob is a first run on a cold machine — the ordinary, correct, self-healing
+        // miss — and failing there would report every fresh checkout as sick.
+        out.ok      = !named || ( std::string_view( leanVerdict ) == "ok" ) || ( std::string_view( richVerdict ) == "ok" );
+    }
+    out.attrs += " lean=\"" + std::string( leanVerdict ) + "\"";
+    out.attrs += " rich=\"" + std::string( richVerdict ) + "\"";
+    // The same declaration cache-dir makes, for the same reason: both verdicts read a per-user directory
+    // any concurrent codecortex process writes into, so two runs of this deterministic binary may legitimately
+    // disagree on exactly these fields and on nothing else. The four identity numbers and the paths are
+    // pure functions of the binary and the root, and are deliberately NOT listed.
+    out.attrs += " volatile=\"lean,rich\"";
+    out.attrs += doctorIndexCacheHint( named, leanVerdict, richVerdict, namedPath, esc );
+    return out;
+}
+
+// --doctor check 2's probe, in full: does each compiled-in grammar's tags.scm actually compile
+// (ts_query_new — the same operation ingest()'s prewarm performs)? Pulled out of runDoctor (not just the
+// hint) so the for-loop + its two ifs (pre-existing) and the label-collecting else (new, for the hint
+// above) all land on a new symbol instead of runDoctor's own complexity.
+struct DoctorGrammarProbe { int loaded = 0; int expected = 0; std::string failedLabels; };
+
+// The probe for a grammar that ships NO tags.scm (markdown — ingest walks its tree directly): the honest
+// health check is the pairing ingest actually uses, set_language + a real parse of a one-line doc.
+inline bool doctorParseProbe( const TSLanguage* ( *grammar )( void ) )
+{
+    bool      ok = false;
+    TSParser* p  = ts_parser_new();
+    if( p != nullptr )
+    {
+        if( ts_parser_set_language( p, grammar() ) )
+        {
+            static constexpr std::string_view kProbeDoc = "# t\n";
+            TSTree* t = ts_parser_parse_string( p, nullptr, kProbeDoc.data(), std::uint32_t( kProbeDoc.size() ) );
+            if( t != nullptr )
+            {
+                ok = !ts_node_is_null( ts_tree_root_node( t ) );
+                ts_tree_delete( t );
+            }
+        }
+        ts_parser_delete( p );
+    }
+    return ok;
+}
+
+/// Exercise every registered grammar and its embedded query, reporting loaded and expected totals.
+inline DoctorGrammarProbe doctorProbeGrammars()
+{
+    struct GEntry { const char* querySub; const TSLanguage* (*grammar)( void ); const char* label; };
+    static const GEntry kTable[] = {
+        { "cpp",        &tree_sitter_cpp,        "cpp"        },
+        { "python",     &tree_sitter_python,     "python"     },
+        { "go",         &tree_sitter_go,         "go"         },
+        { "rust",       &tree_sitter_rust,       "rust"       },
+        { "typescript", &tree_sitter_typescript, "typescript" },
+        { "typescript", &tree_sitter_tsx,        "tsx"        },
+        { "swift",      &tree_sitter_swift,      "swift"      },
+        { "objc",       &tree_sitter_objc,       "objc"       },
+        { "javascript", &tree_sitter_javascript, "javascript" },
+        { "bash",       &tree_sitter_bash,       "bash"       },
+        { "java",       &tree_sitter_java,       "java"       },
+        { "ruby",       &tree_sitter_ruby,       "ruby"       },
+        { "json",       &tree_sitter_json,       "json"       },
+        // The four below were MISSING while the binary linked them, so --doctor reported "13 of 13
+        // grammars ok" on a build carrying 17 probeable entries: a csharp/c/cuda/toml query that failed
+        // to compile was invisible to the one check whose whole job is to say so. Found by the TOML
+        // round's sibling sweep (docs/METHODOLOGY.md §3). `cuda` deliberately shares the "cpp" querySub
+        // — it is a generated superset of tree-sitter-cpp and rides cpp's tags.scm, exactly as `tsx`
+        // shares "typescript" above — so what is probed for it is cpp's query against the CUDA grammar,
+        // which is precisely the pairing ingest uses.
+        { "toml",       &tree_sitter_toml,       "toml"       },
+        { "yaml",       &tree_sitter_yaml,       "yaml"       },
+        { "csharp",     &tree_sitter_c_sharp,    "csharp"     },
+        { "c",          &tree_sitter_c,          "c"          },
+        { "cpp",        &tree_sitter_cuda,       "cuda"       },
+        { "php",        &tree_sitter_php,        "php"        },
+        { "lua",        &tree_sitter_lua,        "lua"        },
+        { "elixir",     &tree_sitter_elixir,     "elixir"     },
+        { "dart",       &tree_sitter_dart,       "dart"       },
+        { "kotlin",     &tree_sitter_kotlin,     "kotlin"     },
+        { "gdscript",   &tree_sitter_gdscript,   "gdscript"   },
+        // markdown carries NO tags.scm — ingest extracts sections by a custom tree walk, so the honest
+        // probe is the pairing ingest actually uses: set_language + a real parse, not a query compile.
+        { nullptr,      &tree_sitter_markdown,   "markdown"   },
+    };
+    DoctorGrammarProbe out;
+    out.expected = int( sizeof( kTable ) / sizeof( kTable[0] ) );
+    for( const GEntry& g : kTable )
+    {
+        bool ok = false;
+        if( g.querySub == nullptr )
+        {
+            ok = doctorParseProbe( g.grammar );
+        }
+        else
+        {
+            const std::string_view scm = rw::embedded_queries::queryFor( g.querySub );
+            if( !scm.empty() )
+            {
+                std::uint32_t errOff  = 0;
+                TSQueryError  errType = TSQueryErrorNone;
+                TSQuery*      q       = ts_query_new( g.grammar(), scm.data(), static_cast<std::uint32_t>( scm.size() ), &errOff, &errType );
+                if( q ) { ok = true; ts_query_delete( q ); }
+            }
+        }
+        if( ok )
+        {
+            ++out.loaded;
+        }
+        else
+        {
+            if( !out.failedLabels.empty() )
+            {
+                out.failedLabels += ",";
+            }
+            out.failedLabels += g.label;
+        }
+    }
+    return out;
+}
+
+// §L10: `capHit` is a NARROWER fact than `truncated` — truncated is "count and/or bytes may be short for
+// SOME reason" (an I/O error mid-scan counts too), while capHit is specifically "we stopped counting at
+// kMaxCacheBlobCount because there may be more, not because anything failed". blobCount lands on EXACTLY
+// the same value (kMaxCacheBlobCount) whether the true count is exactly that many or far more, so
+// blobs="4096" alone cannot tell a reader which; blobs_floor= (emitted only when capHit) closes that gap
+// the same way counts_floor= does everywhere else in this tool. An I/O-error truncation never sets capHit,
+// so it never gets a floor label it cannot back — the count it stopped at there IS the true count so far.
+struct DoctorCacheStats { std::size_t blobCount = 0; std::uintmax_t totalBytes = 0; bool truncated = false; bool capHit = false; };
+
+// Count legacy flat blobs plus the current one-level, two-hex shard layout. The 4K cap matches cache
+// hygiene's retained-blob cap; truncated= makes an I/O error or over-cap result an honest floor.
+inline DoctorCacheStats doctorCacheStats( const std::string& dir )
+{
+    namespace fs = std::filesystem;
+    DoctorCacheStats out;
+    const auto account = [ & ]( const fs::directory_entry& entry )
+    {
+        const std::string name = entry.path().filename().string();
+        if( name.rfind( "codecortex-", 0 ) != 0 ) { return; }
+        std::error_code ec;
+        if( !entry.is_regular_file( ec ) ) { if( ec ) { out.truncated = true; } return; }
+        if( out.blobCount >= rw::quality::kMaxCacheBlobCount ) { out.truncated = true; out.capHit = true; return; }
+        ++out.blobCount;
+        const auto byteSize = entry.file_size( ec );
+        if( ec ) { out.truncated = true; return; }
+        out.totalBytes += byteSize;
+    };
+    const auto scanShard = [ & ]( const fs::path& shard )
+    {
+        std::error_code ec;
+        fs::directory_iterator it( shard, ec ), end;
+        if( ec ) { out.truncated = true; return; }
+        while( it != end && !out.truncated )
+        {
+            account( *it );
+            it.increment( ec );
+            if( ec ) { out.truncated = true; }
+        }
+    };
+    const auto isShardName = []( const std::string& name )
+    {
+        return name.size() == 2 && std::isxdigit( static_cast<unsigned char>( name[0] ) )
+             && std::isxdigit( static_cast<unsigned char>( name[1] ) );
+    };
+
+    std::error_code ec;
+    fs::directory_iterator it( dir, ec ), end;
+    if( ec ) { out.truncated = true; return out; }
+    while( it != end && !out.truncated )
+    {
+        const std::string name = it->path().filename().string();
+        if( name.rfind( "codecortex-", 0 ) == 0 )
+        {
+            account( *it );
+        }
+        else if( isShardName( name ) )
+        {
+            std::error_code sec;
+            if( it->is_directory( sec ) ) { scanShard( it->path() ); }
+            else if( sec ) { out.truncated = true; }
+        }
+        it.increment( ec );
+        if( ec ) { out.truncated = true; }
+    }
+    return out;
+}
+
+inline std::string doctorCacheDirHint( bool writable, const std::string& dir, std::vector<char>& esc )
+{
+    if( writable )
+    {
+        return "";
+    }
+    return " hint=\"" + std::string( rw::escapeXml( std::string_view(
+                  "cannot write to " + dir + " (from TMPDIR/XDG_CACHE_HOME/tmp fallback) — fix its "
+                  "permissions, or point TMPDIR/XDG_CACHE_HOME at a directory you can write to" ), esc ) ) + "\"";
+}
+
+inline std::string doctorGitHint( bool gitAvailable )
+{
+    if( gitAvailable )
+    {
+        return "";
+    }
+    return " hint=\"git not found on PATH — install it (required for --hotspots/--cochange/--owners/"
+           "--merge-scout/--quality-delta and every other churn-mining verb) or check PATH\"";
+}
+
+inline std::string doctorTrackedBinariesHint( bool ok, std::size_t staleCount )
+{
+    if( ok )
+    {
+        return "";
+    }
+    return " hint=\"" + std::to_string( staleCount ) + " stale tracked binar" + ( staleCount == 1 ? "y" : "ies" )
+         + " — the source (src0=, src1=, …) was committed AFTER its binary (p0=, p1=, …); "
+           "rebuild the binary from that newer source and recommit it\"";
+}
+
+struct DoctorAgentRows
+{
+    int checks = 0;
+    int passed = 0;
+    std::string rows;
+    std::string rootAttr;
+};
+
+inline DoctorAgentRows doctorAgentRows( const rw::Config& cfg, const char* argv0 )
+{
+    DoctorAgentRows out;
+    if( cfg.agent != "codex" && cfg.agent != "claude" ) { return out; }
+    const bool claude = cfg.agent == "claude";
+    out.rootAttr = claude ? " agent=\"claude\"" : " agent=\"codex\"";
+    const std::string self = selfExecutablePath( argv0 );
+    for( const rw::codexdoctor::Check& check : ( claude ? rw::codexdoctor::claudeInspect( self )
+                                                        : rw::codexdoctor::inspect( self ) ) )
+    {
+        ++out.checks;
+        if( check.ok ) { ++out.passed; }
+        out.rows += "<c n=\"" + std::string( check.name ) + "\" ok=\"" + ( check.ok ? "1" : "0" ) + "\"";
+        if( !check.attrs.empty() ) { out.rows += " " + check.attrs; }
+        out.rows += "/>";
+    }
+    return out;
+}
+
+// --doctor check 8's body: the git-config trust boundary (harvest 2026-09-09; measurement + reasoning in
+// githarden.h). Reads the form main() probed BEFORE it applied the override — a re-probe here would see the
+// override and report "off" for the very root whose file says hook. Informational: a hook-form key is the
+// CHECKOUT's state, not a broken setup, and the neutralisation IS the verdict — so the row is ok="1" always, the
+// way tree-sitter's is.
+inline std::string doctorGitConfigTrustAttrs( const rw::Config& cfg )
+{
+    using namespace rw;
+    const githarden::FsmonitorForm form        = githarden::startupFormFor( cfg.rootPath );
+    const bool                     neutralised = form == githarden::FsmonitorForm::Hook && githarden::g_startup.applied;
+    std::string attrs = "fsmonitor=\"" + std::string( githarden::fsmonitorFormName( form ) ) + "\"";
+    attrs += " neutralised=\"" + std::string( neutralised ? "1" : "0" ) + "\"";
+    return attrs;
+}
+
+struct DoctorLayoutCheck
+{
+    bool        ok = false;
+    std::string attrs;
+};
+
+inline DoctorLayoutCheck doctorLayoutCheck( std::vector<char>& esc )
+{
+    using namespace rw::layout_registry;
+    const LayoutCheck check = compare();
+    DoctorLayoutCheck out;
+    const auto escaped = [ &esc ]( const char* value )
+    {
+        return std::string( rw::escapeXml( std::string_view( value == nullptr ? "" : value ), esc ) );
+    };
+
+    switch( check.state )
+    {
+        case CheckState::Agree:
+        {
+            out.ok = true;
+            out.attrs = "state=\"agree\" checked=\"1\" units=\"" + std::to_string( check.unitCount )
+                      + "\" types=\"" + std::to_string( check.typeCount ) + "\"";
+            break;
+        }
+        case CheckState::Disagree:
+        {
+            // No types= here (CodeRabbit on #283): compare() takes typeCount from the first sorted record, and records
+            // that disagree may not register the same types, so that one record's count is not a total.
+            const LayoutMismatch& mismatch = check.mismatch;
+            out.attrs = "state=\"disagree\" checked=\"1\" units=\"" + std::to_string( check.unitCount )
+                      + "\" type=\"" + escaped( mismatch.typeName )
+                      + "\" unit0=\"" + escaped( mismatch.unit0 ) + "\" unit1=\"" + escaped( mismatch.unit1 )
+                      + "\" present0=\"" + std::string( mismatch.present0 ? "1" : "0" )
+                      + "\" present1=\"" + std::string( mismatch.present1 ? "1" : "0" )
+                      + "\" size0=\"" + std::to_string( mismatch.size0 ) + "\" size1=\"" + std::to_string( mismatch.size1 )
+                      + "\" align0=\"" + std::to_string( mismatch.align0 ) + "\" align1=\"" + std::to_string( mismatch.align1 )
+                      + "\" hint=\"mixed translation-unit layouts detected — rebuild with cmake --build build --clean-first -j\"";
+            break;
+        }
+        case CheckState::NoRecords:
+        case CheckState::NotChecked:
+        {
+            const char* const state = check.state == CheckState::NoRecords ? "no-records" : "not-checked";
+            out.attrs = "state=\"" + std::string( state ) + "\" checked=\"0\" units=\"" + std::to_string( check.unitCount )
+                      + "\" types=\"" + std::to_string( check.typeCount )
+                      + "\" hint=\"not checked: layout records from at least two translation units are required\"";
+            break;
+        }
+    }
+    return out;
+}
+
+int runDoctor( const rw::Config& cfg, const char* argv0 )
+{
+    using namespace rw;
+
+    int                checks = 0;
+    int                okCount = 0;
+    std::string        rows;
+    std::vector<char>  esc;
+
+    const auto row = [ & ]( const char* name, bool ok, const std::string& attrs )
+    {
+        ++checks;
+        if( ok )
+        {
+            ++okCount;
+        }
+        rows += "<c n=\"";  rows += name;  rows += "\" ok=\"";  rows += ( ok ? "1" : "0" );  rows += "\"";
+        if( !attrs.empty() ) { rows += " "; rows += attrs; }
+        rows += "/>";
+    };
+
+    // ---- check 1: binary-vs-PATH staleness (no --version mechanism exists — checked; compare
+    // realpath'd identity via (device,inode), then mtime/size, of argv[0]'s resolved binary vs
+    // `which codecortex`'s) ----
+    {
+        const std::string selfPath  = selfExecutablePath( argv0 );
+        const std::string whichPath = doctorPopenTrim( "which codecortex 2>/dev/null" );
+        rw::os::stat_t        selfSt {};
+        rw::os::stat_t         whichSt {};
+        const bool haveSelf  = !selfPath.empty()  && rw::os::stat( selfPath.c_str(),  &selfSt )  == 0;
+        const bool haveWhich = !whichPath.empty() && rw::os::stat( whichPath.c_str(), &whichSt ) == 0;
+
+        bool        ok    = true;
+        std::string attrs = "self=\"" + std::string( escapeXml( selfPath, esc ) ) + "\"";
+        attrs += " which=\"" + std::string( escapeXml( whichPath, esc ) ) + "\"";
+
+        if( !haveWhich )
+        {
+            // 2026-09-06 stranger audit: the installer's last line is "<dir> is not on PATH — add it" and the README's
+            // next command is `codecortex . --for=…`. The user who then runs THIS binary by its absolute path to ask the
+            // doctor what is wrong was told ok="1" here and passed=7/7, while `codecortex` at their prompt was "command
+            // not found". Not being on PATH is the commonest state a fresh install is in; it fails this row, with the fix.
+            ok = false;
+            attrs += " on_path=\"0\"" + doctorNotOnPathHint( selfPath, esc );
+        }
+        else if( haveSelf )
+        {
+            const bool sameFile = ( selfSt.st_dev == whichSt.st_dev && selfSt.st_ino == whichSt.st_ino );
+            attrs += " on_path=\"1\" same_file=\"" + std::string( sameFile ? "1" : "0" ) + "\"";
+            if( !sameFile )
+            {
+                // install.sh COPIES the binary (dev/ino always differ from the source build) rather than
+                // symlinking it, so a raw same_file="0" false-positives on every install that worked fine.
+                // Cheap content-equality fallback (degrade, don't crash): equal mtime AND equal size is the
+                // sanctioned proxy for "copied but identical" — a genuine stale shadow almost always differs
+                // in at least one. Only a real mismatch still flags ok=false.
+                const bool sameBytes = ( selfSt.st_size == whichSt.st_size ) && doctorSameFileBytes( selfPath, whichPath );
+                const bool copied    = sameBytes;   // content equality, not the mtime proxy (see doctorSameFileBytes)
+                ok = copied;   // this exact failure bit the LocBench round — stale PATH binary shadows a freshly built one
+                attrs += " same_bytes=\"" + std::string( sameBytes ? "1" : "0" ) + "\"";
+                attrs += " self_mtime=\""  + std::to_string( (long long)selfSt.st_mtime )  + "\"";
+                attrs += " self_size=\""   + std::to_string( (long long)selfSt.st_size )    + "\"";
+                attrs += " which_mtime=\"" + std::to_string( (long long)whichSt.st_mtime ) + "\"";
+                attrs += " which_size=\""  + std::to_string( (long long)whichSt.st_size )   + "\"";
+                // §P11 doctor item: a raw ok="0" with four raw timestamps made the reader do the
+                // subtraction themselves — name which of the two IS the stale one (older mtime) and the
+                // fix, so the LocBench-round failure this check exists for reads as a VERDICT.
+                attrs += doctorBinaryPathVerdictAttr( copied, selfPath, whichPath, selfSt, whichSt, esc );
+            }
+        }
+        else
+        {
+            attrs += " on_path=\"1\"";   // could stat the PATH copy but not our own argv[0]-derived path — degrade, don't fail
+        }
+        // D3 fix round, owner call: `which codecortex` runs through Git Bash's MSYS `which`, which prints "/c/.../codecortex"
+        // — normalize_path_arg fixes the drive spelling but not the missing ".exe" — so on_path="0" and same_file/
+        // same_bytes above can all disagree with a correct install. This row is DEGRADED AND DISCLOSED on Windows this
+        // release rather than silently trusted: `ok` above is still whatever the (possibly Windows-spelling-confused)
+        // comparison found, but a reader now sees why it may be wrong. The call site never asks which OS it is on
+        // (osswitchcheck arm G) — it asks os::which_spelling_is_exact(), true on POSIX (byte-identical: the branch
+        // below never taken) and false only on Windows. The honest fix is a native os::which( "codecortex" )
+        // PATH/PATHEXT search (D4 follow-up), once --doctor itself is shown byte-identical between the two `which`
+        // sources.
+        if( !os::which_spelling_is_exact() )
+        {
+            // The disclosure IS the attribute (a reader of this row's own output sees it); no separate DISCLOSE()
+            // trace — that macro's sink-less form tells the user nothing (Diagnostics.h §4b) and would only grow
+            // selfcheckcheck arm R's pinned sink-less count for no benefit over the attrs= this row already carries.
+            attrs += " degraded=\"1\" degrade_reason=\"win32-which-spelling\"";
+        }
+        row( "binary-path", ok, attrs );
+    }
+
+    // ---- check 2: grammar availability — probe each compiled-in grammar's tags.scm actually
+    // compiles (ts_query_new), the same operation ingest()'s prewarm performs; count vs expected ----
+    // gp OUTLIVES this block on purpose: check 5 reports the same grammar count and used to carry it as a
+    // hardcoded "13" with a comment promising it matched this table. It did not — the table reached 17
+    // while the literal stayed 13. Reading the one probe twice is what makes that promise structural.
+    const DoctorGrammarProbe gp = doctorProbeGrammars();
+    {
+        std::string grammarAttrs = "loaded=\"" + std::to_string( gp.loaded ) + "\" expected=\"" + std::to_string( gp.expected ) + "\"";
+        grammarAttrs += doctorGrammarsHint( gp.loaded, gp.expected, gp.failedLabels, esc );
+        row( "grammars", gp.loaded == gp.expected, grammarAttrs );
+    }
+
+    // ---- check 3: cache-dir health — resolves, writable (create+delete a probe file), report
+    // existing codecortex-* blob count + total bytes (eviction sanity: flag >50 blobs, informational) ----
+    {
+        const std::string dir   = cacheDirLadder();
+        const std::string probe = dir + "/.codecortex-doctor-probe-" + std::to_string( rw::os::getpid() );
+        bool writable = false;
+        if( std::FILE* f = std::fopen( probe.c_str(), "wb" ) )
+        {
+            std::fputs( "doctor", f );
+            std::fclose( f );
+            writable = ( rw::os::unlink( probe.c_str() ) == 0 );
+        }
+
+        const DoctorCacheStats stats = doctorCacheStats( dir );
+        std::string attrs = "dir=\"" + std::string( escapeXml( dir, esc ) ) + "\"";
+        attrs += " blobs=\"" + std::to_string( stats.blobCount ) + "\"";
+        if( stats.capHit )
+        {
+            attrs += " blobs_floor=\"1\"";   // §L10: blobs= landed on the scan cap — could be exactly that many, could be more
+        }
+        attrs += " bytes=\"" + std::to_string( stats.totalBytes ) + "\"";
+        attrs += " many=\"" + std::string( stats.blobCount > 50 ? "1" : "0" ) + "\"";   // eviction sanity flag, informational (never fails the check)
+        attrs += " truncated=\"" + std::string( stats.truncated ? "1" : "0" ) + "\"";
+        attrs += " locks=\"" + std::to_string( doctorEditLockCount( dir ) ) + "\"";   // advisory edit-lock files under locks/ (doctorEditLockCount)
+        // F6 (2026-09-05): THE ROW NAMES ITS OWN LIVE-STATE FIELDS. cacheDirLadder() is a per-USER directory
+        // every codecortex process writes into, so this scan measures a moving object — two back-to-back runs of
+        // a deterministic binary legitimately disagree on blobs=/bytes= and on the flags derived from the same
+        // scan. Three rounds read that as a determinism failure of the BINARY (lane-L7's shapingflagcheck (F)
+        // and gitstampcheck --doctor, both green alone; merge-wave2 §4; the 2026-09-04 close), each time
+        // answered by another private scrub in whichever gate noticed — and gitstampcheck's was order-
+        // dependent, so it silently stopped scrubbing once the scan cap spliced blobs_floor= mid-row.
+        // Declaring the list HERE makes it a fact of the output that test/lib/doctorvolatile.sh reads; no gate
+        // keeps a copy. Removing the fields instead is worse: cache size is this check's whole content.
+        attrs += " volatile=\"blobs,blobs_floor,bytes,many,truncated,locks\"";
+        attrs += doctorCacheDirHint( writable, dir, esc );
+        row( "cache-dir", writable, attrs );
+    }
+
+    // ---- check 4: git reachability — `git` on PATH + the target dir's repo status; degrades
+    // gracefully on non-repos (ok=1, repo="0" — doctor diagnoses, non-repo isn't sickness) ----
+    {
+        const std::string gitVer       = doctorPopenTrim( gitCmd( " --version 2>/dev/null" ) );
+        const bool        gitAvailable = !gitVer.empty();
+        std::string        attrs        = "git=\"" + std::string( gitAvailable ? "1" : "0" ) + "\"";
+        if( gitAvailable )
+        {
+            const std::string root   = std::string( cfg.rootPath );
+            const std::string isRepo = doctorPopenTrim( gitCmd( " -c core.quotepath=false -C " ) + shSingleQuote( root )
+                                                          + " rev-parse --is-inside-work-tree 2>/dev/null" );
+            const bool repo = ( isRepo == "true" );
+            attrs += " repo=\"" + std::string( repo ? "1" : "0" ) + "\"";
+            if( repo )
+            {
+                const bool history = gitRepoHasHistory( root );
+                attrs += " history=\"" + std::string( history ? "1" : "0" ) + "\"";
+                if( history )
+                {
+                    // §A10.4: 9-hex-char width, matching the at= convention (gitstamp.h) every other
+                    // repo-reading verb uses — this was the tool's one remaining 40-char head=.
+                    attrs += " head=\"" + std::string( escapeXml( gitHeadSha( root ).substr( 0, 9 ), esc ) ) + "\"";
+                    if( gitstamp::isShallow( root ) )
+                    {
+                        attrs += " shallow=\"1\"";   // a depth-limited clone: churn everywhere counts only the commits present
+                    }
+                }
+            }
+        }
+        attrs += doctorGitHint( gitAvailable );
+        row( "git", gitAvailable, attrs );
+    }
+
+    // ---- check 5: tree-sitter version + language count (informational, always ok=1) ----
+    {
+        const std::uint32_t cppAbi = ts_language_abi_version( tree_sitter_cpp() );
+        std::string attrs = "core_abi=\"" + std::to_string( TREE_SITTER_LANGUAGE_VERSION ) + "\"";
+        attrs += " cpp_grammar_abi=\"" + std::to_string( cppAbi ) + "\"";
+        attrs += " languages=\"" + std::to_string( gp.expected ) + "\"";   // distinct compiled-in grammar entries — DERIVED from check 2's kTable, not restated
+        row( "tree-sitter", true, attrs );
+    }
+
+    // ---- check 6: tracked-binary staleness — a committed binary whose last-touching
+    // commit is a STRICT ancestor of a same-directory/same-stem source's last-touching commit: someone edited
+    // the source and never recommitted the binary. Git-commit-order only (never mtime — see binstale.h's
+    // header for why); "dependent source" is a naming heuristic, not a build-graph fact — see the same header
+    // for exactly what this can and cannot see. ok="0" (and doctor's overall exit 1) iff any pair fires; a
+    // non-git root or a >kMaxTrackedFiles repo degrades to ok="1" scanned="0" rather than guess.
+    {
+        const binstale::BinaryStaleResult bs = binstale::computeBinaryStaleness( std::string( cfg.rootPath ) );
+        std::string attrs = "tracked=\"" + std::to_string( bs.trackedCount ) + "\"";
+        attrs += " binaries=\"" + std::to_string( bs.binariesFound ) + "\"";
+        attrs += " non_git=\"" + std::string( bs.nonGitRoot ? "1" : "0" ) + "\"";
+        attrs += " truncated=\"" + std::string( bs.truncated ? "1" : "0" ) + "\"";
+        attrs += " stale=\"" + std::to_string( bs.stale.size() ) + "\"";
+        // cap the inline listing (doctor is a one-screen diagnostic, not a report) — every dropped pair is
+        // still counted in stale="N" above, so a capped display never under-reports the finding.
+        constexpr std::size_t kShown = 8;
+        for( std::size_t i = 0; i < bs.stale.size() && i < kShown; ++i )
+        {
+            const binstale::StaleBinary& s = bs.stale[i];
+            attrs += " p" + std::to_string( i ) + "=\"" + std::string( escapeXml( s.path, esc ) ) + "\"";
+            attrs += " src" + std::to_string( i ) + "=\"" + std::string( escapeXml( s.srcPath, esc ) ) + "\"";
+        }
+        if( bs.stale.size() > kShown )
+        {
+            attrs += " more=\"" + std::to_string( bs.stale.size() - kShown ) + "\"";
+        }
+        const bool ok = bs.nonGitRoot || bs.truncated || bs.stale.empty();
+        // §P11 doctor item: name the derived verdict, not just p0=/src0='s raw pair — the fix is always the
+        // same shape (rebuild + recommit), so state it once instead of leaving the reader to infer it.
+        attrs += doctorTrackedBinariesHint( ok, bs.stale.size() );
+        row( "tracked-binaries", ok, attrs );
+    }
+
+    // ---- check 7: index identity + the artifact this root would consume. Body in doctorIndexCacheRow
+    // above (same reason the grammar probe and the cache-dir stats are free functions: runDoctor already
+    // dispatches six checks, and a seventh three-branch body lands its nesting-weighted complexity there).
+    {
+        const DoctorIndexCache ic = doctorIndexCacheRow( cfg, esc );
+        row( "index-cache", ic.ok, ic.attrs );
+    }
+
+    // ---- check 8: the git-config trust boundary — body in doctorGitConfigTrustAttrs above, for the same reason
+    // check 7's lives in doctorIndexCacheRow: runDoctor is a dispatcher, and every check body it absorbs lands there.
+    row( "git-config-trust", true, doctorGitConfigTrustAttrs( cfg ) );
+
+    // ---- check 9: cross-translation-unit layout agreement — this is the one check that can identify a
+    // binary no single source tree could produce. A single record is deliberately not a pass: there is no
+    // second compiler view against which to compare it.
+    {
+        const DoctorLayoutCheck layout = doctorLayoutCheck( esc );
+        row( "layout", layout.ok, layout.attrs );
+    }
+
+    const DoctorAgentRows agentRows = doctorAgentRows( cfg, argv0 );
+    checks += agentRows.checks;
+    okCount += agentRows.passed;
+    rows += agentRows.rows;
+
+    // r26-stamp Task A: anchor this diagnostic to the commit (+dirty state) it ran against — cheap here
+    // (check 4 above already paid for a git rev-parse/status probe on this same root; two more subprocess
+    // calls are noise next to that), and omitted entirely on a non-git root rather than printed as a placeholder.
+    const std::string doctorAt = gitstamp::atAttr( std::string( cfg.rootPath ) );
+    // M10 / lens2-crossverb L6 (capture-audit-2026-09-04): TWO shas were in play and neither was labelled.
+    // `at=` above is the TREE's HEAD right now; `--version` separately printed "git <sha>" — the commit this
+    // BINARY was compiled from (cmake/version_stamp.cmake bakes it) — and in any session that commits without
+    // rebuilding, the ordinary state of a dev tree mid-task, the two differ. A reader could not tell which
+    // sha described what. They now ride side by side under names that say so, and the value is byte-identical
+    // to --version's (one constant, two surfaces — test/doctorcheck.sh arm H pins that).
+    // Deliberately NOT a check: a binary older than HEAD is normal between a commit and the next build, and
+    // failing there would cry wolf on every commit — this is the FACT; the verdict would be noise. The
+    // genuinely wrong case (a stale PATH copy shadowing a fresh build) still belongs to `binary-path` above,
+    // which decides it on inode/mtime/size and never on this sha.
+    const std::string doctorBuiltFrom = std::string( " built_from=\"" ) + std::string( escapeXml( kCodeCortexGitStamp, esc ) ) + "\"";
+    // §P8 collision: this root spelled its COUNT `ok=` while every <c> child directly beneath it spells its
+    // BOOL `ok=` — two meanings on adjacent lines of one document. Renamed per the index-vs-count rule;
+    // `passed=` pairs with the `checks=` denominator beside it. The count had ZERO parsers (doctorcheck.sh's
+    // 8 assertions all read the CHILD bool), so the half with readers keeps its name.
+    // §L10: --doctor had NO legend at all — every row's attributes were --help-only prose. checks=/passed=
+    // and each <c ok=> are self-explaining; what is not is the pair the cache-dir row's own comment above
+    // already knew was confusing (blobs= landing on the scan cap either means "exactly that many" or
+    // "at least that many" and the bare number cannot say which), so the legend names exactly that one,
+    // plus the one other zero-vs-unmeasured ambiguity on this document (tracked-binaries' truncated=)
+    // rather than restating every attribute's --help sentence here. The literal itself lives in
+    // doctorLegendComment() above (a string constant is not part of dispatching seven checks).
+    std::string out = doctorLegendComment();
+    out += "<doctor checks=\"" + std::to_string( checks ) + "\" passed=\"" + std::to_string( okCount ) + "\"" + agentRows.rootAttr + doctorAt + doctorBuiltFrom + ">";
+    out += rows;
+    out += "</doctor>";
+    std::fputs( out.c_str(), stdout );
+    std::fputc( '\n', stdout );
+    return ( okCount == checks ) ? 0 : 1;
+}
+
+}   // namespace — verbs_doctor.h section of main.cpp

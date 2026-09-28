@@ -1,0 +1,428 @@
+#!/usr/bin/env bash
+# tokenbudgetcheck.sh — T1 gate: the calibrated est_tokens estimate + the --max-tokens headroom fit,
+# PLUS (§D#7 / §E item 16) the --token-budget=N repomix-style CI exit-code gate.
+#
+# WHAT T1 CHANGED: est_tokens used a single chars/4 divisor over a
+# name-length PROXY — MEASURED ~50-80% under the real token count (the map is majority terse markup, not
+# raw code, and tokenizes at ~2.4-2.6 B/tok, NOT 4). T1 replaces it with a per-language constexpr
+# calibration table (src/serialize.h kTokenCalib) over an accurate envelope+content byte model. We do NOT
+# vendor a BPE table — Claude's tokenizer isn't public — so this gate validates the ESTIMATE'S PROPERTIES
+# (determinism, a real ceiling under --max-tokens with headroom), not bit-exactness. The MAPE-vs-tiktoken
+# number is REPORTED by the agent in the T1 write-up (tiktoken isn't a build dependency).
+#
+# WHAT --token-budget ADDS: a CI CONTRACT, not a shaping tool. --max-tokens binary-searches top-K to FIT
+# a target; --token-budget ASSERTS the emitted map's est_tokens against a ceiling and exits 3 if it's over
+# (distinct from --arch/--quality-delta's exit 2, so a CI script can tell "map too big" apart from "new
+# debt"). It reads the SAME calibrated est_tokens the header already prints — never a second counter — so
+# checks #7-#13 below also double as a regression guard against that value drifting from the header's.
+#
+# §P6.8 FIX (this round): before this fix, an over-budget run still streamed the WHOLE map to stdout before
+# exiting 3 — a CI log received the exact artifact the gate just rejected. #7 now asserts full BYTE-IDENTITY
+# with the unflagged map (not just non-empty), and new checks #8b/#8c assert the over-budget run's stdout is
+# small (< 2KB) and carries NO withheld map content — mirroring the fix --recall already had for the same
+# class (measure into a buffer, decide, THEN write — never write-then-decide). See src/main.cpp's
+# runDefaultMap (the out/memBuf/memSz block right before the token-budget check) and its §P6.8 comment.
+#
+# THE DETERMINISM ARMS RUN ON A PRIVATE COPY OF src/ (2026-09-09, CI run 34298150602, macOS plain shard
+# 2/2). #14 read `codecortex src --for=…` twice and got est_tokens 3949 then 3947: the second run carried
+# at="<sha>+dirty" because gateexitcheck, three worker slots away under pargates -j 3, had an untracked
+# probe copy in test/gateexitfix/ for a few milliseconds — every stamped verb reads `git status
+# --porcelain` from ANY crawl root inside the checkout for that bit (src/gitstamp.h stampAt), and
+# "+dirty" is six bytes, two tokens at 2.5 B/tok. The tree was innocent; the arm was reading a shared
+# resource. So #1, #14 and #15's pair now crawl $SRC_COPY, a copy of src/ under mktemp: outside every
+# repository, so no concurrent gate can dirty it and no stamp is emitted at all. Their assertions
+# (present, positive, run-to-run identical; a tighter budget never costs more) are properties of the
+# ESTIMATOR, not of the checkout, and hold unchanged on the copy. #2's calibration floor (>= 5764) was
+# measured on the real src and stays there, as do #3–#13 and #16–#17, none of which compare two runs.
+# test/pargates.py's tree tcodecortex now catches the writer class itself; this is the belt to its braces.
+#
+# Usage:  CODECORTEX_BIN=build/codecortex bash test/tokenbudgetcheck.sh   |   CODECORTEX_BIN=asan/codecortex bash …
+# Exits non-zero on any failure; prints PASS/FAIL per check, ALL PASS on success.
+
+set -u
+ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+# W3FIX: $1 was ignored here — the file bound BIN from CODECORTEX_BIN alone, so `test/tokenbudgetcheck.sh
+# asan/codecortex` (the form every sibling gate accepts, and the form the suite's asan pass uses) silently tested
+# build/codecortex instead. Same seam the wave-1 orchestrator fixed in B1's four gates, one file over.
+BIN="${1:-${CODECORTEX_BIN:-$ROOT/build/codecortex}}"
+[ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
+fail=0
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
+no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
+
+TMP_TB_DIR="$( mktemp -d )"
+trap 'rm -rf "$TMP_TB_DIR"' EXIT
+TMP_TB_A="$TMP_TB_DIR/generous.xml"
+TMP_TB_A_ERR="$TMP_TB_DIR/generous.err"
+TMP_TB_B="$TMP_TB_DIR/tiny.xml"
+TMP_TB_B_ERR="$TMP_TB_DIR/tiny.err"
+TMP_TB_B2_ERR="$TMP_TB_DIR/tiny2.err"
+TMP_TB_COMPOSE_ERR="$TMP_TB_DIR/compose.err"
+
+[ -x "$BIN" ] || { echo "no codecortex binary at $BIN — build first"; exit 2; }
+cd "$ROOT"
+
+echo "tokenbudgetcheck: BIN=$BIN"
+
+# the private corpus for the determinism arms (see the header): a copy of src/, outside every git repository
+SRC_COPY="$TMP_TB_DIR/src"
+if ! cp -R "$ROOT/src" "$SRC_COPY" || [ ! -f "$SRC_COPY/main.cpp" ]; then
+    no "could not copy src/ into $TMP_TB_DIR — the determinism arms have no private corpus"; echo "FAILURES ABOVE"; exit 1
+fi
+if git -C "$SRC_COPY" rev-parse --git-dir >/dev/null 2>&1; then
+    no "the private copy $SRC_COPY sits inside a git repository — a concurrent writer there could still flip its stamp (move TMPDIR)"
+fi
+
+est(){ "$BIN" "$1" --no-cache 2>/dev/null | grep -oE 'est_tokens=[0-9]+' | grep -oE '[0-9]+'; }
+outbytes(){ "$BIN" "$@" --no-cache 2>/dev/null | wc -c | tr -d ' '; }
+
+# ── #1: est_tokens is present, positive, and DETERMINISTIC (byte-identical run-to-run) ────────────────
+E1="$( est "$SRC_COPY" )"; E2="$( est "$SRC_COPY" )"
+{ [ -n "$E1" ] && [ "$E1" -gt 0 ] 2>/dev/null && [ "$E1" = "$E2" ]; } \
+    && ok "est_tokens present, positive ($E1), deterministic (on the private copy of src/)" \
+    || no "est_tokens missing / non-positive / non-deterministic (got '$E1' then '$E2')"
+
+# ── #2: the calibrated estimate is materially LARGER than the old chars/4 proxy would give. The old
+#    proxy on src measured est_tokens=4434 (name-length proxy /4); the calibrated one must be ≥ 1.3× that
+#    (it corrects a ~50-80% under-read). This locks in that the fix actually landed (guards a revert). ──
+ESRC="$( est src )"
+{ [ -n "$ESRC" ] && [ "$ESRC" -ge 5764 ] 2>/dev/null; } \
+    && ok "calibrated est_tokens on src ($ESRC) >= 1.3x the old chars/4 proxy (4434) — the T1 correction landed" \
+    || no "est_tokens on src ($ESRC) too close to the old under-reading proxy (4434) — T1 may be reverted"
+
+# ── #3: --max-tokens is a real CEILING with headroom. For budgets above the map's fixed envelope floor,
+#    the ACTUAL output byte count must stay under budget*minBytesPerToken (2.36) — i.e. the packed map
+#    tokenizes to <= the requested budget for ANY language mix. We check bytes (a build-dep-free proxy for
+#    tokens via the densest 2.36 B/tok rate) so tiktoken isn't required here.
+#
+#    THE over_ceiling SPLIT (2026-08-17, W2-F). This arm used to assert the byte ceiling at EVERY N,
+#    including ones where the map's own header says `over_ceiling=1` — "the fixed floor (envelope + legend
+#    + attributes) does not fit inside fit_bytes with ZERO symbols of content". Those two statements
+#    contradict each other, and the contradiction was live rather than theoretical: at N=500 the
+#    pre-existing binary emitted over_ceiling=1 (a disclosed breach) while measuring 1173 B against this
+#    arm's looser 1180 B bound, so the gate called the cap held on a run the tool had already declared it
+#    could not hold. §F5 introduced the label precisely because a cap that can be overshot is not a cap and
+#    must SAY so; an arm that ignores the label is asserting a property the emitter never claimed.
+#
+#    So the loop splits on the label instead of pretending it is not there, and neither half is weaker
+#    than the whole was:
+#      * over_ceiling ABSENT — the emitter is claiming the cap held. The byte assertion binds, unchanged.
+#      * over_ceiling PRESENT — the emitter is claiming the floor alone exceeds the budget. The byte
+#        assertion is meaningless there, so assert the claim that IS being made: the map is at its floor
+#        (shown= is the minimum the search can reach), i.e. the overshoot is the envelope and not unpacked
+#        content. A map that blew the ceiling by SHOWING SYMBOLS would still be caught here.
+#    Plus the monotonicity that keeps the split honest: the label must vanish as N grows (asserted below),
+#    so "disclose over_ceiling" can never become a way to opt out of the ceiling at every budget.
+budget_ok=1
+floor_ok=1
+labelled=""
+for N in 500 1000 2000 5000; do
+    doc="$( "$BIN" src --max-tokens=$N --no-cache 2>/dev/null )"
+    B="$( printf '%s' "$doc" | wc -c | tr -d ' ' )"
+    if printf '%s' "$doc" | grep -q 'over_ceiling=1'; then
+        labelled="$labelled $N"
+        shownN="$( printf '%s' "$doc" | grep -oE 'shown=[0-9]+' | grep -oE '[0-9]+' | head -1 )"
+        floorShown="$( "$BIN" src --max-tokens=1 --no-cache 2>/dev/null | grep -oE 'shown=[0-9]+' | grep -oE '[0-9]+' | head -1 )"
+        if [ "${shownN:-x}" != "${floorShown:-y}" ]; then
+            echo "    N=$N discloses over_ceiling=1 but is NOT at the floor (shown=$shownN vs floor shown=$floorShown) — the overshoot is content, not envelope"
+            floor_ok=0
+        fi
+        continue
+    fi
+    # worst-case tokens <= B / 2.36 ; require that to be <= N (integer math: B*100 <= N*236)
+    if [ $(( B * 100 )) -gt $(( N * 236 )) ]; then
+        echo "    over budget at N=$N: $B bytes → up to $(( B * 100 / 236 )) tokens > $N (and NO over_ceiling label)"; budget_ok=0
+    fi
+done
+[ "$budget_ok" = 1 ] && ok "--max-tokens=N: where the map claims the cap held (no over_ceiling), it stays under N tokens (worst-case 2.36 B/tok)" \
+    || no "--max-tokens exceeded its budget for some N with NO over_ceiling disclosure (headroom/ceiling broken)"
+[ "$floor_ok" = 1 ] && ok "--max-tokens=N: where the map discloses over_ceiling=1 (N in{$labelled }), it is at its FLOOR — the overshoot is the envelope" \
+    || no "--max-tokens: an over_ceiling=1 map is packing content above its floor — the label is covering a real overshoot"
+# The label must be a SMALL-N property, not an escape hatch: the largest probed budget must not carry it.
+"$BIN" src --max-tokens=5000 --no-cache 2>/dev/null | grep -q 'over_ceiling=1' \
+    && no "--max-tokens=5000 discloses over_ceiling=1 — the fixed floor has grown past a realistic budget" \
+    || ok "--max-tokens=5000 carries no over_ceiling label (the floor is small relative to real budgets)"
+
+# ── #4: a bigger budget never packs FEWER symbols (monotone fit) — the binary search must be monotone ──
+S500="$( "$BIN" src --max-tokens=500  --no-cache 2>/dev/null | grep -oE 'shown=[0-9]+' | grep -oE '[0-9]+' )"
+S5000="$( "$BIN" src --max-tokens=5000 --no-cache 2>/dev/null | grep -oE 'shown=[0-9]+' | grep -oE '[0-9]+' )"
+{ [ -n "$S500" ] && [ -n "$S5000" ] && [ "$S5000" -ge "$S500" ] 2>/dev/null; } \
+    && ok "monotone fit: shown at 5000 ($S5000) >= shown at 500 ($S500)" \
+    || no "non-monotone --max-tokens fit (shown 500=$S500 5000=$S5000)"
+
+# ── #5: --max-tokens output is well-formed XML ────────────────────────────────────────────────────────
+if command -v xmllint >/dev/null 2>&1; then
+    "$BIN" src --max-tokens=1500 --no-cache 2>/dev/null | xmllint --noout - 2>/dev/null \
+        && ok "xml well-formed under --max-tokens" || no "xml malformed under --max-tokens"
+else
+    printf '  SKIP  xml well-formed (no xmllint)\n'
+fi
+
+# ── #6: (optional) tiktoken MAPE report — informational, never gates (tiktoken isn't a build dep) ──────
+if python3 -c 'import tiktoken' >/dev/null 2>&1; then
+    python3 - "$BIN" <<'PY'
+import sys, subprocess, os, re, statistics, tiktoken
+b=sys.argv[1]; enc=tiktoken.get_encoding("o200k_base")
+corpora=["test/metricsfix","test/resolvefix","test/rankbyfix","test/skillfix","test/regexfix","test/fixture","test/swiftfix","test/usesfix"]
+errs=[]
+for p in corpora:
+    if not os.path.isdir(p): continue
+    out=subprocess.run([b,p,"--no-cache"],capture_output=True).stdout.decode('utf-8','replace')
+    real=len(enc.encode(out)); m=re.search(r'est_tokens=(\d+)',out)
+    if not m: continue
+    est=int(m.group(1)); errs.append(abs(est-real)/real)
+if errs:
+    print(f"  INFO  calibrated est_tokens MAPE vs tiktoken o200k = {statistics.mean(errs)*100:.1f}%  (N={len(errs)}; target <=10%)")
+PY
+else
+    printf '  SKIP  tiktoken MAPE report (tiktoken not installed)\n'
+fi
+
+# ──  §D#7: --token-budget=N — the repomix-style CI EXIT-CODE gate (distinct from --max-tokens,
+# which SHAPES a map to fit; this one ASSERTS the result and fails). Gates on the SAME est_tokens the
+# header already reports — never a second counter (checked explicitly in #9 below). ──────────────────
+
+# ── #7: a generous budget → exit 0, map on stdout BYTE-IDENTICAL to the unflagged run (§P6.8: the flag
+#    must never SHAPE the map when the budget is not exceeded — it only asserts, or withholds) ───────────
+"$BIN" src --token-budget=999999 --no-cache >"$TMP_TB_A" 2>"$TMP_TB_A_ERR"
+rc_generous=$?
+"$BIN" src --no-cache >"$TMP_TB_DIR/unflagged.xml" 2>/dev/null
+{ [ "$rc_generous" -eq 0 ] && [ -s "$TMP_TB_A" ]; } \
+    && ok "--token-budget=999999 (generous): exit 0, map emitted" \
+    || no "--token-budget=999999 (generous): expected exit 0 + non-empty stdout, got exit=$rc_generous size=$(wc -c <"$TMP_TB_A" 2>/dev/null)"
+cmp -s "$TMP_TB_A" "$TMP_TB_DIR/unflagged.xml" \
+    && ok "--token-budget=999999: stdout is BYTE-IDENTICAL to the unflagged map (never shapes)" \
+    || no "--token-budget=999999: stdout differs from the unflagged map — the flag is shaping, not just gating"
+
+# ── #8: a tiny budget → exit 3 (distinct from --arch/--quality-delta's exit 2), stderr names actual vs budget ──
+"$BIN" src --token-budget=1 --no-cache >"$TMP_TB_B" 2>"$TMP_TB_B_ERR"
+rc_tiny=$?
+[ "$rc_tiny" -eq 3 ] \
+    && ok "--token-budget=1 (tiny): exit 3" \
+    || no "--token-budget=1 (tiny): expected exit 3, got $rc_tiny"
+if grep -qE 'est_tokens=[0-9]+ > budget=1$' "$TMP_TB_B_ERR" 2>/dev/null; then
+    ok "--token-budget=1: stderr names actual est_tokens vs the budget"
+else
+    no "--token-budget=1: stderr missing actual-vs-budget message (got: $(cat "$TMP_TB_B_ERR" 2>/dev/null))"
+fi
+
+# ── #8b (§P6.8): the REJECTED map must NOT reach stdout — a CI log that captures stdout on exit 3 must
+#    never receive the artifact the gate just refused. stdout stays small (< 2KB); the 20+ KB map body
+#    (grep for a real symbol name that only appears inside map rows) is absent. ───────────────────────────
+TB_B_BYTES="$( wc -c < "$TMP_TB_B" | tr -d ' ' )"
+[ "$TB_B_BYTES" -lt 2048 ] \
+    && ok "--token-budget=1: stdout is small on exit 3 ($TB_B_BYTES bytes < 2KB — map withheld)" \
+    || no "--token-budget=1: stdout is $TB_B_BYTES bytes (>= 2KB) — the rejected map is still leaking to stdout"
+grep -q '<s t="' "$TMP_TB_B" \
+    && no "--token-budget=1: stdout still contains <s t=\"...\"> map row content — not actually withheld" \
+    || ok "--token-budget=1: stdout carries no map row content"
+
+# ── #8c (§P6.8): a MID-size budget (over the generous run, under the full map) also withholds — not just
+# the degenerate budget=1 case — and reproduces the exact repro from  ──
+"$BIN" . --token-budget=100 --no-cache >"$TMP_TB_DIR/mid.xml" 2>"$TMP_TB_DIR/mid.err"
+rc_mid=$?
+MID_BYTES="$( wc -c < "$TMP_TB_DIR/mid.xml" | tr -d ' ' )"
+{ [ "$rc_mid" -eq 3 ] && [ "$MID_BYTES" -lt 2048 ]; } \
+    && ok "--token-budget=100 on repo root: exit 3, stdout $MID_BYTES bytes (< 2KB — the PLAN's own repro)" \
+    || no "--token-budget=100 on repo root: expected exit 3 + stdout < 2KB, got exit=$rc_mid bytes=$MID_BYTES"
+grep -qE 'est_tokens=[0-9]+ > budget=100$' "$TMP_TB_DIR/mid.err" \
+    && ok "--token-budget=100: stderr names actual est_tokens vs budget=100" \
+    || no "--token-budget=100: stderr missing actual-vs-budget message (got: $(cat "$TMP_TB_DIR/mid.err" 2>/dev/null))"
+
+# ── #9: the gate's actual number MUST equal the map header's own est_tokens (never a second counter) ───
+HDR_EST="$( grep -oE 'est_tokens=[0-9]+' "$TMP_TB_A" | grep -oE '[0-9]+' )"
+GATE_EST="$( grep -oE 'est_tokens=[0-9]+' "$TMP_TB_B_ERR" | grep -oE '[0-9]+' )"
+{ [ -n "$HDR_EST" ] && [ -n "$GATE_EST" ] && [ "$HDR_EST" = "$GATE_EST" ]; } \
+    && ok "gate value ($GATE_EST) == map header's est_tokens ($HDR_EST) — one counter, not two" \
+    || no "gate/header est_tokens MISMATCH (header=$HDR_EST gate=$GATE_EST) — a second counter crept in"
+
+# ── #10: determinism — the same command re-run twice gives the same exit code + the same est_tokens ───
+"$BIN" src --token-budget=1 --no-cache >/dev/null 2>"$TMP_TB_B2_ERR"; rc_tiny2=$?
+GATE_EST2="$( grep -oE 'est_tokens=[0-9]+' "$TMP_TB_B2_ERR" | grep -oE '[0-9]+' )"
+{ [ "$rc_tiny" = "$rc_tiny2" ] && [ "$GATE_EST" = "$GATE_EST2" ]; } \
+    && ok "--token-budget deterministic: exit ($rc_tiny) and est_tokens ($GATE_EST) match across re-runs" \
+    || no "--token-budget non-deterministic across re-runs (exit $rc_tiny vs $rc_tiny2; est $GATE_EST vs $GATE_EST2)"
+
+# ── #11: --token-budget accepts a K suffix (reuses --max-file-size's N[K|M|G] grammar) ─────────────────
+"$BIN" src --token-budget=16K --no-cache >/dev/null 2>/dev/null
+rc_ksuffix=$?
+[ "$rc_ksuffix" -eq 0 ] || [ "$rc_ksuffix" -eq 3 ] \
+    && ok "--token-budget=16K: K suffix parses (exit $rc_ksuffix, not a parse error)" \
+    || no "--token-budget=16K: K suffix rejected (exit $rc_ksuffix)"
+
+# ── #12: composes with --max-tokens — shaping to a small map, then asserting a smaller budget still fails ──
+"$BIN" src --max-tokens=500 --token-budget=10 --no-cache >/dev/null 2>"$TMP_TB_COMPOSE_ERR"
+rc_compose=$?
+[ "$rc_compose" -eq 3 ] \
+    && ok "--max-tokens=500 --token-budget=10: composes (shapes to ~500, still exceeds budget=10, exit 3)" \
+    || no "--max-tokens + --token-budget composition: expected exit 3, got $rc_compose"
+
+# ── #13: a bad --token-budget value is a clean parse error (exit 1), not a crash ────────────────────────
+"$BIN" src --token-budget=abc --no-cache >/dev/null 2>/dev/null
+rc_bad=$?
+[ "$rc_bad" -eq 1 ] \
+    && ok "--token-budget=abc: clean parse-error exit 1" \
+    || no "--token-budget=abc: expected exit 1, got $rc_bad"
+
+# ── D10: --for/--pack-task/--from-trace SHAPE instead of gate (always exit 0) — only the --for
+# carve-out was documented before this round, and the shaped bundle carried no est_tokens at all, so a
+# caller couldn't tell whether the shape actually fit. Checks #14-#16 close that gap for --for. ─────────
+
+# ── #14: the --for lens header reports its OWN est_tokens=N — present, positive, deterministic ─────────
+FOR_A="$( "$BIN" "$SRC_COPY" --for="parse arguments" --no-cache 2>/dev/null )"
+FOR_B="$( "$BIN" "$SRC_COPY" --for="parse arguments" --no-cache 2>/dev/null )"
+FOR_EST_A="$( printf '%s' "$FOR_A" | grep -oE 'est_tokens="[0-9]+"' | head -1 | grep -oE '[0-9]+' )"
+FOR_EST_B="$( printf '%s' "$FOR_B" | grep -oE 'est_tokens="[0-9]+"' | head -1 | grep -oE '[0-9]+' )"
+{ [ -n "$FOR_EST_A" ] && [ "$FOR_EST_A" -gt 0 ] 2>/dev/null && [ "$FOR_EST_A" = "$FOR_EST_B" ]; } \
+    && ok "--for header reports est_tokens (present, positive: $FOR_EST_A, deterministic; on the private copy of src/)" \
+    || no "--for header est_tokens missing/non-positive/non-deterministic (got '$FOR_EST_A' then '$FOR_EST_B')"
+
+# ── #15: --for's est_tokens tracks a --token-budget override — a tighter budget shapes to fewer tokens ──
+FOR_TIGHT="$( "$BIN" "$SRC_COPY" --for="parse arguments" --token-budget=200 --no-cache 2>/dev/null )"
+FOR_TIGHT_EST="$( printf '%s' "$FOR_TIGHT" | grep -oE 'est_tokens="[0-9]+"' | head -1 | grep -oE '[0-9]+' )"
+{ [ -n "$FOR_TIGHT_EST" ] && [ "$FOR_TIGHT_EST" -gt 0 ] 2>/dev/null && [ "$FOR_TIGHT_EST" -le "$FOR_EST_A" ] 2>/dev/null; } \
+    && ok "--for --token-budget=200 shapes to fewer/equal est_tokens ($FOR_TIGHT_EST <= $FOR_EST_A default)" \
+    || no "--for --token-budget=200 did not shrink est_tokens (tight=$FOR_TIGHT_EST default=$FOR_EST_A)"
+
+# ── #16: --for always exits 0 under a tiny --token-budget — SHAPES, never gates (contrast #8 above) ────
+"$BIN" src --for="parse arguments" --token-budget=1 --no-cache >/dev/null 2>/dev/null
+rc_for_tiny=$?
+[ "$rc_for_tiny" -eq 0 ] \
+    && ok "--for --token-budget=1: exit 0 (shapes to fit, never the map/--query exit-3 gate)" \
+    || no "--for --token-budget=1: expected exit 0 (shaping), got $rc_for_tiny"
+
+# ── #17 (W3FIX H2): the ABSOLUTE ceiling, not only the RELATIVE shape ──────────────────────────────────
+# #15/#16 are relative arms — a tighter budget shapes to fewer-or-equal tokens, and shaping never gates — and a
+# FLOOR satisfies both perfectly: --for on a 900-char task delivered 5.3x its own stated ceiling at EVERY
+# budget, which is monotone, exits 0, and shrinks as the budget shrinks. Every relative arm in this file passed
+# it, which is precisely why an absolute one has to exist. The bar is the ceiling PLUS the single-entry
+# overshoot the design allows (src/serialize.h kCeilingFirstEntryTolerance = 1.15 — the ranking section emits
+# its first entry whole): the delivered document either fits that, or SAYS over_ceiling. Never neither.
+TB_LONG_TASK="$( python3 -c "print(('budget accounting for the ranked lens header attributes '*20)[:900])" 2>/dev/null )"
+if [ -z "$TB_LONG_TASK" ]; then
+    no "#17: python3 unavailable — the absolute-ceiling arm could not build its 900-char task"
+else
+    for TB_B in 600 1200 2400; do
+        "$BIN" src --for="$TB_LONG_TASK" --token-budget=$TB_B --no-cache >"$TMP_TB_DIR/abs.$TB_B" 2>/dev/null
+        TB_BYTES="$( wc -c < "$TMP_TB_DIR/abs.$TB_B" | tr -d ' ' )"
+        TB_ALLOW="$( python3 -c "print(int($TB_B*2.36*1.15))" )"
+        # the disclosure lives in the header COMMENT — a body that quotes the word must not satisfy this arm
+        TB_HDR="$( head -c 6000 "$TMP_TB_DIR/abs.$TB_B" | sed -e 's/-->.*//' )"
+        if [ "$TB_BYTES" -le "$TB_ALLOW" ]; then
+            ok "#17 --for 900-char task --token-budget=$TB_B: $TB_BYTES B fits the $TB_ALLOW B allowance"
+        elif printf '%s' "$TB_HDR" | grep -q 'over_ceiling'; then
+            ok "#17 --for 900-char task --token-budget=$TB_B: $TB_BYTES B over $TB_ALLOW B and DISCLOSES over_ceiling"
+        else
+            no "#17 --for 900-char task --token-budget=$TB_B: $TB_BYTES B past the $TB_ALLOW B allowance in SILENCE"
+        fi
+    done
+fi
+
+# ── #18: THE CALIBRATION BAND — est_tokens against a REAL tokenizer, pinned ────────────────────────────
+# THE GAP THIS CLOSES. Everything above measures the estimate's PROPERTIES: present, positive,
+# deterministic, monotone under a tighter budget, and bounded by an allowance derived from the estimate's
+# OWN constants. Not one arm asks whether the number is TRUE. This file's own header said so — "the
+# MAPE-vs-tiktoken number is REPORTED by the agent in the T1 write-up (tiktoken isn't a build
+# dependency)" — which makes the accuracy of the tool's most-quoted number a thing a human typed into a
+# document once, in 2026-07, and nothing has re-derived since. METHODOLOGY §9 principle 6: measuring gets
+# its own instrument. This is it.
+#
+# HOW IT AVOIDS THE DEPENDENCY. The tokenizer runs OUT OF BAND (bench/tokenaudit/pin.py, by hand, with
+# tiktoken) and writes real o200k_base/cl100k_base counts into test/estcalib.manifest. This arm reads
+# numbers. No package, no network, bash + python3's stdlib + the binary — the same contract as
+# test/printf_parity.manifest.
+#
+# WHY THE PINS DO NOT ROT, and why the fixture is copied. test/estcalibfix is frozen, and the copy is
+# crawled from a temp dir by a RELATIVE path: outside any repository there is no `at="<sha>+dirty"` stamp
+# to change under a commit (or under a concurrent gate — the same shared-resource class this file's header
+# records at #14), and root="f" is one byte on every machine, so a deep checkout path cannot move the
+# count. Both artifacts that CAN move these numbers are the ones under test: the fixture and the emitter.
+#
+# THE BAND IS AN ENVELOPE, NOT A TARGET, and it is deliberately signed-asymmetric-free. Measured on three
+# corpora (this fixture, this repository, a 1500-file private C++ tree; bench/tokenaudit/README.md) the
+# signed error runs -18.4% to +41.7%: est_tokens OVER-reads the small legend-heavy bundles (the legend is
+# English prose at ~4.4 B/tok charged at a ~2.5 B/tok signature rate) and UNDER-reads --expand's dense
+# small bodies. So the band is +-, not a one-sided "never under-reads" floor: that claim was in
+# src/serialize.h and this instrument is what disproved it. What the band DOES buy is that the error
+# cannot silently double — a rate table edit, a new emitter charging bytes at the wrong rate, or a legend
+# that grows into a document whose price is quoted at the markup rate all leave the band.
+EST_MAN="$ROOT/test/estcalib.manifest"
+EST_FIX="$ROOT/test/estcalibfix"
+if [ ! -r "$EST_MAN" ] || [ ! -d "$EST_FIX" ]; then
+    no "#18: test/estcalib.manifest or test/estcalibfix missing — the calibration band cannot be measured"
+else
+    EST_TMP="$( mktemp -d )"
+    cp -R "$EST_FIX" "$EST_TMP/f"
+    est_pins=0
+    est_abs_sum=0
+    while read -r label o200k cl100k pinned_est rest; do
+        case "$label" in ""|\#*) continue ;; esac
+        # shellcheck disable=SC2086  # $rest is the pinned argv: deliberately word-split, never quoted
+        # L1 (2026-09-19): the o200k/cl100k counts were pinned (bench/tokenaudit/pin.py, needs tiktoken) on the FULL-legend
+        # documents, the default when they were taken; the CLI default is compact now, so the pinned argv asks for the
+        # document the counts describe. Re-pinning the default posture needs tiktoken — recorded in the L1 lane report.
+        EST_OUT="$( cd "$EST_TMP" && "$BIN" f $rest --legend=full 2>/dev/null )"
+        EST_GOT="$( printf '%s' "$EST_OUT" | grep -oE 'est_tokens="[0-9]+"' | head -1 | grep -oE '[0-9]+' )"
+        if [ -z "$EST_GOT" ]; then
+            no "#18 $label: no est_tokens in the output — the pin says this verb prices itself"
+            continue
+        fi
+        est_pins=$(( est_pins + 1 ))
+        EST_ERR="$( python3 -c "print( round( 100.0 * ( $EST_GOT - $o200k ) / $o200k, 2 ) )" )"
+        EST_ABS="$( python3 -c "print( int( round( abs( 100.0 * ( $EST_GOT - $o200k ) / $o200k ) ) ) )" )"
+        est_abs_sum=$(( est_abs_sum + EST_ABS ))
+        EST_LO="$( python3 -c "print( int( $o200k * 0.75 ) )" )"
+        EST_HI="$( python3 -c "print( int( $o200k * 1.55 ) )" )"
+        if [ "$EST_GOT" -ge "$EST_LO" ] && [ "$EST_GOT" -le "$EST_HI" ]; then
+            ok "#18 $label: est=$EST_GOT vs o200k=$o200k (cl100k=$cl100k), ${EST_ERR}% — inside [$EST_LO,$EST_HI]"
+        else
+            no "#18 $label: est=$EST_GOT vs o200k=$o200k, ${EST_ERR}% — OUTSIDE the measured band [$EST_LO,$EST_HI]"
+        fi
+    done < "$EST_MAN"
+    rm -rf "$EST_TMP"
+
+    # #18b AGGREGATE. A per-pin band tolerates one verb drifting to the edge; the MAPE is the number the
+    # T1 write-up quoted by hand and is what moves when the RATE TABLE is wrong rather than one emitter.
+    # 30 is the measured 21% plus headroom — tighten it when a calibration round earns the tightening.
+    if [ "$est_pins" -gt 0 ]; then
+        EST_MAPE=$(( est_abs_sum / est_pins ))
+        if [ "$EST_MAPE" -le 30 ]; then
+            ok "#18b est_tokens MAPE vs o200k = ${EST_MAPE}% over $est_pins pins (ceiling 30%)"
+        else
+            no "#18b est_tokens MAPE vs o200k = ${EST_MAPE}% over $est_pins pins — past the 30% ceiling"
+        fi
+    fi
+
+    # #18c MUTATION CONTROL. Eight pins are committed; a loop that measured fewer (a manifest truncated by
+    # a merge, a verb that stopped printing est_tokens) asserted less than the PASS lines above suggest.
+    if [ "$est_pins" -ge 8 ]; then
+        ok "#18c $est_pins pins measured against the tokenizer manifest"
+    else
+        no "#18c only $est_pins pin(s) measured — the band arms above asserted almost nothing"
+    fi
+fi
+
+# ── #20: an UNBUFFERED over-budget map is never called withheld ─────────────────────────────────────────────────
+# When the --token-budget buffer cannot open, the map streams straight to stdout. The gate then printed
+# withheld_est_tokens= on stderr beside the very map it claimed to withhold — stdout and stderr contradicting each
+# other. The buffer now opens through rw::openChargeStream, so CODECORTEX_FAULT_CHARGE_BUFFER reaches it (it was the one
+# buffer that bypassed the seam), and its DISCLOSE sink makes the gate say the map was NOT withheld (still exit 3).
+# The switch is non-NDEBUG only: read the flavour and SKIP on Release rather than pass blind.
+TB_FLAVOUR="$( "$BIN" --version 2>/dev/null | sed -nE 's/^[^(]*\(([^,)]*).*/\1/p' )"
+case "$TB_FLAVOUR" in
+    Release|RelWithDebInfo|MinSizeRel)
+        printf '  SKIP  #20 the charge-buffer fault switch is compiled out of this %s (NDEBUG) binary — the plain-flavour leg proves it\n' "$TB_FLAVOUR" ;;
+    *)
+        CODECORTEX_FAULT_CHARGE_BUFFER=1 "$BIN" "$ROOT/test/fixture" --token-budget=10 --no-cache >"$TMP_TB_DIR/t20.out" 2>"$TMP_TB_DIR/t20.err"; rc20=$?
+        if [ "$rc20" = 3 ] && grep -q '<r [^>]*est_tokens=' "$TMP_TB_DIR/t20.out" && grep -q '</r>' "$TMP_TB_DIR/t20.out"; then
+            ok "#20 the unbuffered over-budget map streamed whole and the run still exits 3"
+        else
+            no "#20 expected the whole streamed map and exit 3 (rc=$rc20): $( head -c 120 "$TMP_TB_DIR/t20.out" )"
+        fi
+        { grep -q 'the map above was NOT withheld' "$TMP_TB_DIR/t20.err" && ! grep -q 'withheld_est_tokens' "$TMP_TB_DIR/t20.err"; } \
+            && ok "#20 stderr says the map was NOT withheld, and never uses the withheld_ spelling beside it" \
+            || no "#20 stderr contradicts stdout: $( grep -v 'math degraded' "$TMP_TB_DIR/t20.err" | head -2 | tr '\n' ' ' )" ;;
+esac
+
+[ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES ABOVE"
+exit $fail

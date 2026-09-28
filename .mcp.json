@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "codecortex": {
+      "command": "codecortex",
+      "args": [".", "--mcp", "--mcp-ui"]
+    }
+  }
+}

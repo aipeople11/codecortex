@@ -1,0 +1,334 @@
+#!/usr/bin/env bash
+# skipreasoncheck.sh — the skip TAXONOMY: `--skipped` names WHY each file is absent, and the default
+# map header names the languages the index could not see at all.
+#
+# Why this gate exists. `--skipped` itemized exactly ONE drop reason — oversize. Every other way a file
+# leaves the corpus was invisible:
+#   * a file dropped by --exclude was simply gone (no row, no count);
+#   * a file whose EXTENSION has no grammar was gone the same way — and that is the load-bearing one,
+#     because it is how a whole LANGUAGE disappears. On facebook/infer (11 923 files, ~60% OCaml) the
+#     default map header gave zero indication that the repo's primary language contributed nothing;
+#     the top-ranked symbols were meaningless test fixtures. `oversize="0"` read as "index complete".
+# That is the honesty contract's own failure mode: a zero that means "none exists" rather than "none
+# found". This gate pins the taxonomy — one why= per drop class — and the header's unindexed= roll-up.
+#
+# Arms:
+#   (0) presence guards — the fixture really contains each drop class the arms below assert
+#   (1) why= vocabulary — oversize / excluded / unsupported-ext each appear on the right path
+#   (2) reconciliation — indexed= + oversize= + excluded= = the candidate population the crawl
+#       ENUMERATED, and unsupported_ext= counts the source/text-looking files outside it
+#   (3) unindexed= header — a tree whose bulk is .ml says so on the DEFAULT map, with a per-ext count
+#   (4) asset denylist — .png/.zip do NOT enter unindexed= (disclosed rule: binary/asset extensions)
+#   (5) zero means none found — a corpus with nothing dropped emits no unindexed= attribute at all
+#       (purely additive, G5/G4: the default map over a fully-indexable tree stays byte-identical)
+#   (6) determinism — two --skipped runs, byte-identical
+#   (7) well-formedness (G4) — --skipped pipes clean through xmllint when xmllint is available
+#   (8) BUILT-IN subtree prunes are counted too, and SEPARATELY from the user ones. Three prune paths
+#       converge on `it.disable_recursion_pending()` in ingest.cpp — a --exclude match, the committed
+#       denylist (ingest.h kCrawlSkipDirs), and the CMakeCache.txt build-output sentinel — but only the
+#       FIRST incremented a counter. So `--skipped` on a tree with node_modules/ reported every counter
+#       zero while whole subtrees had been dropped: the same "a zero that means none exists" failure the
+#       arms above exist to close, one level up. pruned_dirs= is its OWN attribute, never folded into
+#       excluded_dirs=, because the reader must be able to tell a policy prune (this build always does
+#       this) from a prune THEY asked for (--exclude).
+#   (9) BOTH header attributes arm (3) can produce — unindexed= and its unindexed_exts= cap bit — are
+#       DEFINED somewhere in the tool's own output. The map legend is not that place and this arm does not
+#       ask it to be: putting the clause there was tried and MEASURED, and on `src` at --max-tokens=500 the
+#       map's fixed floor sits 7 bytes under its allowance (test/tokenbudgetcheck.sh arm #3), so no wording
+#       fits. The --skipped legend is under no such budget and is where the definition lives; unindexed_exts=
+#       had no definition anywhere, which is the half that was genuinely undefined. The arm ALSO pins the
+#       negative — the map legend must stay byte-identical — so a future clause cannot land there silently.
+#
+# Usage:  bash test/skipreasoncheck.sh      [CODECORTEX_BIN=path/to/binary]
+# Exits non-zero on any failure.
+
+set -u
+ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+BIN="${1:-${CODECORTEX_BIN:-$ROOT/build/codecortex}}"
+[ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
+fail=0
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
+no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
+
+[ -x "$BIN" ] || { echo "no codecortex binary at $BIN — build first"; exit 2; }
+echo "skipreasoncheck: BIN=$BIN"
+TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
+
+# ── fixture ──────────────────────────────────────────────────────────────────────────────────────────
+# corpus/: one indexable .cpp, one OVERSIZE .cpp (>1K), one EXCLUDED .cpp (file-level --exclude match),
+#          three .ml (no grammar — the "whole language is invisible" case), one .mli, one .png asset.
+mkdir -p "$TMP/corpus"
+printf 'int keepThisSymbol( void ) { return 1; }\n' > "$TMP/corpus/keep.cpp"
+{ printf '// filler\n'; for i in $( seq 1 80 ); do printf 'int filler_%d( void ) { return %d; }\n' "$i" "$i"; done; } > "$TMP/corpus/big.cpp"
+printf 'int generatedThing( void ) { return 2; }\n' > "$TMP/corpus/vendorgen.cpp"
+for i in 1 2 3; do printf 'let ocamlFn%d x = x + %d\n' "$i" "$i" > "$TMP/corpus/mod$i.ml"; done
+printf 'val ocamlSig : int -> int\n' > "$TMP/corpus/mod1.mli"
+printf '\211PNG\r\n\032\n binary-ish payload\n' > "$TMP/corpus/logo.png"
+
+cd "$TMP"   # crawl arg `corpus` → root="corpus" + rows spell the bare relative path, machine-independently
+# RE-PINNED 2026-08-19 (R-E CORRECTION): with the crawl arg `corpus`, p= used to repeat that prefix on
+# every row; root-relative p= states it ONCE as root="corpus" and rows spell the bare relative path.
+# Still machine-independent — that is why this script cds into $TMP and crawls a relative arg.
+
+# ── (0) presence guards ──────────────────────────────────────────────────────────────────────────────
+bigBytes="$( wc -c < "$TMP/corpus/big.cpp" | tr -d ' ' )"
+[ "$bigBytes" -gt 1024 ] && ok "(0) big.cpp exceeds the 1K ceiling ($bigBytes B)" \
+                         || no "(0) big.cpp does NOT exceed 1024 B ($bigBytes B) — fixture broken"
+[ "$( ls "$TMP"/corpus/*.ml | wc -l | tr -d ' ' )" -eq 3 ] && ok "(0) fixture has 3 .ml files" \
+                         || no "(0) fixture does not have 3 .ml files — arm (3) would pass by finding nothing"
+[ -f "$TMP/corpus/logo.png" ] && ok "(0) fixture has an asset file (logo.png)" \
+                         || no "(0) fixture lost logo.png — arm (4) would pass by finding nothing"
+
+# ── (1) why= vocabulary ──────────────────────────────────────────────────────────────────────────────
+"$BIN" corpus --skipped --max-file-size=1K --exclude=vendorgen --no-cache > "$TMP/sk.xml" 2>/dev/null
+
+hasrow(){ # hasrow <path-substr> <why>
+  python3 - "$TMP/sk.xml" "$1" "$2" <<'PY'
+import re,sys
+x=open(sys.argv[1]).read(); p=sys.argv[2]; w=sys.argv[3]
+for m in re.finditer(r'<f\b[^>]*/>', x):
+    r=m.group(0)
+    if p in r and ('why="%s"'%w) in r:
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+if hasrow 'big.cpp'       oversize; then ok '(1) big.cpp     row carries why="oversize"'; else no '(1) NO why="oversize" row for corpus/big.cpp'; fi
+if hasrow 'vendorgen.cpp' excluded; then ok '(1) vendorgen.cpp row carries why="excluded"'; else no '(1) NO why="excluded" row for corpus/vendorgen.cpp'; fi
+if hasrow 'mod1.ml'       unsupported-ext; then ok '(1) mod1.ml     row carries why="unsupported-ext"'; else no '(1) NO why="unsupported-ext" row for corpus/mod1.ml'; fi
+grep -q 'p="keep.cpp"' "$TMP/sk.xml" && no '(1) keep.cpp is INDEXED — it must not appear as a skip row' \
+                                            || ok '(1) the indexed file (keep.cpp) has no skip row'
+
+# ── (2) reconciliation ───────────────────────────────────────────────────────────────────────────────
+attr(){ python3 - "$1" "$2" <<'PY'
+import re,sys
+x=open(sys.argv[1]).read(); m=re.search(r'<skipped\b[^>]*>',x)
+if not m: print(""); raise SystemExit(0)
+a=re.search(r'\b%s="([^"]*)"'%sys.argv[2], m.group(0))
+print(a.group(1) if a else "")
+PY
+}
+IDX="$( attr "$TMP/sk.xml" indexed )"
+OVR="$( attr "$TMP/sk.xml" oversize )"
+EXC="$( attr "$TMP/sk.xml" excluded )"
+UNS="$( attr "$TMP/sk.xml" unsupported_ext )"
+echo "    indexed=$IDX oversize=$OVR excluded=$EXC unsupported_ext=$UNS"
+if [ -n "$IDX" ] && [ -n "$OVR" ] && [ -n "$EXC" ] && [ "$(( IDX + OVR + EXC ))" -eq 3 ]; then
+  ok "(2) indexed+oversize+excluded = 3 (the enumerated .cpp candidate population)"
+else
+  no "(2) reconciliation broken: indexed=$IDX oversize=$OVR excluded=$EXC (want sum 3)"
+fi
+[ "$UNS" = "4" ] && ok "(2) unsupported_ext=4 (3 .ml + 1 .mli; the .png asset is excluded by the disclosed rule)" \
+                 || no "(2) unsupported_ext=$UNS, want 4"
+
+# ── (3) unindexed= on the DEFAULT map ────────────────────────────────────────────────────────────────
+# L1 (2026-09-19): the CLI default legend is compact, which defines unindexed= in the map legend by design; the (9) negative
+# arm guards the FULL map legend's --max-tokens headroom, so this run asks for the full legend (the header attribute is posture-free).
+"$BIN" corpus --no-cache --legend=full > "$TMP/map.xml" 2>/dev/null
+UNIDX="$( python3 - "$TMP/map.xml" <<'PY'
+import re,sys
+x=open(sys.argv[1]).read(); m=re.search(r'unindexed="([^"]*)"',x)
+print(m.group(1) if m else "")
+PY
+)"
+echo "    unindexed=\"$UNIDX\""
+case "$UNIDX" in
+  *ml:3*) ok '(3) default map header discloses unindexed="…ml:3…" — the invisible language says so' ;;
+  *)      no "(3) default map header has no ml:3 in unindexed= (got \"$UNIDX\")" ;;
+esac
+
+# ── (4) asset denylist ───────────────────────────────────────────────────────────────────────────────
+case "$UNIDX" in
+  *png*) no '(4) .png entered unindexed= — assets must be excluded by the disclosed rule' ;;
+  *)     ok '(4) .png is NOT counted in unindexed= (asset extension)' ;;
+esac
+
+# ── (5) zero means none found: a fully-indexable tree emits no unindexed= at all ─────────────────────
+mkdir -p "$TMP/clean"
+printf 'int cleanOne( void ) { return 1; }\n' > "$TMP/clean/a.cpp"
+printf 'def clean_two():\n    return 2\n'     > "$TMP/clean/b.py"
+"$BIN" clean --no-cache > "$TMP/clean.xml" 2>/dev/null
+grep -q 'unindexed=' "$TMP/clean.xml" && no '(5) unindexed= emitted on a fully-indexable tree — not additive' \
+                                      || ok '(5) no unindexed= attribute when nothing is unindexed (byte-identical default)'
+
+# ── (6) determinism ──────────────────────────────────────────────────────────────────────────────────
+"$BIN" corpus --skipped --max-file-size=1K --exclude=vendorgen --no-cache > "$TMP/sk2.xml" 2>/dev/null
+cmp -s "$TMP/sk.xml" "$TMP/sk2.xml" && ok '(6) two --skipped runs are byte-identical' \
+                                    || no '(6) --skipped output is NOT deterministic'
+
+# ── (7) well-formedness ──────────────────────────────────────────────────────────────────────────────
+if command -v xmllint >/dev/null 2>&1; then
+  xmllint --noout "$TMP/sk.xml" 2>/dev/null && ok '(7) --skipped is well-formed XML' \
+                                            || no '(7) --skipped is NOT well-formed XML'
+  xmllint --noout "$TMP/map.xml" 2>/dev/null && ok '(7) the map carrying unindexed= is well-formed XML' \
+                                             || no '(7) the map carrying unindexed= is NOT well-formed XML'
+else
+  echo "  SKIP  (7) xmllint unavailable"
+fi
+
+# ── (8) built-in subtree prunes are counted, and counted apart from the user ones ────────────────────
+# pruned/: one indexable .cpp at the top, three subtrees the CRAWL prunes by policy (node_modules and
+# dist from kCrawlSkipDirs, buildout/ via the CMakeCache.txt build-output sentinel) and one the USER
+# prunes (--exclude=genstuff). The two classes must land in two different counters.
+mkdir -p "$TMP/pruned/node_modules/pkg" "$TMP/pruned/dist" "$TMP/pruned/buildout" "$TMP/pruned/genstuff"
+printf 'int prunedKeep( void ) { return 1; }\n'  > "$TMP/pruned/keep.cpp"
+printf 'int nodeThing( void ) { return 2; }\n'   > "$TMP/pruned/node_modules/pkg/m.cpp"
+printf 'int distThing( void ) { return 3; }\n'   > "$TMP/pruned/dist/gen.cpp"
+printf '# CMake cache stub\n'                    > "$TMP/pruned/buildout/CMakeCache.txt"
+printf 'int builtThing( void ) { return 4; }\n'  > "$TMP/pruned/buildout/obj.cpp"
+printf 'int genThing( void ) { return 5; }\n'    > "$TMP/pruned/genstuff/g.cpp"
+
+# (8a) presence guard — the fixture really holds a file under each pruned subtree
+[ -f "$TMP/pruned/node_modules/pkg/m.cpp" ] && [ -f "$TMP/pruned/dist/gen.cpp" ] && [ -f "$TMP/pruned/buildout/obj.cpp" ] \
+    && ok "(8) fixture has a source file under each of the 3 built-in-pruned subtrees" \
+    || no "(8) fixture is missing a pruned-subtree source file — the arms below would pass by finding nothing"
+
+# L1 (2026-09-19): arms (8)/(9) read the FULL --skipped legend's prose from this run, so it asks for the full legend.
+"$BIN" pruned --skipped --no-cache --legend=full > "$TMP/prune_plain.xml" 2>/dev/null
+PR_PLAIN="$( attr "$TMP/prune_plain.xml" pruned_dirs )"
+EX_PLAIN="$( attr "$TMP/prune_plain.xml" excluded_dirs )"
+echo "    (8) no --exclude: pruned_dirs=\"$PR_PLAIN\" excluded_dirs=\"$EX_PLAIN\""
+if [ -n "$PR_PLAIN" ] && [ "$PR_PLAIN" -ge 3 ] 2>/dev/null; then
+  ok "(8) built-in prunes are COUNTED — pruned_dirs=$PR_PLAIN (node_modules, dist, the CMakeCache sentinel)"
+else
+  no "(8) pruned_dirs=\"${PR_PLAIN:-absent}\" — built-in subtree prunes are invisible (want >= 3)"
+fi
+[ "$EX_PLAIN" = "0" ] && ok "(8) excluded_dirs=0 with no --exclude — a policy prune is never miscounted as a user one" \
+                      || no "(8) excluded_dirs=\"$EX_PLAIN\" with no --exclude given — want 0"
+
+"$BIN" pruned --skipped --exclude=genstuff --no-cache > "$TMP/prune_exc.xml" 2>/dev/null
+PR_EXC="$( attr "$TMP/prune_exc.xml" pruned_dirs )"
+EX_EXC="$( attr "$TMP/prune_exc.xml" excluded_dirs )"
+echo "    (8) with --exclude=genstuff: pruned_dirs=\"$PR_EXC\" excluded_dirs=\"$EX_EXC\""
+[ "$EX_EXC" = "1" ] && ok "(8) the USER prune still lands in excluded_dirs=1, separately" \
+                    || no "(8) excluded_dirs=\"$EX_EXC\" under --exclude=genstuff — want 1"
+[ -n "$PR_EXC" ] && [ "$PR_EXC" = "$PR_PLAIN" ] && ok "(8) pruned_dirs is unchanged by --exclude ($PR_EXC) — the two counters do not bleed" \
+                    || no "(8) pruned_dirs moved from \"$PR_PLAIN\" to \"$PR_EXC\" when --exclude was added — the classes are folded together"
+
+LEG_SK="$( python3 - "$TMP/prune_plain.xml" <<'PY'
+import re,sys
+x=open(sys.argv[1]).read(); m=re.match(r'\A(?:\s*<ctx>)?(?:\s*<!--.*?-->)+', x, re.S)
+print(m.group(0) if m else "")
+PY
+)"
+case "$LEG_SK" in
+  *pruned_dirs=*) ok '(8) the skipped legend DEFINES pruned_dirs=' ;;
+  *)              no '(8) the skipped legend never spells pruned_dirs= — a counter no reader can read' ;;
+esac
+# The UNKNOWN language must belong to the pruned_dirs CLAUSE, not merely be present somewhere in a legend
+# that already says it about excluded_dirs= — otherwise this arm passes on the unfixed binary.
+if printf '%s' "$LEG_SK" | python3 -c '
+import re,sys
+leg = sys.stdin.read()
+m = re.search( r"pruned_dirs=", leg )
+sys.exit( 0 if m and "UNKNOWN" in leg[ m.start() : m.start() + 320 ] else 1 )
+'; then
+  ok '(8) the pruned_dirs clause itself carries the "contents UNKNOWN, not zero" language'
+else
+  no '(8) the pruned_dirs clause does not say the contents are UNKNOWN — a pruned subtree is not an empty one'
+fi
+
+# ── (9) unindexed= and unindexed_exts= are both DEFINED, and the map floor stays where it was ────────
+# The --skipped legend is the definition site (see the arm note in the header for the 7-byte measurement
+# that keeps it out of the map legend). LEG_SK is that legend, already extracted for arm (8).
+case "$LEG_SK" in
+  *unindexed=*) ok '(9) the skipped legend defines unindexed=' ;;
+  *)            no '(9) unindexed= is emitted (arm 3) and defined nowhere in the output' ;;
+esac
+case "$LEG_SK" in
+  *unindexed_exts=*) ok '(9) the skipped legend defines unindexed_exts= (the TOP-6 cap bit)' ;;
+  *)                 no '(9) unindexed_exts= is undefined everywhere — a cap disclosure no reader can read' ;;
+esac
+# The negative half: the MAP legend must not grow. Its leading comments are the v1 legend, any conditional
+# clause, then the stats header — the stats header is DATA (it literally contains unindexed="ml:3"), so it
+# is dropped before the check, or this arm could never see a clause land.
+maplegOf(){ python3 - "$1" <<'PY'
+import re,sys
+x = open( sys.argv[1] ).read()
+m = re.match( r'\A(?:\s*<!--.*?-->)+', x, re.S )
+lead = m.group( 0 ) if m else ""
+print( "".join( c for c in re.findall( r'<!--.*?-->', lead, re.S ) if not c.startswith( "<!-- files=" ) ) )
+PY
+}
+MAPLEG="$( maplegOf "$TMP/map.xml" )"
+case "$MAPLEG" in
+  *unindexed*) no '(9) a clause defining unindexed= landed in the MAP legend — re-run tokenbudgetcheck arm #3 before keeping it (the floor had 7 B of headroom)' ;;
+  *)           ok '(9) the map legend is unchanged — the --max-tokens floor keeps its headroom' ;;
+esac
+
+# ── (10) EXTRACT-PARTIAL: a file the extraction could not finish is itemized, never cached as whole ────────────────
+# An extraction pass that stops at a nesting bound (here: an #include nested inside 260 #if containers, past
+# kMaxImportContainerDepth), a grammar whose tags query is unavailable, or an extraction that throws part-way, used
+# to leave only a one-argument DISCLOSE — nothing at all in a Release binary — and the partial facts were CACHED under
+# the file's real hash, so every warm run reused them as the whole answer. The pass now discloses into the file's
+# ExtractShortfall sink: --skipped carries extract_partial="N" and one <f why="extract-partial"> row, defined in the
+# same document, in every build flavour; and the file's cache record is written UNKNOWN, so the row survives warm runs.
+XP="$TMP/xpartial"; mkdir -p "$XP/tree" "$XP/xdg"
+python3 - "$XP/tree/deep.c" <<'PYEOF'
+import sys
+open(sys.argv[1], "w").write( "#if 1\n" * 260 + '#include "deep.h"\n' + "#endif\n" * 260 + "int cfn( void ) { return 1; }\n" )
+PYEOF
+printf 'int ok( void ) { return 0; }\n' >"$XP/tree/clean.c"
+XPBYTES="$( wc -c <"$XP/tree/deep.c" | tr -d ' ' )"
+# The cache ladder is $TMPDIR/codecortex FIRST, then $XDG_CACHE_HOME (quality.h cacheDirLadder): isolate both.
+for run in cold warm; do
+    TMPDIR="$XP/xdg" XDG_CACHE_HOME="$XP/xdg" "$BIN" "$XP/tree" --skipped >"$XP/$run.xml" 2>/dev/null
+    XPROOT="$( grep -o '<skipped [^>]*>' "$XP/$run.xml" )"
+    printf '%s' "$XPROOT" | grep -q ' extract_partial="1"' \
+        && ok "(10/$run) --skipped counts the partially-extracted file: extract_partial=\"1\" (every build flavour)" \
+        || no "(10/$run) the partially-extracted file is not counted on <skipped>: $XPROOT"
+    grep -q "<f p=\"deep.c\" why=\"extract-partial\" bytes=\"$XPBYTES\" ext=\".c\"/>" "$XP/$run.xml" \
+        && ok "(10/$run) the file is itemized: <f p=\"deep.c\" why=\"extract-partial\" bytes=\"$XPBYTES\">" \
+        || no "(10/$run) no exact extract-partial row for deep.c: $( grep -o '<f p="[^"]*" why="[^"]*"[^/]*/>' "$XP/$run.xml" | head -3 )"
+done
+grep -q 'extract_partial= counts' "$XP/cold.xml" \
+    && ok "(10) extract_partial= is defined in the same document" || no "(10) extract_partial= rides with no definition"
+grep -q 'p="clean.c" why="extract-partial"' "$XP/cold.xml" \
+    && no "(10) control: the clean file was itemized extract-partial" || ok "(10) control: the clean file carries no extract-partial row"
+command -v xmllint >/dev/null 2>&1 && { xmllint --noout "$XP/cold.xml" 2>/dev/null \
+    && ok "(10) the disclosing document is well-formed" || no "(10) the disclosing document fails xmllint"; }
+
+# ── (10a) THE PARSER-VERSION FLOOR — the CI half of (10b), which runs without a base binary ─────────────────────
+# (10b) needs CODECORTEX_BASE and SKIPs in CI. What makes it true everywhere is the bump itself: a cache whose header names
+# an older kParserVer is refused (test/cacheidentitycheck.sh forges one and asserts reason="parser-version"), so every
+# cache written before extract-partial existed (kParserVer <= 116) is re-extracted. This pins the floor, from source:
+# kParserVer >= 117 and quality.h's mirror equal to it. The lane pinned 115 over its own base (114); train 7 landed it
+# as 117 (one past main's 116 from train 6), so a 115/116 cache predates extract-partial and the floor is 117. A later
+# bump keeps it green; only a revert below 117 reds it.
+PV_FLOOR=117
+PV="$( sed -nE 's/^constexpr std::uint32_t kParserVer +=[ ]*([0-9]+);.*/\1/p' "$ROOT/src/ingest_cache.h" )"
+PVM="$( sed -nE 's/^constexpr std::uint32_t kIngestParserVerMirror +=[ ]*([0-9]+);.*/\1/p' "$ROOT/src/quality.h" )"
+if [ -n "$PV" ] && [ "$PV" -ge "$PV_FLOOR" ] && [ "$PVM" = "$PV" ]; then
+    ok "(10a) kParserVer=$PV >= $PV_FLOOR and quality.h's mirror agrees — a pre-extract-partial cache cannot be served warm"
+else
+    no "(10a) kParserVer='$PV' (mirror '$PVM'): below the extract-partial floor $PV_FLOOR, or the mirror disagrees — a cache holding partial facts as whole would be trusted"
+fi
+
+# ── (10b) THE UPGRADE LADDER: a cache written by a PRE-extract-partial binary is not trusted as whole ──────────
+# Before this class existed, the partial facts of such a file were cached under its real content hash, and a warm
+# run served them as the whole answer. kParserVer's bump (ingest_cache.h) is what rejects every such cache: the
+# branch binary, run warm on a cache the base binary wrote, must re-extract and list the file. Needs a pre-bump
+# binary as CODECORTEX_BASE (the argvdiffcheck convention); SKIPs, and says so, without one — CI has no "previous" binary.
+BASE="${CODECORTEX_BASE:-}"
+if [ -z "$BASE" ]; then
+    printf '  SKIP  (10b) no CODECORTEX_BASE — the upgrade ladder needs a pre-bump binary to write the cache\n'
+elif [ ! -x "$BASE" ]; then
+    no "(10b) CODECORTEX_BASE=$BASE is not an executable"
+else
+    UL="$TMP/upgrade"; mkdir -p "$UL/cache"; cp -R "$XP/tree" "$UL/tree"
+    TMPDIR="$UL/cache" XDG_CACHE_HOME="$UL/cache" "$BASE" "$UL/tree" --skipped >"$UL/base.xml" 2>/dev/null; brc=$?
+    ls "$UL/cache/codecortex" 2>/dev/null | grep -q . \
+        && ok "(10b) guard: the base binary ran (rc=$brc) and wrote a cache under the isolated ladder" \
+        || no "(10b) guard: the base binary wrote no cache under $UL/cache — the ladder is void"
+    TMPDIR="$UL/cache" XDG_CACHE_HOME="$UL/cache" "$BIN" "$UL/tree" --skipped >"$UL/warm.xml" 2>/dev/null
+    grep -q "<f p=\"deep.c\" why=\"extract-partial\"" "$UL/warm.xml" \
+        && ok "(10b) the branch binary, warm on the base binary's cache, re-extracts and lists deep.c as extract-partial" \
+        || no "(10b) a cache written before the class existed was served as whole: no extract-partial row ($( grep -o '<skipped [^>]*>' "$UL/warm.xml" | grep -o 'extract_partial="[0-9]*"' ))"
+    TMPDIR="$UL/cache" XDG_CACHE_HOME="$UL/cache" "$BIN" "$UL/tree" --skipped >"$UL/warm2.xml" 2>/dev/null
+    grep -q "<f p=\"deep.c\" why=\"extract-partial\"" "$UL/warm2.xml" \
+        && ok "(10b) and again on the cache the branch binary rewrote" \
+        || no "(10b) the second warm run lost the extract-partial row"
+fi
+
+echo
+[ "$fail" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "FAILURES"; exit 1; }

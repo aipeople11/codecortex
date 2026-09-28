@@ -1,0 +1,1328 @@
+#pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
+
+// mcpindex.h — the warm in-memory index for --mcp: parse-once/reuse-across-calls
+// {ingest, graph, rank} keyed by root, its staleness machinery (mtime+size stat sweep, the
+// kqueue FS-event watcher, content-hash stamp), the multi-root workspace registry, getIndex()
+// (the warm-rebuild pipeline), and the stable content-handle system (lazy bodies). Extracted
+// from mcp.h (the mcp.h/main.cpp concern-split). Includes mcpjson.h; included by mcpverbs.h,
+// mcpedit.h, and mcp.h. Also carries the index-side mcpdetail helpers (mtime/stat/watcher/
+// byte-hash/handle codec) — the JSON-side mcpdetail helpers live in mcpjson.h (same namespace).
+
+#include "mcpjson.h"
+
+#include "model.h"
+#include "ingest.h"
+#include "graph.h"
+#include "serialize.h"
+#include "search.h"
+#include "gitmine.h"
+#include "lexical.h"
+#include "recall.h"
+#include "situ.h"
+#include "workspace.h"          // multi-root `paths` array (A11): root hygiene + labels + merge
+#include "infra/statclock.h"    // rw::saturatingNanoseconds — the staleness stat reads without signed overflow past 2262
+#include "quality.h"            // computeSnapshot/computeDelta + writeBaseline + gitHeadSha/computeHeadSnapshot — the quality_delta/quality_baseline verbs reuse the exact CLI logic
+#include "infra/Diagnostics.h"  // DISCLOSE — no-op in release; the visible line on a watcher-degrade path
+#include "infra/hashutil.h"     // sanitizer-clean modulo-2^64 FNV multiplication
+
+#include "infra/os.h"    // rw::os — stat + the nanosecond stat fields, open/close, flock, and the directory watcher
+
+// The FS-event watcher (os::dirwatch_*) exists only where the platform has kqueue: <sys/event.h> does not exist on
+// Linux at all, which is where the first public CI run stopped ("fatal error: sys/event.h: No such file or
+// directory", both ubuntu legs). It powers ONE optimisation — eliding the directory-mtime sweep on a settled tree —
+// and the watcher already has a fully-specified degrade path for "no watcher" (see FsWatcher below): stay
+// unhealthy, and getIndex() runs the full stat/mtime sweep on every request, i.e. the exact pre-Feature-1
+// behaviour. A platform without kqueue takes that same path, so the MCP staleness CONTRACT is unchanged — a stale
+// index is still detected on request, by the per-file mtime+size loop that runs regardless of the watcher. FUTURE
+// UPGRADE: inotify (Linux) / FSEvents would restore the elision; that is new code with its own event-semantics bug
+// surface and is deliberately not attempted here, because the poll fallback is already correct.
+//
+// `-DRW_OS_HAS_KQUEUE=0` (read by os.h) compiles the no-watcher path on a Mac, so the fallback can be built and RUN
+// here instead of being first discovered by a CI leg nobody can reproduce locally.
+//
+// L2 (Linux runtime probe) — why FsWatcher::arm's no-watcher branch (os::dirwatch_available() is false) is SILENT
+// while its watcher-failed branch still emits DISCLOSE. An alert marks an UNEXPECTED fallback: something
+// that normally works did not, this run. On a build with no watcher at all (every Linux build, and any
+// -DRW_OS_HAS_KQUEUE=0 build), the stat-sweep is not a fallback — it is the only path the binary has, taken on
+// every arm() call for the life of the process, forever. Alerting on it made every Linux MCP run emit a degrade
+// line nobody can act on, and reddened the stderr-clean gates that correctly read an alert as a signal. The
+// freshness CONTRACT is identical either way, which is precisely why that branch has nothing to report. A RUNTIME
+// kqueue() failure on a kqueue platform is the opposite event — the fast path exists and did not come up — so it
+// keeps its alert.
+
+#include <algorithm>    // std::sort — the card-A3 content-change merge-walk over two path lists
+#include <atomic>       // CODECORTEX_MCP_TIMINGS rebuild-count observable (env-gated stderr timing; off → untouched)
+#include <cctype>
+#include <cerrno>       // errno / EWOULDBLOCK — the edit-lock bounded-acquire loop (F1)
+#include <chrono>       // CODECORTEX_MCP_TIMINGS per-request steady_clock wall (env-gated)
+#include <ctime>        // nanosleep — the edit-lock bounded-acquire backoff (F1)
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <limits>
+#include <string>
+#include <string_view>
+#include <thread>       // Phase-M: the DETACHED qsnap-prefetch worker
+#include <utility>
+#include <vector>
+
+namespace rw
+{
+
+namespace mcpdetail
+{
+    // nanosecond mtime out of a filled stat_t, saturating past 2262 (infra/statclock.h) where the plain product
+    // overflowed. os::st_mtim reads the sub-second field under whichever name the platform gives it (st_mtimespec
+    // on Darwin/BSD, st_mtim on Linux, a whole-second fallback elsewhere), so no platform switch is needed here.
+    // Same arithmetic as ingest.cpp's statSizeTimes; kept local rather than shared because that one lives in a
+    // .cpp and hoisting it would move ingest internals into a header for two call sites.
+    inline long long mtimeNsOf( const os::stat_t& st ) noexcept
+    {
+        return saturatingNanoseconds( os::st_mtim( st ) );
+    }
+
+    // nanosecond mtime of a path, or -1 if it can't be stat'd. The staleness signal for the in-memory index.
+    inline long long mtimeOf( const std::string& p )
+    {
+        os::stat_t st;
+        if( os::stat( p.c_str(), &st ) != 0 )
+        {
+            return -1;
+        }
+        return mtimeNsOf( st );
+    }
+
+    // ctime-ns out of a filled stat_t, exactly like mtimeNsOf above. POSIX st_ctime is the inode CHANGE time, not a
+    // creation time: it moves on any write to the file and on any metadata change, INCLUDING the utimes() that a
+    // `touch -r` / `cp -p` / mtime-preserving editor performs. There is no POSIX interface for setting it, so an
+    // unprivileged writer cannot restore it.
+    inline long long ctimeNsOf( const os::stat_t& st ) noexcept
+    {
+        return saturatingNanoseconds( os::st_ctim( st ) );
+    }
+
+    // (mtime-ns, size, ctime-ns) of a path in ONE stat(), or (-1,-1,-1) if it can't be stat'd. mcpStale()
+    // uses all three: size and ctime both come free from the stat that already reads mtime, and between them
+    // they leave no same-(mtime,size) residual for a read to have to cover.
+    struct FileStat { long long mtimeNs; long long sizeBytes; long long ctimeNs; };
+    inline FileStat statOf( const std::string& p )
+    {
+        os::stat_t st;
+        if( os::stat( p.c_str(), &st ) != 0 )
+        {
+            return { -1, -1, -1 };
+        }
+        return { mtimeNsOf( st ), (long long)st.st_size, ctimeNsOf( st ) };
+    }
+
+    // ALL directories under root (root itself included) → their mtimes, pruning the same noise/vendor/build
+    // subtrees the ingest crawl prunes (mirrors kSkipDirs in ingest.cpp collectSources — keep in sync).
+    // This is the staleness watch-list: tracking every dir (not just parents of INGESTED files) means adding
+    // the first source file to a previously file-less directory is detected — creating the file bumps its
+    // own dir's mtime, and creating a brand-new subdir bumps its (already-tracked) parent's mtime, so every
+    // add/delete bubbles into a watched dir. Errors degrade: an unreadable subtree is simply not watched.
+    inline void collectDirMtimes( const std::string& root, HashMap<std::string, long long>& dirMtime )
+    {
+        namespace fs = std::filesystem;
+        dirMtime.try_emplace( root, mtimeOf( root ) );
+
+        std::error_code ec;
+        fs::recursive_directory_iterator it( fs::path( root ), fs::directory_options::skip_permission_denied, ec );
+        if( ec )
+        {
+            return; // unreadable root — the root mtime alone still catches top-level changes
+        }
+
+        const fs::recursive_directory_iterator end;
+        for( ; it != end; it.increment( ec ) )
+        {
+            if( ec ) { ec.clear(); continue; }
+            if( !it->is_directory( ec ) )
+            {
+                continue;
+            }
+
+            // prune the ingest denylist subtrees — changes inside them never affect the index
+            static constexpr std::string_view kSkipDirs[] = {
+                ".git", ".claude", ".hg", ".svn", "node_modules", "vendor", "third_party",
+                ".cache", "build", "dist", "out", "target", ".venv", "venv", "__pycache__",
+                ".idea", ".vscode",
+                "asan", "build_prof", "CMakeFiles" };
+            const std::string dn = it->path().filename().string();
+            bool skip = false;
+            for( std::string_view s : kSkipDirs )
+            {
+                if( dn == s ) { skip = true; break; }
+            }
+            if( !skip && dn.size() > 12 && dn.compare( 0, 12, "cmake-build-" ) == 0 )
+            {
+                skip = true;
+            }
+            if( !skip )
+            {
+                const fs::path cacheSentinel = it->path() / "CMakeCache.txt";
+                if( fs::exists( cacheSentinel, ec ) )
+                {
+                    skip = true;
+                }
+                ec.clear();
+            }
+            if( skip ) { it.disable_recursion_pending(); continue; }
+
+            const std::string d = it->path().string();
+            dirMtime.try_emplace( d, mtimeOf( d ) );
+        }
+    }
+
+    // ─── Feature 1: FS-event freshness watcher (codanna hot-reload, adapted deterministically) ─────────
+    //
+    // WHY a watcher AT ALL, and what it is (and is NOT) allowed to change:
+    //   The warm McpIndex answers every verb from an in-memory parse; the per-call staleness cost is mcpStale()'s
+    //   stat-sweep — a stat() per watched DIRECTORY (adds/deletes/renames) plus a stat() per FILE (content edits
+    //   via mtime+size). The directory portion scales with the tree's dir count and is pure overhead on the
+    //   common no-change path. A kqueue watcher over the (denylist-pruned) directory set replaces that whole
+    //   dir loop with ONE non-blocking kevent() poll when nothing structural changed: on a settled tree, the
+    //   dir sweep is provably redundant because the watcher would have reported any add/delete/rename.
+    //
+    // DETERMINISM CONTRACT — the load-bearing invariant. The watcher affects ONLY *which redundant work is
+    //   elided*, NEVER the bytes any verb returns for a given tree state:
+    //     • The PER-FILE mtime+size loop (the S1 content-staleness authority — catches a content-only,
+    //       mtime-preserved edit via the size discriminator; see mcpstalecheck) ALWAYS runs, watcher or not.
+    //       So a given tree state always produces byte-identical answers, and two processes agree: neither the
+    //       kqueue fd nor any timing leaks into one output byte.
+    //     • The watcher can only make us skip work it has ITSELF covered (structural changes) — it never lets a
+    //       real change go unseen. Unhealthy watcher OR any pending event → the FULL dir sweep runs (the exact
+    //       pre-Feature-1 path). No TTL, no clock: the skip decision is a pure function of the event queue.
+    //
+    // WHY dir-watch, not file-watch:
+    //   kqueue's EVFILT_VNODE needs one open fd PER watched node. Watching every FILE would exhaust the fd
+    //   table on a large tree, so we watch DIRECTORIES only (bounded = dir count, small). A dir NOTE_WRITE fires
+    //   on add / delete / rename inside it — but a CONTENT-ONLY edit to an existing file fires NO dir event
+    //   (verified empirically). That is exactly why the per-file loop is NEVER gated by the watcher: the
+    //   watcher covers structural changes, the always-run file loop covers content edits — together they are
+    //   complete, and neither is timing-dependent.
+    //
+    // DEGRADE, never throw: if kqueue()/open() fail (fd pressure, an OS without kqueue), the watcher is simply
+    //   marked unhealthy — getIndex() then always runs the full dir sweep, i.e. the exact pre-Feature-1 path.
+    struct FsWatcher
+    {
+        int              kq       = -1;      // the kqueue fd, or -1 if unavailable (→ unhealthy → always sweep)
+        std::vector<int> dirFds;             // one open fd per watched directory (registered EVFILT_VNODE)
+        bool             healthy  = false;   // true only when kq is open AND every dir fd registered cleanly
+
+        FsWatcher() = default;
+        FsWatcher( const FsWatcher& ) = delete;
+        FsWatcher& operator=( const FsWatcher& ) = delete;
+        ~FsWatcher() { reset(); }
+
+        // release every fd (symmetric teardown; called on rebuild before re-arming and at destruction).
+        void reset() noexcept
+        {
+            for( int fd : dirFds )
+            {
+                if( fd >= 0 )
+                {
+                    os::close( fd );
+                }
+            }
+            dirFds.clear();
+            if( kq >= 0 )
+            {
+                os::close( kq );
+            }
+            kq = -1;
+            healthy = false;
+        }
+
+        // arm the watcher over `dirs` (the McpIndex dirMtime key set). ALL-OR-NOTHING (A3-F4): `healthy`
+        // becomes true ONLY when kqueue() succeeded AND every dir registered cleanly — the field's contract.
+        // An unregistered dir produces NO events, so a partially-armed watcher that claimed health would let
+        // getIndex() skip the dir-mtime sweep (the only detector of file ADDITIONS) for exactly the dirs it
+        // cannot see: a permanent new-file blind spot, violating "the watcher can only make us skip work it
+        // has ITSELF covered". One fd per dir with no cap means fd exhaustion past RLIMIT_NOFILE is the
+        // COMMON failure past a few hundred dirs — on the FIRST failure, stop and release every watcher fd
+        // (relieving the very pressure we created) and stay unhealthy: getIndex() then always runs the full
+        // dir sweep (the exact pre-Feature-1 path). If kqueue() is unavailable, same degrade. L2: the
+        // no-kqueue-at-all arm is SILENT, the runtime-failure arm alerts — see the L2 note in this file's
+        // kqueue preamble for why those are different events.
+        void arm( const std::vector<std::string>& dirs )
+        {
+            reset();
+            if( !os::dirwatch_available() )                             // the DESIGNED path here (no watcher exists) — unhealthy → getIndex() always sweeps, silently (L2)
+            {
+                return;
+            }
+            kq = os::dirwatch_open();
+            if( kq < 0 )
+            {
+                DISCLOSE( Diagnostics::answerUnchanged, "the full stat sweep keeps the index exactly as fresh: only slower",
+                          "mcp watcher: kqueue() unavailable — falling back to stat-sweep freshness" );
+                return;
+            }
+
+            dirFds.reserve( dirs.size() );
+            for( const std::string& d : dirs )
+            {
+                const int fd = os::open( d.c_str(), O_RDONLY | O_CLOEXEC );
+                bool isRegistered = fd >= 0;
+                if( isRegistered )
+                {
+                    os::dirwatch_event ev;
+                    if( os::dirwatch_add( kq, fd, &ev ) < 0 ) { os::close( fd ); isRegistered = false; }
+                }
+                if( !isRegistered )                                     // fd limit / unopenable dir → degrade whole
+                {
+                    DISCLOSE( Diagnostics::answerUnchanged, "the full stat sweep keeps the index exactly as fresh: only slower",
+                              "mcp watcher: dir watch failed (fd limit or unopenable dir) — falling back to stat-sweep freshness" );
+                    reset();
+                    return;
+                }
+                dirFds.push_back( fd );
+            }
+            healthy = true;                                             // kq live AND every dir registered → the fast path is available
+        }
+
+        // drain all pending events (EV_CLEAR → edge-triggered, so this both reports AND resets them). Returns
+        // true if ANY event was pending since the last poll (a structural change under a watched dir). A poll
+        // failure degrades to `true` (assume changed → force a sweep — never skip on uncertainty).
+        bool drainHadEvent() noexcept
+        {
+            if( kq < 0 )
+            {
+                return true; // unhealthy (incl. every platform with no watcher, where arm() never opens kq) → force the sweep
+            }
+            os::dirwatch_event out[ os::kDirwatchBatch ];
+            struct timespec    zero = { 0, 0 };
+            bool               any = false;
+            for( ;; )
+            {
+                const int n = os::dirwatch_poll( kq, out, os::kDirwatchBatch, &zero );
+                if( n < 0 )
+                {
+                    return true; // poll error → conservative: assume changed
+                }
+                if( n == 0 )
+                {
+                    break;
+                }
+                any = true;
+                if( n < os::kDirwatchBatch )
+                {
+                    break; // fewer than the batch cap → queue drained
+                }
+            }
+            return any;
+        }
+    };
+
+    // read a whole file into a string; empty string (and readOk=false) on any open/read failure — the caller
+    // treats a read failure as "content unknown", which the edit verbs turn into a refusal (degrade, never
+    // splice against bytes we couldn't verify). Separate readOk out-param so an empty FILE (0 bytes, a legal
+    // state) is distinguishable from a missing/unreadable one.
+    inline std::string readFileBytes( const std::string& path, bool& readOk )
+    {
+        readOk = false;
+        std::FILE* in = std::fopen( path.c_str(), "rb" );
+        if( !in )
+        {
+            return {};
+        }
+        std::string s;
+        char b[ 8192 ];
+        std::size_t n;
+        while( ( n = std::fread( b, 1, sizeof( b ), in ) ) > 0 )
+        {
+            s.append( b, n );
+        }
+        const bool err = std::ferror( in ) != 0;
+        std::fclose( in );
+        if( err )
+        {
+            return {};
+        }
+        readOk = true;
+        return s;
+    }
+
+    // FNV-1a 64 over a byte range — the per-file content fingerprint the EDIT verbs verify against.
+    inline std::uint64_t byteHash( const char* data, std::size_t n ) noexcept
+    {
+        std::uint64_t h = 14695981039346656037ull;
+        for( std::size_t i = 0; i < n; ++i ) { h ^= static_cast<unsigned char>( data[i] ); h = hashutil::fnv1aMultiply( h ); }
+        return h;
+    }
+
+    // FNV-1a 64 over a std::string — the same hash the handle system uses for the STABLE identity part.
+    inline std::uint64_t str64( const std::string& s ) noexcept { return byteHash( s.data(), s.size() ); }
+
+    // ─── T4: stable content-handle system (lazy bodies) ───────────────────────────────────────────
+    //
+    // A handle lets an agent reference a symbol's body instead of re-receiving it: the READ verbs surface a
+    // `handle`, and the `fetch_body` verb returns the full def source ONLY when the agent asks. The contract
+    // is "names/signatures by default, bodies by handle on request" — the default-lean posture (~90% token
+    // cut measured when it was adopted) and the MCP-2026 stateless-HANDLE spec (`sym#<stableId>@<contentHash>`).
+    //
+    // Handle format:  sym#<canonIdHash>@<contentHash>   (both 16 lowercase hex = FNV-1a-64)
+    //   • canonIdHash — FNV-1a-64 of the symbol's STABLE canonical id (below). MUST derive from canonId, NEVER
+    //     from NodeId: NodeId is reassigned every run (warm==cold reassigns ids), so a NodeId handle is stale on
+    //     the very next call (trap library: "NodeId is per-run, canonId is stable"). canonId is `path::scope::
+    //     name` — a pure function of the source, byte-identical across two independent server processes and
+    //     across warm/cold, so the SAME symbol at the SAME content yields the SAME handle everywhere.
+    //   • contentHash — the FNV-1a-64 of the symbol's FILE bytes (the fileByteHash the index already computed
+    //     for the edit verbs). It PINS the version: if the file's bytes change, a handle minted against the old
+    //     bytes no longer matches → fetch_body detects the staleness for free and refuses (never serves a body
+    //     against shifted offsets — mirrors the edit-verbs' fileByteHash discipline).
+    //
+    // The STABLE id source: canonicalId() returns the BARE NAME for a free function (empty scope), which is not
+    // unique across files — two `helper()`s in two files would share a handle. So we fold the file PATH in for
+    // the unscoped case: `path::name`. The path is run-stable (the file's spelling doesn't change run-to-run),
+    // so the id stays stable while becoming unique-per-file. Scoped symbols already carry the path in canonId.
+    inline std::string stableHandleId( const std::string& canonId, const std::string& path, const std::string& name )
+    {
+        // scoped canonId already includes the path ("path::scope::name") → unique + stable, use as-is.
+        // free-function canonId is the bare name (resolve.h: empty scope → bare name) → fold the path in.
+        if( canonId.find( "::" ) != std::string::npos )
+        {
+            return canonId;
+        }
+        return path + "::" + name;                                          // unscoped: path-qualify for per-file uniqueness
+    }
+
+    // build the handle string for symbol `id`. canonId from g.canonId[id] (STABLE); contentHash = the file's
+    // byteHash as of index build (fileByteHash[fileId]). Both parts are pure functions of the source → the
+    // handle is deterministic and process-independent.
+    inline std::string makeHandle( const std::string& canonId, const std::string& path, const std::string& name,
+                                   std::uint64_t contentHash )
+    {
+        const std::uint64_t idHash = str64( stableHandleId( canonId, path, name ) );
+        char buf[ 64 ];
+        rw::formatTo( buf, sizeof( buf ), "sym#{:016x}@{:016x}",
+                       (unsigned long long)idHash, (unsigned long long)contentHash );
+        return buf;
+    }
+
+    // parse a handle "sym#<16hex>@<16hex>" → (idHash, contentHash, ok). Strict: exact prefix, exactly 16 hex
+    // per part, a single '@' separator, nothing trailing. A hand-mutated/garbage handle degrades to ok=false
+    // (the fetch verb refuses) — never a silent mis-resolve.
+    inline bool parseHandle( const std::string& h, std::uint64_t& idHash, std::uint64_t& contentHash )
+    {
+        idHash = 0; contentHash = 0;
+        if( h.size() != 4 + 16 + 1 + 16 )
+        {
+            return false; // "sym#" + 16 + "@" + 16
+        }
+        if( h.compare( 0, 4, "sym#" ) != 0 )
+        {
+            return false;
+        }
+        if( h[20] != '@' )
+        {
+            return false;
+        }
+        const auto hex16 = []( const std::string& s, std::size_t off, std::uint64_t& out ) -> bool
+        {
+            out = 0;
+            for( std::size_t i = 0; i < 16; ++i )
+            {
+                const char c = s[ off + i ];
+                std::uint64_t d;
+                if( c >= '0' && c <= '9' )
+                {
+                    d = std::uint64_t( c - '0' );
+                }
+                else if( c >= 'a' && c <= 'f' )
+                {
+                    d = std::uint64_t( c - 'a' + 10 );
+                }
+                else
+                {
+                    return false; // uppercase / non-hex → reject (handles are always lowercase)
+                }
+                out = ( out << 4 ) | d;
+            }
+            return true;
+        };
+        return hex16( h, 4, idHash ) && hex16( h, 21, contentHash );
+    }
+
+    // FNV-1a 64 over ing.files's (path, mtime, byteHash) tuples, in ing.files order. ingest() guarantees
+    // files are sorted lexicographically (the determinism contract), so this is already a stable
+    // iteration order; no per-call sort needed.
+    //
+    // We fold the per-file CONTENT hash (fileByteHash, computed at index build in getIndex) — NOT just
+    // (path,mtime) — because the stamp must change whenever answers change. A content-changed-but-mtime-
+    // preserved edit (the S1 hole) leaves (path,mtime) identical; folding byteHash means the stamp still
+    // moves, so it never lies alongside the fixed mcpStale() staleness. The bytes were read anyway at build
+    // (for the edit verbs), so this costs nothing extra. NUL-separated so "ab"+"c" and "a"+"bc" don't collide.
+    inline std::uint64_t indexContentHash( const std::vector<std::string>&   files,
+                                           const std::vector<long long>&      fileMtime,
+                                           const std::vector<std::uint64_t>&  fileByteHash )
+    {
+        std::uint64_t h = 14695981039346656037ull;
+        const auto mix = [ &h ]( const void* data, std::size_t n ) noexcept
+        {
+            const unsigned char* b = static_cast<const unsigned char*>( data );
+            for( std::size_t i = 0; i < n; ++i ) { h ^= b[i]; h = hashutil::fnv1aMultiply( h ); }
+        };
+        for( std::size_t i = 0; i < files.size(); ++i )
+        {
+            mix( files[i].data(), files[i].size() );
+            h ^= 0u; h = hashutil::fnv1aMultiply( h );                   // NUL separator
+            const long long m = ( i < fileMtime.size() ) ? fileMtime[i] : -1;
+            mix( &m, sizeof( m ) );
+            const std::uint64_t bh = ( i < fileByteHash.size() ) ? fileByteHash[i] : 0;
+            mix( &bh, sizeof( bh ) );                                    // content fingerprint → stamp moves on a mtime-preserved edit
+        }
+        return h;
+    }
+}   // namespace mcpdetail
+
+// ---- persistent in-memory index (parse once, reuse across MCP calls) ----
+// The MCP server is long-lived; previously every verb re-parsed the whole tree (~6.5 s each). This caches
+// the assembled {ingest, graph, rank} keyed by root and reuses it INSTANTLY when nothing changed. Staleness
+// = any source file's mtime OR the mtime of ANY directory under root (walked at index time with the same
+// denylist pruning as ingest — not just parents of ingested files, so the first source file added to a
+// previously file-less directory is caught too: the new file bumps its dir, a new subdir bumps its watched
+// parent — modifications, additions, AND deletions all bubble into a watched dir). When stale, the rebuild
+// is WARM — it goes through the file content-hash cache, so only changed files re-parse.
+struct McpIndex
+{
+    std::string                       root;
+    bool                              valid = false;
+    IngestResult                      ing;
+    Graph                             g;
+    std::vector<float>                rank;
+    RankDisclosure                    prDisclosure;   // W2-F: what the power iteration behind `rank` did →
+                                                      //   pr_iters= / pr_converged= on every ranked MCP payload.
+                                                      //   Held beside the vector it describes so a verb cannot
+                                                      //   serve one without the other (src/prconverge.h).
+    std::vector<long long>            fileMtime;   // parallel to ing.files
+    std::vector<long long>            fileSize;    // parallel to ing.files: st_size at index build (staleness fast-path discriminator,
+                                                   //   free from the same stat() as mtime — a size change is caught without a read).
+    std::vector<long long>            fileCtime;   // parallel to ing.files: st_ctime at index build. The THIRD discriminator, also free
+                                                   //   from that same stat(): an unprivileged writer can restore mtime and preserve
+                                                   //   length, but not ctime, so a same-(mtime,size) edit is stale here (card A3
+                                                   //   follow-up). -1 (unstatable) reads as a mismatch, which is the safe direction.
+    std::vector<std::uint64_t>        fileByteHash;   // parallel to ing.files: FNV-1a of the file's BYTES at index build.
+                                                      //   The EDIT verbs (replace/insert) compare a fresh read against this before
+                                                      //   splicing — mtime alone can lie (same mtime, different content on a fast
+                                                      //   restore/rewrite), and a byte hash is the only signal that proves the span
+                                                      //   offsets the index computed still address the same source. S1 ALSO folds it into
+                                                      //   the stamp (indexContentHash) so the `_index` stamp moves on ANY content change,
+                                                      //   even a same-(mtime,size) edit the stat check misses.
+    HashMap<std::string, long long>   dirMtime;    // ALL dirs under root (denylist-pruned), root included
+    std::string                       cacheFile;   // file --cache backing cheap rebuilds
+    std::uint64_t                     contentHash = 0;   // FNV-1a of sorted (path,mtime,byteHash) — the stamp payload (S1: content-folded)
+
+    // Feature 1 (freshness): the FS-event watcher over dirMtime's dir set. It lets getIndex() SKIP the
+    // directory-mtime portion of mcpStale() when no structural change occurred (see FsWatcher). Pure
+    // WHEN-to-check state — it never enters an output byte, so RESULT bytes stay a function of tree state.
+    mcpdetail::FsWatcher              watcher;
+
+    // working-set personalization (feature 2, Cody-style): the uncommitted-diff mask `rank` was teleport-biased
+    // toward, as of the LAST rebuild — kept so mcpStale() can detect "same tree, different diff" (see below).
+    std::uint64_t                     workingSetHash = 0;   // FNV-1a of the changed-file id list used to build `rank`
+
+    // ── P1-15 incremental-pass disclosure (the `_reingest` envelope field; mcpReingestField below).
+    //
+    // incrementalPasses counts ONLY rebuilds that refreshed an index this process ALREADY held for this
+    // root — never the initial build, and that exclusion is the load-bearing part. A first build re-extracts
+    // the whole corpus against a cold cache blob and nothing at all against a warm one, so disclosing its
+    // cost would make two runs of the same request answer with different bytes and break MCP cache
+    // transparency (gated by mcpverbscheck / mcprobustcheck / mcpclidiffcheck). Counting only refreshes
+    // makes the disclosed number a function of the session's own EDITS, which replay identically either way,
+    // so the disclosure and the determinism contract stop competing. The initial build's cost stays where it
+    // always was: the CODECORTEX_CACHE_STATS stderr line.
+    //
+    // lastReingestFiles is that pass's cost (ing.reparsedFiles, latched at the rebuild rather than read live
+    // off `ing`, so a later warm reuse cannot re-report an older pass's cost as its own). Neither field may
+    // ever reach an output byte that must match a cold run — both are process history, not tree state.
+    std::uint64_t                     incrementalPasses = 0;
+    std::size_t                       lastReingestFiles = 0;
+
+    // ── card A3 freshness disclosure (`_fresh` / `_stale_files` / `_changed_files`; mcpFreshFields below).
+    // Same category as the two above — PROCESS HISTORY, never tree state. Latched at the rebuild that
+    // produced them, from mcpStaleFileCount and mcpContentChangeCount, whose comments carry the contract:
+    // how many recorded stats moved, and how many files actually differ in CONTENT. Two numbers rather than
+    // one because they disagree on two of the four mutations (add: 0/1, touch: 1/0). Both are 0 when the
+    // rebuild ran with no sweep at all — an edit verb's invalidateMcpIndex, or a root switch.
+    std::size_t                       lastStaleFiles    = 0;
+    std::size_t                       lastChangedFiles  = 0;
+};
+
+// Cache file path, deterministic per (user, root), under the shared private cache ladder and its existing
+// two-hex shard layout. MCP sessions used to leave one flat file per temporary checkout directly in TMPDIR;
+// tens of thousands of those files made every later cache-hygiene scan enumerate the shared directory.
+//
+// The root field is `quality::cacheRootKeyHex` — the ONE canonical spelling the CLI families use, so an MCP
+// blob is pinned by the byte-budget sweep alongside its own root's lean/rich/qchurn siblings instead of
+// looking like a foreign root. This used to open-code the hash AND skip realpath entirely, so the MCP blob
+// diverged from the CLI's twice over: a different offset basis, and a key that followed the SPELLING of the
+// root (a trailing slash or a symlinked checkout minted a second blob).
+inline std::string mcpCachePath( const std::string& root )
+{
+    return quality::rootKeyedCachePath( root, "codecortex-mcp-", ".cache" );
+}
+
+// working-set (Cody-style): FNV-1a-64 of the SORTED changed-file id list, so the hash is a pure
+// function of the SET (git's --name-only order is not guaranteed stable) and empty/no-git both hash to the
+// same "no working set" value — this collapses the "clean tree" and "not a git repo" cases into identical
+// rank behavior (both must byte-match the pre-feature uniform-prior output), which is exactly what §GATE(d)
+// requires: a clean tree's stamp/rank must equal a non-git root's.
+inline std::uint64_t workingSetHashOf( const std::vector<char>& changed )
+{
+    std::uint64_t          h = 14695981039346656037ull;
+    std::vector<std::uint32_t> ids;
+    for( std::uint32_t f = 0; f < changed.size(); ++f )
+    {
+        if( changed[f] )
+        {
+            ids.push_back( f );
+        }
+    }
+    for( std::uint32_t f : ids )
+    {
+        h ^= f;
+        h = hashutil::fnv1aMultiply( h );
+        h ^= ( f >> 8 );
+        h = hashutil::fnv1aMultiply( h );
+    }
+    return h;
+}
+
+// mcpStale: what to re-check, and at what cost.
+//
+// mtimes (file + all watched dirs) are a stat() per entry — microseconds total, checked on EVERY MCP call
+// regardless of verb (getIndex() is called by every verb handler).
+//
+// The working set (feature 2) adds a THIRD staleness source in principle — `git diff --name-only HEAD` can
+// change independently of the tracked mtimes. Deliberately NOT stat-checked here; instead git diff is only
+// ever re-run inside getIndex()'s rebuild path (below), which fires exactly when mcpStale() returns true.
+// Why that composes correctly: every case that ADDS to or SHRINKS the working set through a normal edit
+// (save/create/delete) touches that file's mtime or its directory's mtime — dirty files are, tautologically,
+// files whose bytes changed since the last commit's checkout, and changing bytes changes mtime — so the
+// mtime check below is a reliable trigger for "the diff set may have changed too", and git diff gets
+// re-invoked as part of the SAME rebuild, not as a separate probe. The one gap: reverting a file
+// (`git checkout -- file`, or a stash-pop that restores pre-edit bytes) can leave mtime bumped from the
+// write while the diff itself shrinks back toward clean — that self-heals on the next edit (or the next
+// `touch`-triggered getIndex() call) and meanwhile only costs a stale-but-not-wrong-forever rank bias
+// (teleport mass lingers on a file that's no longer actually dirty; PageRank still converges, it just
+// personalizes toward slightly the wrong set for one call).
+//
+// Cost tradeoff (measured — see report): `git diff --name-only` via popen() is ~10-20ms on this repo. Paying
+// that on EVERY verb call (even when nothing changed) would erase most of the point of McpIndex (the
+// ~6.5s→instant warm-path win) — so it must NOT be in this stat-only hot-path check. Tying it to the existing
+// mtime-triggered rebuild means: unchanged tree → zero popen, pure stat() (no added per-call cost); any real
+// edit → one rebuild that already pays for a fresh ingest, and one more popen is noise next to that.
+//
+// S1 — the mtime-equality staleness hole. mtime EQUALITY alone was serving
+// STALE answers when a file's content changed but its mtime was preserved (`touch -r` after an edit, or an
+// edit whose mtime was otherwise reset). The fix adds the file SIZE — captured for free from the SAME stat()
+// that already reads mtime — as a second staleness discriminator, plus a content-hash fold into the stamp.
+//
+//   • mtime differs → stale. (unchanged behavior)
+//   • SIZE differs → stale. (NEW) Every content edit that changes the byte length — which is essentially
+//     every real edit: adding/removing/renaming a symbol, inserting a line, changing an identifier's length —
+//     is now caught EVEN IF the mtime was restored. This is the audit's own reproduction (an edit that adds
+//     or renames a symbol), and it is caught at zero read cost, one stat() per file.
+//
+//   • ctime differs → stale. (NEW, card A3 follow-up — docs/EVALS.md) The third discriminator, also free
+//     from the SAME stat(). It closes what used to be the residual below.
+//
+// WHAT THE RESIDUAL WAS, AND WHY THE COMMENT THAT USED TO STAND HERE WAS WRONG. A content change preserving
+// BOTH the mtime AND the exact byte length — a same-length identifier rename plus `touch -r` to the original
+// mtime — was NOT caught, and this comment asserted that "catching it is provably impossible without READING
+// the file's bytes". That reasoning was sound about the two fields it considered and wrong about the third
+// the same ::stat already returns. Reading is indeed unaffordable: on the common no-change path every file
+// is stat-equal, so a read+hash fallback is a whole-tree re-read per verb call — MEASURED at ~168 ms/call vs
+// ~12.5 ms/call on a 1320-file/38 MB tree (~13x) — which would destroy the stat-sweep design. But st_ctime
+// moves on any write AND on the utimes() the mtime restore performs, and POSIX gives an unprivileged process
+// no way to set it back, so the same reproduction is now caught at zero additional cost. Reproduced and
+// gated end-to-end in test/freshnesscheck.sh arm 7 (this surface) and arm 6 / statgatecheck (b2) (the CLI
+// cache an --mcp rebuild re-ingests through — both halves had to change, since a rebuild that then trusted
+// ingest()'s stat gate would have been handed the pre-edit facts).
+//
+// WHAT IS STILL OUTSIDE IT, named rather than implied: a caller who can move the system clock backward, raw
+// block-device manipulation, and a filesystem that maintains no distinct ctime (FAT/exFAT, some SMB mounts)
+// — there this check degrades to exactly its pre-ctime behaviour. Two backstops still cover that case in the
+// paths that matter: (1) the EDIT verbs re-read + byte-hash the target file on every write, so a splice is
+// NEVER applied against stale offsets regardless of this check (mcpeditcheck step 5); (2) any
+// watched-directory mtime bump (a sibling add/delete, a re-save through most editors) triggers a full
+// rebuild. `fileSize`/`fileByteHash` are retained on McpIndex for the edit verbs and the content-folded
+// stamp below; the stamp moves on ANY content change, so a caller holding two results can still detect that
+// the state changed even where this check degrades.
+// `skipDirSweep` — Feature 1 fast path: when the kqueue watcher has proven NO structural event fired since
+// the last check, the directory-mtime loop (which catches adds/deletes/renames bubbling into a watched dir)
+// is provably redundant and may be skipped. The PER-FILE mtime+size loop is ALWAYS run regardless: it is the
+// S1 staleness authority (a content-only, mtime-preserved edit is caught by the size discriminator — see
+// mcpstalecheck), and the watcher does NOT catch content-only edits, so skipping it would reopen the S1 hole
+// AND make results timing-dependent. So the fast path only ever elides work the watcher has already covered;
+// the answer for a given tree state is byte-identical whether or not the dir loop ran.
+inline bool mcpStale( const McpIndex& ix, bool skipDirSweep = false )
+{
+    if( !ix.valid )
+    {
+        return true;
+    }
+
+    // directory watch-list (catches adds/deletes/renames that bubble into a watched dir). Skipped ONLY when
+    // the FS-event watcher has proven no structural change occurred (getIndex passes skipDirSweep in that case).
+    if( !skipDirSweep )
+    {
+        for( const auto& [d, m] : ix.dirMtime )
+        {
+            if( mcpdetail::mtimeOf( d ) != m )
+            {
+                return true;
+            }
+        }
+    }
+
+    // per-file mtime+size+ctime loop — ALWAYS run (the content-staleness authority; never gated by the watcher).
+    for( std::size_t i = 0; i < ix.ing.files.size(); ++i )
+    {
+        const auto [ mtime, size, ctime ] = mcpdetail::statOf( diskPath( ix.ing, std::uint32_t( i ) ) );   // one stat() → all three signals
+        const long long recMtime = ix.fileMtime[i];
+        const long long recSize  = ( i < ix.fileSize.size() )  ? ix.fileSize[i]  : -1;
+        const long long recCtime = ( i < ix.fileCtime.size() ) ? ix.fileCtime[i] : -1;
+        if( mtime != recMtime || size != recSize || ctime != recCtime )
+        {
+            return true; // mtime OR size OR ctime moved → stale, no read
+        }
+    }
+    return false;
+}
+
+// Card A3 — HOW MANY indexed files diverged, where mcpStale() only answers WHETHER one did. Deliberately a
+// second function rather than an out-parameter on mcpStale: the hot path asks a yes/no question and must
+// keep its first-mismatch early return, and only the REBUILD path (which is about to pay for a full
+// re-ingest, three orders of magnitude more than a stat sweep) needs the number. A dir-only change — the
+// ADD case — correctly counts 0 here: no indexed file moved, the containing directory did.
+inline std::size_t mcpStaleFileCount( const McpIndex& ix )
+{
+    std::size_t n = 0;
+    for( std::size_t i = 0; i < ix.ing.files.size(); ++i )
+    {
+        const auto [ mtime, size, ctime ] = mcpdetail::statOf( diskPath( ix.ing, std::uint32_t( i ) ) );
+        const long long recSize  = ( i < ix.fileSize.size() )  ? ix.fileSize[i]  : -1;
+        const long long recCtime = ( i < ix.fileCtime.size() ) ? ix.fileCtime[i] : -1;
+        n += ( mtime != ix.fileMtime[i] || size != recSize || ctime != recCtime ) ? 1u : 0u;
+    }
+    return n;
+}
+
+// Card A3 — an index's per-file content fingerprints as a SORTED (identity path, byte hash) list. Sorted so
+// the comparison below is one linear walk and independent of crawl order (a workspace merge concatenates
+// per-root file lists, so globally sorted is not free). Reads no file: `hashes` was computed by the build
+// that produced `ing`.
+inline std::vector<std::pair<std::string, std::uint64_t>> mcpContentFingerprints( const IngestResult& ing,
+                                                                                 const std::vector<std::uint64_t>& hashes )
+{
+    std::vector<std::pair<std::string, std::uint64_t>> out;
+    out.reserve( ing.files.size() );
+    for( std::size_t i = 0; i < ing.files.size(); ++i )
+    {
+        out.emplace_back( ing.files[i], i < hashes.size() ? hashes[i] : 0 );
+    }
+    std::sort( out.begin(), out.end() );
+    return out;
+}
+
+// Card A3 — everything about the OUTGOING index that the disclosure needs, captured in one call before the
+// rebuild overwrites it. Two fields because the two questions have different answers (an add moves no
+// indexed file's stat; a touch moves a stat and no byte), and `comparable` because an initial build has no
+// predecessor: it is false exactly when there was nothing to replace, which is what makes the change count
+// below 0 rather than "every file is new".
+struct McpRebuildBaseline
+{
+    bool                                              comparable = false;
+    std::size_t                                       staleFiles = 0;   // indexed files whose recorded stat moved
+    std::vector<std::pair<std::string, std::uint64_t>> content;         // sorted fingerprints of the index being replaced
+};
+
+inline McpRebuildBaseline mcpRebuildBaseline( const McpIndex& ix, bool isIncrementalPass )
+{
+    if( !isIncrementalPass )
+    {
+        return {};
+    }
+    return { true, mcpStaleFileCount( ix ), mcpContentFingerprints( ix.ing, ix.fileByteHash ) };
+}
+
+// Card A3 — how many files actually differ in CONTENT between the replaced index and the fresh one: an
+// ADDED path, a REMOVED path and a path whose bytes moved each count one. This is the number that separates
+// "the index was refreshed" from "the tree changed", and the case they disagree on is the point — a bare
+// `touch` moves a recorded stat (so staleFiles is 1) and no byte (so this is 0).
+//
+// Counted through the two set sizes rather than by adding up cases: over two path-sorted lists, `common` is
+// how many paths both carry and `same` how many of those also agree on bytes, so removed + added + modified
+// collapses to |prev| + |now| − common − same. One walk, one arithmetic identity, no per-case bookkeeping.
+inline std::size_t mcpContentChangeCount( const McpRebuildBaseline& before,
+                                          const std::vector<std::pair<std::string, std::uint64_t>>& now )
+{
+    if( !before.comparable )
+    {
+        return 0;
+    }
+    const auto& prev = before.content;
+    std::size_t common = 0, same = 0, a = 0, b = 0;
+    while( a < prev.size() && b < now.size() )
+    {
+        if( prev[a].first < now[b].first )      { ++a; }
+        else if( now[b].first < prev[a].first ) { ++b; }
+        else                                    { ++common; same += ( prev[a].second == now[b].second ) ? 1u : 0u; ++a; ++b; }
+    }
+    return prev.size() + now.size() - common - same;
+}
+
+// the single process-wide cached index. File-scope (not a function-local static) so the EDIT verbs can flip
+// its `valid` flag after a successful write, forcing the next verb to rebuild (belt-and-braces on top of the
+// mtime watch — see invalidateMcpIndex / the edit handlers). inline → one definition across TUs.
+inline McpIndex& mcpIndexSlot()
+{
+    static McpIndex ix;
+    return ix;
+}
+
+// force the cached index stale — the next getIndex() call rebuilds from disk. Called after a successful edit
+// so a follow-up verb never answers from an index that predates the write. Cheap: one bool flip.
+inline void invalidateMcpIndex()
+{
+    mcpIndexSlot().valid = false;
+}
+
+// CODECORTEX_MCP_TIMINGS observable (MEASURE-FIRST, mirrors ingest.cpp's CODECORTEX_CACHE_STATS precedent): a
+// monotone count of FULL getIndex() rebuilds (the staleness/edit path — NOT warm reuses). The spec_trace
+// harness reads it before/after each request to attribute per-request wall time to "rebuilt" vs "warm".
+// Relaxed: the only reader is the same-thread timing print in runMcp, ordered by the request it wraps.
+inline std::atomic<std::uint64_t>& mcpRebuildCounter()
+{
+    static std::atomic<std::uint64_t> n{ 0 };
+    return n;
+}
+
+// P1-15 — the `_reingest` envelope field for a response whose handling ran an INCREMENTAL pass, or "" when
+// it did not. `passesAtEntry` is McpIndex::incrementalPasses as read before the verb ran; a difference means
+// a pass refreshed the index while this request was being served, and lastReingestFiles is that pass's cost.
+// Absent field / 0 / N are three distinct facts — see the field's contract on McpIndex::incrementalPasses.
+// A free function rather than three lines inside the response builder: it keeps the branch out of
+// dispatchMcpLine, which is already the largest symbol in the file.
+// The shared predicate behind BOTH disclosure fields: did serving this request refresh an index the process
+// already held? `passesAtEntry` is McpIndex::incrementalPasses as read before the verb ran. One definition,
+// because `_reingest` (what it cost) and `_fresh` (whether it happened at all) must never be able to
+// disagree about whether a pass ran.
+inline bool mcpRefreshedThisRequest( std::uint64_t passesAtEntry )
+{
+    return mcpIndexSlot().incrementalPasses != passesAtEntry;
+}
+
+inline std::string mcpReingestField( std::uint64_t passesAtEntry )
+{
+    return mcpRefreshedThisRequest( passesAtEntry )
+         ? ",\"_reingest\":" + std::to_string( mcpIndexSlot().lastReingestFiles ) : std::string{};
+}
+
+// Card A3 — the `_fresh` envelope field, and the two counts that qualify it. Every response that reads the
+// index carries this, which is the whole capability: an agent holding a warm answer never has to run a
+// second command to find out whether it still describes the tree it is editing.
+//
+//   _fresh:"ok"          the per-request re-validation ran and found nothing moved; served from the index
+//                        as it stood.
+//   _fresh:"reindexed"   the re-validation found the tree had moved, and the index was rebuilt BEFORE the
+//                        verb answered — plus `_stale_files` and `_changed_files`. There is no third value:
+//                        this surface's chosen policy is re-index, never serve-and-flag, so `_fresh` can
+//                        never say "stale". (The CLI's policy is the same by construction — it re-crawls
+//                        every invocation — which is why nothing like this is emitted there; see the card
+//                        A3 section in docs/EVALS.md for the measurement and the rejected CLI half.)
+//
+// The trigger is the SAME predicate `_reingest` uses (incrementalPasses moved), for the same reason: only a
+// refresh of an index this process ALREADY held is a re-index. A first build has nothing to be stale
+// against, and disclosing its counts would leak whether a cache blob happened to exist on disk.
+//
+// The two counts answer different questions and disagree on two of the four mutations — see the contract on
+// McpIndex::lastStaleFiles. Both are emitted whenever `_fresh` is "reindexed", INCLUDING when they are 0:
+// `_stale_files:0` (an add) and `_changed_files:0` (a touch) are the two most informative values either one
+// takes, so suppressing a zero here would delete the answer rather than save the bytes.
+inline std::string mcpFreshFields( std::uint64_t passesAtEntry )
+{
+    const McpIndex& ix = mcpIndexSlot();
+    return mcpRefreshedThisRequest( passesAtEntry )
+         ? ",\"_fresh\":\"reindexed\",\"_stale_files\":" + std::to_string( ix.lastStaleFiles )
+             + ",\"_changed_files\":" + std::to_string( ix.lastChangedFiles )
+         : std::string{ ",\"_fresh\":\"ok\"" };
+}
+
+// ── Multi-root workspaces over MCP (A11): the additive `paths` array. A request
+// carrying 2+ paths resolves to a WORKSPACE KEY (the canonical, deduped, label-ordered realpath join) that
+// stands in for `path` everywhere downstream; getIndex() recognizes a registered key and builds ONE merged
+// index over the root set (per-root mcpCachePath blobs, id-offset merge — the same machinery as the CLI).
+// Single `path` requests never touch any of this (`path` unchanged — back-compat).
+inline HashMap<std::string, std::vector<WorkspaceRoot>>& mcpWorkspaceRegistry()
+{
+    static HashMap<std::string, std::vector<WorkspaceRoot>> reg;
+    return reg;
+}
+
+// resolve a `paths` root list to its workspace key (registering the root set); "" + err on a hard error
+// (nested roots / too many). Dedupe can collapse to ONE root — then the single path is returned as-is.
+inline std::string mcpWorkspaceKey( const std::vector<std::string>& rootArgs, std::string& err )
+{
+    if( rootArgs.size() > kMaxWorkspaceRoots ) { err = "too many roots in `paths` (max 16)"; return {}; }
+    std::vector<WorkspaceRoot> ws;
+    if( !buildWorkspaceRoots( rootArgs, ws ) ) { err = "nested roots are not allowed in `paths` — pass disjoint roots"; return {}; }
+    if( ws.size() == 1 )
+    {
+        return ws[0].arg; // dedupe collapsed to one → plain single-root path
+    }
+    std::string key;
+    for( const WorkspaceRoot& r : ws ) { key.append( r.real );  key.push_back( '\x1f' ); }
+    mcpWorkspaceRegistry()[ key ] = std::move( ws );
+    return key;
+}
+
+// ─── Phase-M: qsnap PREFETCH ──────────────────────────────────────────────────────────────────────────
+//
+// A FILE-CACHE WARMER, NOT an index mechanism — it never touches this McpIndex. When a request observes that
+// git HEAD has MOVED since the last observation (a commit just landed), it kicks a DETACHED background thread
+// that runs the SAME quality::computeHeadSnapshot path a lazy quality_delta would — warming the sha-keyed qsnap
+// cache FILE so the NEXT quality_delta finds it warm instead of paying a cold HEAD ingest + clone pass (~14.5 s
+// p95 quality_delta on a large private C++ corpus, §8; the prefetch hides the ~43 % HEAD-side share). Rules (§2b):
+//   (1) atomic publish — computeHeadSnapshot now writes qsnap via tmp+rename (quality::atomicWriteQSnap).
+//   (2) single-flight  — one atomic flag; a second HEAD-move while a worker runs is DROPPED (the next
+//                        observation re-fires, so the newest sha is always eventually warmed).
+//   (3) discard-on-error — any failure in the worker is swallowed (optional work; the lazy path still covers it).
+//   (4) GO-at-scale — gated on a cheap file-count heuristic (default 500; §8 measured the win is corpus-
+//                     dependent: NO-GO on small repos, GO on large) so a small repo never pays a useless
+//                     ~700 ms background HEAD ingest per commit. Test override: CODECORTEX_QSNAP_PREFETCH_MIN_FILES.
+// MONOTONE FRESHNESS: computeHeadSnapshot re-reads gitHeadSha at run time and keys the qsnap by THAT sha, so a
+// prefetched blob is byte-identical to what lazy would compute for the same sha and can NEVER be served for a
+// different (newer) HEAD — the filename key IS the sha. A prefetch that lost the HEAD race just leaves an
+// unused older-sha file, LRU-evicted by the existing keep=2 family evictor.
+
+// process-wide prefetch state: the single-flight guard, the last HEAD-token we acted on, and a spawn counter
+// (observable under CODECORTEX_MCP_TIMINGS for the single-flight gate).
+inline std::atomic<bool>&          mcpPrefetchInFlight()   { static std::atomic<bool>          f{ false }; return f; }
+inline std::atomic<std::uint64_t>& mcpPrefetchLastToken() { static std::atomic<std::uint64_t> t{ 0 };     return t; }
+inline std::atomic<std::uint64_t>& mcpPrefetchSpawnCount(){ static std::atomic<std::uint64_t> n{ 0 };     return n; }
+
+// the file-count threshold below which prefetch never fires (§8: small repos have a cheap cold HEAD snapshot →
+// no latency to hide, only a wasted background burn). CODECORTEX_QSNAP_PREFETCH_MIN_FILES overrides it (test
+// surface — lets a small fixture repo exercise the mechanism). Parsed ONCE (static), so it is a fixed constant.
+inline std::size_t mcpPrefetchMinFiles()
+{
+    static const std::size_t v = []() -> std::size_t
+    {
+        if( const char* e = std::getenv( "CODECORTEX_QSNAP_PREFETCH_MIN_FILES" ) )
+        {
+            char*                    end = nullptr;
+            const unsigned long long n   = std::strtoull( e, &end, 10 );
+            if( end != e )
+            {
+                return static_cast<std::size_t>( n );
+            }
+        }
+        return 500;
+    }();
+    return v;
+}
+
+// Cheap, popen-FREE "did HEAD move?" signal: a fold of the (mtime,size) of git's HEAD-tracking files. git
+// appends to logs/HEAD on EVERY ref update to HEAD (commit/reset/checkout/merge — reflog is on by default for
+// non-bare repos), rewrites HEAD on a branch switch, and rewrites the resolved branch ref on a commit — so the
+// fold changes exactly when HEAD moves, WITHOUT the ~15 ms popen that gitHeadSha (and git diff) cost, keeping
+// the observation off the warm hot path (the same mtime-staleness philosophy the whole McpIndex rests on).
+// Returns 0 when git state is indeterminate (no .git, or an unresolvable worktree/submodule gitfile) → the
+// caller then simply does not prefetch (honest degrade; the lazy path still warms on demand). NEVER a popen,
+// NEVER reads tree source bytes.
+inline std::uint64_t gitHeadMoveToken( const std::string& root )
+{
+    std::string gitDir = root + "/.git";
+    os::stat_t st;
+    if( os::stat( gitDir.c_str(), &st ) != 0 )
+    {
+        return 0; // not a git working tree we track
+    }
+    if( ( st.st_mode & S_IFMT ) == S_IFREG )
+    {
+        // ".git" is a FILE ("gitdir: <path>") for worktrees / submodules — resolve one hop, cheaply.
+        bool        ok = false;
+        std::string s  = mcpdetail::readFileBytes( gitDir, ok );
+        std::size_t p  = ok ? s.find( "gitdir:" ) : std::string::npos;
+        if( p == std::string::npos )
+        {
+            return 0; // unresolvable → indeterminate
+        }
+        p += 7;
+        while( p < s.size() && ( s[p] == ' ' || s[p] == '\t' ) )
+        {
+            ++p;
+        }
+        std::size_t e = p;
+        while( e < s.size() && s[e] != '\n' && s[e] != '\r' )
+        {
+            ++e;
+        }
+        std::string gd = s.substr( p, e - p );
+        if( gd.empty() )
+        {
+            return 0;
+        }
+        if( !os::path_is_absolute( gd ) )   // "/x" here; "C:/x" in a Windows checkout's .git file (git writes that spelling)
+        {
+            gd = root + "/" + gd; // relative gitdir → resolve against root
+        }
+        gitDir = gd;
+    }
+
+    std::uint64_t h = 14695981039346656037ull;
+    const auto fold = [ &h ]( const std::string& path )
+    {
+        // (mtime, size) only, and ctime DELIBERATELY not folded: this is a "did git move HEAD" stamp, not a
+        // staleness check, and a chmod or a re-checkout of an identical ref file must not read as a commit.
+        const auto st = mcpdetail::statOf( path );
+        h ^= static_cast<std::uint64_t>( st.mtimeNs );
+        h = hashutil::fnv1aMultiply( h );
+        h ^= static_cast<std::uint64_t>( st.sizeBytes );
+        h = hashutil::fnv1aMultiply( h );
+    };
+    fold( gitDir + "/logs/HEAD" );      // appended on every HEAD move (reflog; default-on for a working tree)
+    fold( gitDir + "/HEAD" );           // rewritten on a branch switch (reflog-independent)
+    fold( gitDir + "/packed-refs" );    // a commit may repack refs
+    // resolve HEAD → its branch ref file (a commit rewrites that loose ref even when the reflog is disabled).
+    bool        okH  = false;
+    std::string head = mcpdetail::readFileBytes( gitDir + "/HEAD", okH );
+    if( okH )
+    {
+        if( std::size_t q = head.find( "ref:" ); q != std::string::npos )
+        {
+            q += 4;
+            while( q < head.size() && ( head[q] == ' ' || head[q] == '\t' ) )
+            {
+                ++q;
+            }
+            std::size_t e2 = q;
+            while( e2 < head.size() && head[e2] != '\n' && head[e2] != '\r' )
+            {
+                ++e2;
+            }
+            const std::string ref = head.substr( q, e2 - q );
+            if( !ref.empty() )
+            {
+                fold( gitDir + "/" + ref );
+            }
+        }
+    }
+    if( h == 0 )
+    {
+        h = 1; // 0 is the "indeterminate" sentinel — a real token must never collide with it
+    }
+    return h;
+}
+
+// Observe HEAD; on a move (and only above the size threshold) single-flight-spawn the DETACHED qsnap warmer.
+// Called from getIndex() on EVERY request (warm reuse and rebuild) — the per-call cost is the cheap stat-fold
+// above, gated first on the file count so a small repo does not even probe git.
+inline void maybePrefetchHeadSnapshot( const std::string& root, std::size_t fileCount )
+{
+    if( fileCount < mcpPrefetchMinFiles() )
+    {
+        return; // (4) GO-at-scale: small repos never pay
+    }
+
+    const std::uint64_t token = gitHeadMoveToken( root );
+    if( token == 0 )
+    {
+        return; // indeterminate git state → no prefetch
+    }
+
+    std::uint64_t last = mcpPrefetchLastToken().load( std::memory_order_relaxed );
+    if( last == 0 )                                                    // FIRST observation: seed, do NOT fire (§Open-q 2: no startup pre-warm)
+    {
+        mcpPrefetchLastToken().compare_exchange_strong( last, token, std::memory_order_relaxed );
+        return;
+    }
+    if( token == last )
+    {
+        return; // HEAD has not moved since we last acted
+    }
+
+    // (2) single-flight: at most ONE worker. If one is already warming, DROP this trigger WITHOUT advancing
+    //     lastToken, so the next observation re-fires once the worker finishes (newest sha eventually warmed).
+    bool expected = false;
+    if( !mcpPrefetchInFlight().compare_exchange_strong( expected, true, std::memory_order_acq_rel ) )
+    {
+        return;
+    }
+
+    mcpPrefetchLastToken().store( token, std::memory_order_relaxed );  // we won → this move is ours
+    mcpPrefetchSpawnCount().fetch_add( 1, std::memory_order_relaxed );
+
+    const bool timingsOn = std::getenv( "CODECORTEX_MCP_TIMINGS" ) != nullptr;
+    if( timingsOn ) { rw::emitTo( stderr, "codecortex-prefetch spawn root={}\n", root.c_str() ); std::fflush( stderr ); }
+
+    // DETACHED worker: copies `root` by value (no dangling), runs the SAME computeHeadSnapshot the lazy
+    // quality_delta uses with the SAME default args (so it warms the IDENTICAL qsnap key), then clears the
+    // in-flight flag via an RAII guard on EVERY exit path. (3) discard-on-error: a throw (OOM at operator new)
+    // is swallowed; the flag is always cleared so the mechanism never wedges.
+    std::thread( [ root, timingsOn ]() noexcept
+    {
+        struct FlagGuard { ~FlagGuard(){ mcpPrefetchInFlight().store( false, std::memory_order_release ); } } guard;
+        try   { (void)rw::quality::computeHeadSnapshot( root ); }      // side effect: warm the sha-keyed qsnap (atomic publish)
+        catch( ... ) { /* optional work — drop silently (§2b rule 3) */ }
+        if( timingsOn ) { rw::emitTo( stderr, "codecortex-prefetch done root={}\n", root.c_str() ); std::fflush( stderr ); }
+    } ).detach();
+}
+
+// the cached index for `root`, rebuilt only when stale (otherwise returned as-is, no parse, no graph rebuild).
+inline const McpIndex& getIndex( const std::string& root )
+{
+    McpIndex& ix = mcpIndexSlot();
+
+    // hot path. The FS-event watcher (Feature 1) lets us SKIP the directory-mtime sweep when it proves no
+    // structural change occurred — a single kevent poll instead of a stat() per watched dir. The PER-FILE
+    // mtime+size loop still runs (the S1 content-staleness authority, deterministic), so the answer for any
+    // tree state is byte-identical to the pre-watcher server: the watcher only elides work it has itself
+    // covered. If the watcher is unhealthy (kqueue unavailable) OR reports an event, the FULL sweep runs —
+    // the exact pre-Feature-1 lazy path. drainHadEvent() degrades to "assume changed" on any poll error, so
+    // uncertainty never skips the dir sweep.
+    if( ix.valid && ix.root == root )
+    {
+        const bool watcherClean = ix.watcher.healthy && !ix.watcher.drainHadEvent();
+        if( !mcpStale( ix, /*skipDirSweep=*/watcherClean ) )
+        {
+            maybePrefetchHeadSnapshot( root, ix.ing.files.size() );        // Phase-M: observe HEAD move on the warm path (a bare commit does not rebuild)
+            return ix;                                                     // warm reuse (no rebuild, no popen)
+        }
+    }
+
+    // P1-15: read BEFORE the rebuild overwrites `ix`. `valid` alone is not enough — a request that switches
+    // roots finds a valid index belonging to a DIFFERENT tree, and building for the new root is an initial
+    // build for it, not a refresh of anything.
+    const bool isIncrementalPass = ix.valid && ix.root == root;
+
+    // card A3: everything the freshness disclosure needs about the index this rebuild is about to replace,
+    // read at the same moment and for the same reason as the line above. Rebuild path only — nothing here
+    // touches the warm reuse that returned above.
+    const McpRebuildBaseline a3Before = mcpRebuildBaseline( ix, isIncrementalPass );
+
+    // Multi-root workspace key (A11): per-root ingest (each with ITS OWN mcpCachePath blob — an edit in
+    // one root never reparses another) merged into one IngestResult; else the single-root path unchanged.
+    const auto wsIt = mcpWorkspaceRegistry().find( root );
+    const bool isWorkspace = wsIt != mcpWorkspaceRegistry().end() && wsIt->second.size() >= 2;
+    {
+        // Phase-M: serialize this rebuild's ingest against a concurrent qsnap-prefetch worker (ingest() writes
+        // single-writer process-global query caches — §2b). Uncontended on the single request thread; only the
+        // background warmer can contend, and then one waits. Reached ONLY on a real rebuild (warm reuse returns
+        // above), so it never touches the hot path.
+        std::lock_guard<std::mutex> ingestLk( rw::quality::headSnapshotIngestMutex() );
+        if( isWorkspace )
+        {
+            const std::vector<WorkspaceRoot>& roots = wsIt->second;
+            std::vector<IngestResult> parts;
+            parts.reserve( roots.size() );
+            for( const WorkspaceRoot& r : roots )
+            {
+                parts.push_back( ingest( r.arg.c_str(), {}, mcpCachePath( r.arg ), kDefaultMaxFileBytes, true, r.label ) );
+            }
+            ix.cacheFile = mcpCachePath( root );                      // key-derived (unused by the per-root ingests)
+            ix.ing = mergeWorkspaceIngests( roots, parts );
+        }
+        else
+        {
+            ix.cacheFile = mcpCachePath( root );
+            ix.ing  = ingest( root.c_str(), {}, ix.cacheFile );          // warm rebuild via content-hash cache
+        }
+    }
+    ix.g    = buildGraph( ix.ing );
+
+    // working-set personalization (Cody-style): teleport the PageRank prior toward files with uncommitted
+    // changes, mirroring --map-diff's diffTeleport weighting (main.cpp) — β=0.7 of the mass on changed-file
+    // symbols, the rest uniform, then rankGraphTeleport (which also applies the name-quality biasPrior
+    // automatically, same as every other teleport-based rank mode). A clean tree or a non-git root both
+    // degrade to an ALL-ZERO changed mask, and diffTeleport() itself returns the plain uniform prior when
+    // changed==0 — so this is byte-identical to the pre-feature rankGraph(g) in both of those cases (§GATE-d).
+    std::vector<char> changed( ix.ing.files.size(), 0 );
+    if( isWorkspace )
+    {
+        // §5: the working set is the UNION of per-root diffs, each mined only against its own files.
+        const std::vector<WorkspaceRoot>& roots = wsIt->second;
+        for( std::uint32_t r = 0; r < roots.size(); ++r )
+        {
+            const auto [ mask, gitOk ] = gitDiffChangedMask( roots[r].arg, ix.ing, r );
+            if( gitOk )
+            {
+                for( std::size_t f = 0; f < changed.size() && f < mask.size(); ++f )
+                {
+                    if( mask[f] )
+                    {
+                        changed[f] = 1;
+                    }
+                }
+            }
+        }
+    }
+    else
+    {
+        const auto [ mask, gitOk ] = gitDiffChangedMask( root, ix.ing );
+        if( gitOk )
+        {
+            changed = mask; // not a repo / git missing → stays all-zero
+        }
+    }
+    ix.workingSetHash = workingSetHashOf( changed );
+    const auto [ wsRank, wsIters, wsConverged ] = rankGraphTeleport( ix.g, diffTeleport( ix.ing, changed ) );
+    ix.rank         = wsRank;
+    ix.prDisclosure = RankDisclosure{ wsIters, wsConverged, true };   // W2-F: a teleport variant is still a power iteration
+
+    ix.fileMtime.assign( ix.ing.files.size(), 0 );
+    ix.fileSize.assign( ix.ing.files.size(), -1 );      // st_size parallel to files — the staleness fast-path discriminator (S1)
+    ix.fileCtime.assign( ix.ing.files.size(), -1 );     // st_ctime parallel to files — the same-(mtime,size) discriminator (card A3 follow-up)
+    ix.fileByteHash.assign( ix.ing.files.size(), 0 );   // per-file byte fingerprint for the edit verbs AND the content-folded stamp (S1)
+    for( std::size_t i = 0; i < ix.ing.files.size(); ++i )
+    {
+        const auto [ mtime, size, ctime ] = mcpdetail::statOf( diskPath( ix.ing, std::uint32_t( i ) ) );
+        ix.fileMtime[i] = mtime;
+        ix.fileSize[i]  = size;
+        ix.fileCtime[i] = ctime;
+        bool readOk = false;
+        const std::string bytes = mcpdetail::readFileBytes( diskPath( ix.ing, std::uint32_t( i ) ), readOk );
+        ix.fileByteHash[i] = readOk ? mcpdetail::byteHash( bytes.data(), bytes.size() ) : 0;   // unreadable → 0 (edit verb refuses; mcpStale sees a mismatch)
+    }
+    ix.contentHash = mcpdetail::indexContentHash( ix.ing.files, ix.fileMtime, ix.fileByteHash );   // stamp, now content-folded (S1)
+
+    // card A3: latch the two disclosure counts against the baseline captured before the rebuild.
+    ix.lastStaleFiles   = a3Before.staleFiles;
+    ix.lastChangedFiles = mcpContentChangeCount( a3Before, mcpContentFingerprints( ix.ing, ix.fileByteHash ) );
+
+    // the staleness watch-list: every directory under root (denylist-pruned), so additions in previously
+    // file-less dirs are detected too — see collectDirMtimes.
+    ix.dirMtime.clear();
+    if( isWorkspace )
+    {
+        for( const WorkspaceRoot& r : wsIt->second )
+        {
+            mcpdetail::collectDirMtimes( r.arg, ix.dirMtime );
+        }
+    }
+    else
+    {
+        mcpdetail::collectDirMtimes( root, ix.dirMtime );
+    }
+
+    // Feature 1: (re-)arm the FS-event watcher over the freshly-collected dir set. The rebuild we just did IS
+    // the freshest possible read, so events queued against the old state are dropped with the old fds. If
+    // kqueue is unavailable, arm() leaves the watcher unhealthy → getIndex() always runs the FULL dir sweep
+    // (the pre-Feature-1 lazy path). Registration order can't reach output, so the dirMtime keys are taken
+    // as-is (no sort needed).
+    std::vector<std::string> watchDirs;
+    watchDirs.reserve( ix.dirMtime.size() );
+    for( const auto& [d, m] : ix.dirMtime )
+    {
+        watchDirs.push_back( d );
+    }
+    ix.watcher.arm( watchDirs );
+
+    ix.root  = root;
+    ix.valid = true;
+    ix.lastReingestFiles = ix.ing.reparsedFiles;              // P1-15: latch what THIS pass cost
+    ix.incrementalPasses += isIncrementalPass ? 1u : 0u;      // …and whether it refreshed an index we already held
+    mcpRebuildCounter().fetch_add( 1, std::memory_order_relaxed );   // MEASURE-FIRST: a real (cache-miss) rebuild just happened
+    maybePrefetchHeadSnapshot( root, ix.ing.files.size() );          // Phase-M: seed the HEAD token on the first build; observe a move on later rebuilds
+    return ix;
+}
+
+// ─── T4: handle helpers over a live McpIndex ─────────────────────────────────────────────────────
+//
+// R-R (root-relative emission): the handle's two identity inputs, made root-relative. A content handle must
+// name the same symbol in the same commit no matter WHERE the repo is checked out — before this, the canonId
+// and path folded into sym#<idHash> carried the absolute checkout prefix, so two clones of ONE commit handed
+// an agent different handles for the same symbol (and a handle minted under one checkout resolved to nothing
+// under another). makeHandle and resolveHandle BOTH derive from this one function, so the round-trip stays
+// closed by construction: change the spelling here and both sides move together, which is the property that
+// makes a handle safe to mint at all. Empty root ⇒ multi-root, where ing.files already carry a label-relative
+// identity and there is nothing to strip.
+inline void handleIdentity( const McpIndex& ix, NodeId id, std::string& canonOut, std::string& pathOut )
+{
+    ASSUME_NO_ALIAS( canonOut, pathOut );
+    const Symbol&          s       = ix.ing.symbols[ id ];
+    const std::string_view rootArg = ix.ing.realPaths.empty() ? std::string_view( ix.root ) : std::string_view();
+    canonOut = ( id < ix.g.canonId.size() ) ? canonicalIdForEmit( ix.ing, s, rootArg ) : s.name;
+    pathOut  = rootArg.empty()
+             ? ix.ing.files[ s.fileId ]
+             : std::string( rw::sarif::rootRelativeUri( ix.ing.files[ s.fileId ], rw::sarif::rootPrefixOf( rootArg ) ) );
+}
+
+// CLI read verbs already own an IngestResult + Graph and must not build a second MCP index merely to mint
+// the same handle. The caller supplies the freshly-read file hash so one file can be read once and shared by
+// every enclosing row it contains. Identity and spelling stay exactly the MCP contract above.
+inline std::string sourceHandleFor( const IngestResult& ing, const Graph& g, std::string_view root, NodeId id,
+                                    std::uint64_t contentHash )
+{
+    if( id >= ing.symbols.size() || contentHash == 0 )
+    {
+        return {};
+    }
+    const Symbol& s = ing.symbols[id];
+    const std::string_view rootArg = ing.realPaths.empty() ? root : std::string_view();
+    const std::string canon = ( id < g.canonId.size() ) ? canonicalIdForEmit( ing, s, rootArg ) : s.name;
+    const std::string path = rootArg.empty()
+                           ? ing.files[s.fileId]
+                           : std::string( rw::sarif::rootRelativeUri( ing.files[s.fileId], rw::sarif::rootPrefixOf( rootArg ) ) );
+    return mcpdetail::makeHandle( canon, path, s.name, contentHash );
+}
+
+// handleFor(ix, id) — the stable content-handle for symbol `id`, from the STABLE canonId + the file's byte
+// fingerprint (both already on the index). The READ verbs attach this so an agent knows what to ask for.
+inline std::string handleFor( const McpIndex& ix, NodeId id )
+{
+    if( id >= ix.ing.symbols.size() )
+    {
+        return {};
+    }
+    const Symbol&       s      = ix.ing.symbols[id];
+    std::string         canon, path;
+    handleIdentity( ix, id, canon, path );                                  // R-R: root-relative identity
+    const std::uint64_t chash  = ( s.fileId < ix.fileByteHash.size() ) ? ix.fileByteHash[ s.fileId ] : 0;
+    return mcpdetail::makeHandle( canon, path, s.name, chash );
+}
+
+// resolveHandle(ix, idHash) — the NodeId whose STABLE canonId hashes to idHash, or kNoNode. canonId can
+// collide (free functions in the SAME file, overloads sharing scope::name); we pick the LOWEST id among the
+// matches — deterministic. The lowest-id pick is a *valid fetch target only when the colliding symbols share
+// one body* (e.g. a declaration + its definition); for same-scope OVERLOADS with DIFFERENT bodies it is one
+// arbitrary body among several (F4). `resolveHandleAll` exposes the full colliding set so fetch_body can be
+// HONEST about that ambiguity instead of silently serving the lowest-id body. The caller separately verifies
+// the handle's contentHash against the file's CURRENT bytes (staleness).
+inline NodeId resolveHandleAll( const McpIndex& ix, std::uint64_t idHash, std::vector< NodeId >& matches )
+{
+    const IngestResult& ing = ix.ing;
+    matches.clear();
+    NodeId best = kNoNode;
+    for( NodeId id = 0; id < NodeId( ing.symbols.size() ); ++id )
+    {
+        const Symbol&      s     = ing.symbols[id];
+        std::string        canon, path;
+        handleIdentity( ix, id, canon, path );                              // R-R: same identity makeHandle minted
+        if( mcpdetail::str64( mcpdetail::stableHandleId( canon, path, s.name ) ) == idHash )
+        {
+            if( best == kNoNode )
+            {
+                best = id; // ids ascend → first match is the lowest; deterministic
+            }
+            matches.push_back( id );
+        }
+    }
+    return best;
+}
+
+inline NodeId resolveHandle( const McpIndex& ix, std::uint64_t idHash )
+{
+    std::vector< NodeId > matches;
+    return resolveHandleAll( ix, idHash, matches );
+}
+
+}   // namespace rw

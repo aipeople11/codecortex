@@ -1,0 +1,205 @@
+#!/usr/bin/env bash
+# opencodewrapcheck.sh — `codecortex wrap opencode` emits a config opencode actually READS.
+#
+# The failure mode this gate exists for is not a crash: it is a recipe that emits the
+# familiar-but-wrong shape (the `mcpServers` stanza every other wrapped agent uses). That config
+# parses, installs, looks right, and silently does nothing, because opencode's key is `mcp` and its
+# entry carries `type` + a single `command` ARRAY. A grep-only gate cannot tell those apart, so this
+# one parses the emitted JSON and checks it against opencode's own published schema.
+#
+# The schema is VENDORED at test/fixtures/opencode-config.schema.json (pinned; opencode ships
+# releases multiple times a day and the published schema is unversioned with no $id). No gate in
+# this tree reaches the network and G3 forbids host-installed dependencies, so conformance is
+# checked by reading the pinned schema's own McpLocalConfig definition rather than by running a
+# JSON Schema validator. Refresh the pin with test/tools/refresh-opencode-schema.sh (manual, never
+# in CI) — a refreshed schema automatically re-tightens the assertions below.
+set -u
+
+ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+BIN="${1:-${CODECORTEX_BIN:-$ROOT/build/codecortex}}"
+[ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"          # allow repo-relative CODECORTEX_BIN
+SCHEMA="$ROOT/test/fixtures/opencode-config.schema.json"
+TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
+fail=0
+
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
+no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
+
+[ -x "$BIN" ]     || { echo "opencodewrapcheck: no binary at $BIN — build first"; exit 2; }
+[ -f "$SCHEMA" ]  || { echo "opencodewrapcheck: missing pinned schema at $SCHEMA"; exit 2; }
+command -v python3 >/dev/null 2>&1 || { echo "opencodewrapcheck: python3 required"; exit 2; }
+
+# ── 1. the agent is recognized at all ───────────────────────────────────────────────────────────
+# runWrap's whitelist is a separate site from the emitter; an unlisted agent falls through to the
+# generic `mcpServers` stanza with exit 2 — which would pass a naive "did it print JSON" check.
+"$BIN" wrap opencode --force >"$TMP/out.txt" 2>"$TMP/err.txt"
+rc=$?
+if [ "$rc" = 0 ]; then
+    ok "wrap opencode exits 0 (agent is in the recognized list)"
+else
+    no "wrap opencode exited $rc — opencode is not in runWrap's recognized-agent list"
+    sed 's/^/        /' "$TMP/err.txt" | head -5
+fi
+
+# ── 2. the wrong-shape guard ────────────────────────────────────────────────────────────────────
+# Scoped to EMITTED lines, not prose: the recipe's comments deliberately name the `mcpServers` shape
+# to warn that opencode parses it and then ignores it. A `#` line saying so is the feature; the same
+# string in the config body is the bug. (§3 re-checks this on the parsed object.)
+if grep -v '^#' "$TMP/out.txt" | grep -q 'mcpServers'; then
+    no "a non-comment line contains 'mcpServers' — that is the shape opencode IGNORES (silent no-op)"
+else
+    ok "no 'mcpServers' in any emitted (non-comment) line"
+fi
+
+# ── 3. extract + parse the JSON block, then check it against the pinned schema ───────────────────
+# Block = the first line that is exactly '{' through the first subsequent line that is exactly '}'.
+awk '/^\{$/{f=1} f{print} /^\}$/{if(f)exit}' "$TMP/out.txt" >"$TMP/cfg.json"
+if [ ! -s "$TMP/cfg.json" ]; then
+    no "no JSON object found in wrap opencode output"
+else
+    python3 - "$TMP/cfg.json" "$SCHEMA" >"$TMP/py.txt" 2>&1 <<'PY'
+import json, sys
+
+cfg_path, schema_path = sys.argv[1], sys.argv[2]
+try:
+    cfg = json.load( open( cfg_path ) )
+except Exception as e:
+    print( "FAIL emitted block is not valid JSON: %s" % e ); sys.exit( 0 )
+print( "PASS emitted block parses as JSON" )
+
+schema = json.load( open( schema_path ) )
+local  = schema[ "$defs" ][ "McpLocalConfig" ]
+allowed  = set( local[ "properties" ] )
+required = set( local.get( "required", [] ) )
+
+# top level: the key is `mcp`, and the schema must still agree that is where servers live
+if "mcp" not in schema[ "$defs" ][ "Config" ][ "properties" ]:
+    print( "FAIL pinned schema has no Config.properties.mcp — refresh changed the shape" ); sys.exit( 0 )
+if "mcp" not in cfg:
+    print( "FAIL emitted config has no top-level 'mcp' key" ); sys.exit( 0 )
+print( "PASS top-level 'mcp' key present" )
+
+if "mcpServers" in cfg:
+    print( "FAIL config carries a 'mcpServers' key — opencode parses that and ignores it" ); sys.exit( 0 )
+print( "PASS config carries no 'mcpServers' key" )
+
+if cfg.get( "$schema" ) != "https://opencode.ai/config.json":
+    print( "FAIL $schema is %r, expected https://opencode.ai/config.json" % cfg.get( "$schema" ) )
+else:
+    print( "PASS $schema line points at opencode's published schema" )
+
+entry = cfg[ "mcp" ].get( "codecortex" )
+if not isinstance( entry, dict ):
+    print( "FAIL mcp.codecortex missing or not an object" ); sys.exit( 0 )
+
+if entry.get( "type" ) != "local":
+    print( "FAIL mcp.codecortex.type is %r, expected 'local'" % entry.get( "type" ) )
+else:
+    print( "PASS mcp.codecortex.type == 'local'" )
+
+cmd = entry.get( "command" )
+if not isinstance( cmd, list ) or not all( isinstance( x, str ) for x in cmd ):
+    print( "FAIL command must be an ARRAY of strings (not a command/args pair), got %r" % ( cmd, ) )
+elif not ( cmd[ :1 ] == [ "codecortex" ] or ( cmd[ :1 ] and cmd[ 0 ].endswith( "/codecortex" ) ) ) or "--mcp" not in cmd:   # 2026-09-06: absolute path when nothing on PATH is codecortex
+    print( "FAIL command %r does not invoke codecortex --mcp" % ( cmd, ) )
+else:
+    print( "PASS command is a string array invoking codecortex --mcp" )
+
+# additionalProperties:false in the pinned schema — any stray key is a hard validation failure
+extra = set( entry ) - allowed
+if extra:
+    print( "FAIL keys %s are not in McpLocalConfig (schema sets additionalProperties:false)" % sorted( extra ) )
+else:
+    print( "PASS every emitted key is allowed by the pinned McpLocalConfig" )
+
+missing = required - set( entry )
+if missing:
+    print( "FAIL required McpLocalConfig keys missing: %s" % sorted( missing ) )
+else:
+    print( "PASS all schema-required keys present (%s)" % ", ".join( sorted( required ) ) )
+PY
+    while IFS= read -r line; do
+        case "$line" in
+            PASS*) ok "${line#PASS }" ;;
+            *)     no "${line#FAIL }" ;;
+        esac
+    done < "$TMP/py.txt"
+fi
+
+# ── 4. the rules half — opencode reads AGENTS.md automatically ───────────────────────────────────
+if grep -q '^# --- paste into AGENTS.md ---$' "$TMP/out.txt" && grep -q '^# --- end paste ---$' "$TMP/out.txt"; then
+    ok "AGENTS.md context blurb is fenced and present"
+else
+    no "no AGENTS.md paste fence — kWrapBlurbTargets is missing its opencode row"
+fi
+
+# ── 5. CLI-first ordering — the recipe leads with the shell path, MCP is the alternative ─────────
+# opencode has a bash tool, and the MCP server's 30 verb schemas are standing context every turn
+# whether called or not (docs/EVALS.md §5). So the CLI line must come BEFORE the MCP stanza.
+cli_line=$( grep -n -- '--for=' "$TMP/out.txt" | head -1 | cut -d: -f1 )
+mcp_line=$( grep -n '"mcp"' "$TMP/out.txt" | head -1 | cut -d: -f1 )
+if [ -n "$cli_line" ] && [ -n "$mcp_line" ] && [ "$cli_line" -lt "$mcp_line" ]; then
+    ok "CLI recipe precedes the MCP stanza (line $cli_line < $mcp_line)"
+else
+    no "CLI recipe must precede the MCP stanza (cli=${cli_line:-none} mcp=${mcp_line:-none})"
+fi
+
+# ── 6. determinism (house contract) ─────────────────────────────────────────────────────────────
+"$BIN" wrap opencode --force >"$TMP/out2.txt" 2>/dev/null
+if cmp -s "$TMP/out.txt" "$TMP/out2.txt"; then
+    ok "two runs byte-identical"
+else
+    no "wrap opencode is not deterministic across runs"
+fi
+
+# ── 7. the pin itself ───────────────────────────────────────────────────────────────────────────
+# Recorded so a silent fixture edit is visible in review; refresh via test/tools/refresh-opencode-schema.sh.
+want="dcd450a9a5ff40d2b73f821b39c1885fad849c73ae738e59f318e51d44e28728"
+got=$( shasum -a 256 "$SCHEMA" 2>/dev/null | awk '{print $1}' )
+if [ -z "$got" ]; then
+    got=$( sha256sum "$SCHEMA" 2>/dev/null | awk '{print $1}' )
+fi
+if [ "$got" = "$want" ]; then
+    ok "pinned schema sha256 matches the recorded pin"
+else
+    no "pinned schema changed (sha256 $got != $want) — update the pin AND re-read the assertions above"
+fi
+
+# ── 8. an absolute command token survives JSON ─────────────────────────────────────────────────
+# With no `codecortex` on PATH the stanza's command is this binary's absolute path, and a path is bytes: a
+# double quote or a backslash is legal in a POSIX filename and is every Windows path's separator. Run a copy
+# from a directory whose name carries both, with a PATH that holds no codecortex, and require that the
+# opencode stanza AND the mcpServers stanza (cursor) parse and name exactly that path.
+ODD_DIR="$TMP/quo\"te back\\slash"
+mkdir -p "$ODD_DIR"
+cp "$BIN" "$ODD_DIR/codecortex"
+# CodeRabbit PR #292 finding 4052087951: /usr/bin:/bin is not guaranteed empty of `codecortex` — a
+# system-installed copy there would let the wrapper resolve the bare name off PATH instead of emitting
+# this test's own odd absolute path, so a real bug (the wrapper failing to prefer/quote an odd path) could
+# pass silently. An EMPTY directory is the only PATH guaranteed to hold no `codecortex` anywhere.
+EMPTY_PATH="$TMP/empty-path"
+mkdir -p "$EMPTY_PATH"
+for agent in opencode cursor; do
+    PATH="$EMPTY_PATH" "$ODD_DIR/codecortex" wrap "$agent" --force >"$TMP/odd_$agent.txt" 2>/dev/null
+    awk '/^\{$/{f=1} f{print} /^\}$/{if(f)exit}' "$TMP/odd_$agent.txt" >"$TMP/odd_$agent.json"
+    verdict="$( python3 - "$TMP/odd_$agent.json" "$ODD_DIR/codecortex" "$agent" <<'PY'
+import json, os, sys
+path, want, agent = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    cfg = json.load( open( path ) )
+except Exception as e:
+    print( "FAIL the %s stanza is not valid JSON once the command is an odd absolute path: %s" % ( agent, e ) ); sys.exit( 0 )
+command = cfg[ "mcp" ][ "codecortex" ][ "command" ][ 0 ] if agent == "opencode" else cfg[ "mcpServers" ][ "codecortex" ][ "command" ]
+if os.path.realpath( command ) != os.path.realpath( want ):
+    print( "FAIL the %s stanza parses but names %r, not the running binary %r" % ( agent, command, want ) ); sys.exit( 0 )
+print( "PASS the %s stanza parses and names the running binary's quoted/backslashed path" % agent )
+PY
+)"
+    case "$verdict" in
+        PASS*) ok "${verdict#PASS }" ;;
+        *)     no "${verdict#FAIL }" ;;
+    esac
+done
+
+[ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES ABOVE"
+exit $fail

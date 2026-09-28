@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# parsehealthcheck.sh — PARSE HEALTH: files that ARE indexed but whose extraction the tool cannot vouch for.
+#
+# Why this gate exists. The skip taxonomy (test/skipreasoncheck.sh) covers files the index does not
+# CONTAIN. This gate covers the quieter lie: files the index contains and reports on as if they were
+# understood. Run on a corpus of 252 deliberately-invalid Python files, `--skipped` reported
+# oversize="0" — "index complete" — while every file was syntactically broken and every symbol drawn
+# from it was garbage. Same for a minified bundle: one 400 KB line yields plausible-looking symbols
+# with no relation to authored code.
+#
+# The two disclosure-only classes this gate pins (BOTH files stay INDEXED — nothing is newly dropped):
+#   degraded-parse    — the file's tree-sitter parse contains ERROR / MISSING nodes. err= counts them,
+#                       err_ratio= is the share of the file's BYTES covered by top-most ERROR spans.
+#                       Deliberately NOT called "invalid syntax": tree-sitter error recovery is a
+#                       parser-state fact, not a language conformance judgment (a valid file in a
+#                       dialect the vendored grammar predates reads degraded too, and that is exactly
+#                       the case a reader must be told about).
+#   minified-suspect  — whitespace frequency under 0.07 across the leading sample (semgrep's published
+#                       threshold). ws_freq= is disclosed so the reader can second-guess the threshold.
+#
+# Arms:
+#   (0) presence guards — the fixture's broken files really are broken, the valid ones really parse
+#   (1) degraded-parse across THREE languages (C++, Python, JavaScript): each truncated file gets a row
+#       carrying err= and err_ratio=
+#   (2) the VALID counterpart of each broken file reports NOTHING — no row, no err
+#   (3) minified-suspect: the no-whitespace bundle gets a row with ws_freq=, and its ws_freq is < 0.07
+#   (4) still indexed: a degraded file and the minified file are BOTH in files= and still contribute
+#       symbols — this lane discloses, it never drops
+#   (5) counts join the rows — degraded_parse= / minified_suspect= equal the rows emitted
+#   (6) WARM CACHE: the second run over the same tree with a cache reports the SAME health. Health that
+#       evaporates on a warm run is worse than no health at all (the auto-cache is the default path).
+#   (7) determinism + well-formedness
+#
+# Usage:  bash test/parsehealthcheck.sh      [CODECORTEX_BIN=path/to/binary]
+# Exits non-zero on any failure.
+
+set -u
+ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+BIN="${1:-${CODECORTEX_BIN:-$ROOT/build/codecortex}}"
+[ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
+fail=0
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
+no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
+
+[ -x "$BIN" ] || { echo "no codecortex binary at $BIN — build first"; exit 2; }
+command -v python3 >/dev/null 2>&1 || { echo "python3 required for XML assertions"; exit 2; }
+echo "parsehealthcheck: BIN=$BIN"
+TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
+mkdir -p "$TMP/corpus"
+
+# ── fixture: one VALID + one TRUNCATED-MID-FUNCTION file per language, plus a minified bundle ────────
+cat > "$TMP/corpus/goodcpp.cpp" <<'EOF'
+int healthyCppFn( int x )
+{
+    if( x > 0 )
+    {
+        return x + 1;
+    }
+    return 0;
+}
+EOF
+cat > "$TMP/corpus/brokencpp.cpp" <<'EOF'
+int truncatedCppFn( int x )
+{
+    if( x > 0 )
+    {
+        return x +
+EOF
+cat > "$TMP/corpus/goodpy.py" <<'EOF'
+def healthy_py_fn(x):
+    if x > 0:
+        return x + 1
+    return 0
+EOF
+cat > "$TMP/corpus/brokenpy.py" <<'EOF'
+def truncated_py_fn(x
+    if x > 0
+        return x +
+EOF
+cat > "$TMP/corpus/goodjs.js" <<'EOF'
+function healthyJsFn( x ) {
+    if ( x > 0 ) {
+        return x + 1;
+    }
+    return 0;
+}
+EOF
+cat > "$TMP/corpus/brokenjs.js" <<'EOF'
+function truncatedJsFn( x ) {
+    if ( x > 0 ) {
+        return x +
+EOF
+# a minified bundle: >=256 B, essentially no whitespace, and perfectly VALID JS (so this arm cannot
+# be satisfied by the degraded-parse machinery instead)
+# NB: ONE `var` declaring a comma list, the way a real minifier emits it — 40 × `var vN=N;` carries 40
+# mandatory spaces and lands at ws_freq 0.092, ABOVE the threshold. That near-miss is the reason arm (0)
+# asserts the whitespace count instead of trusting the generator to look minified.
+{ printf 'function minifiedEntry(){var '; for i in $( seq 1 40 ); do printf 'v%d=%d,' "$i" "$i"; done; printf 'vLast=0;return v1;}'; } > "$TMP/corpus/bundle.js"
+# a file with a genuinely invalid UTF-8 byte (0xFF cannot start any valid sequence) sitting in an
+# otherwise well-formed function — tree-sitter's own error recovery may not flag this as ERROR/MISSING
+# (confirmed empirically on a random-byte .kt file during the Kotlin port's own adversarial testing),
+# so this is what measureFileHealth's byte-level UTF-8 scan exists to catch.
+printf 'int badUtf8Fn( int x )\n{\n    // bad byte follows: \xffhere\n    return x + 1;\n}\n' > "$TMP/corpus/badutf8.cpp"
+# the negative control: REAL multi-byte UTF-8 (not invalid bytes) in a comment and a string literal —
+# this must NOT be flagged degraded-parse, proving the scan validates sequences rather than just
+# rejecting every byte >= 0x80.
+printf 'int goodUtf8Fn( int x )\n{\n    // héllo wörld —日本語 ☺\n    const char* s = "café";\n    return x + 1;\n}\n' > "$TMP/corpus/goodutf8.cpp"
+# a bad UTF-8 byte sitting INSIDE a genuine tree-sitter top-most ERROR span (garbage tokens tree-sitter
+# cannot parse at all), not just anywhere in the file — measureFileHealth's overlap-dedup arithmetic
+# (the std::lower_bound scan against badUtf8Positions per ERROR span) exists specifically to avoid
+# double-counting THIS shape; badutf8.cpp above never exercises that path, since its bad byte sits in a
+# clean-parsing `//` comment with no ERROR node to overlap at all. The baseline swaps the bad byte for
+# an ordinary letter to pin the ERROR-only count first: both fixtures must report the SAME err= — proof
+# the bad-UTF-8 position was folded into the existing ERROR span rather than added on top of it (a
+# regression to the dedup arithmetic — a swapped lower_bound direction, a missed subtraction — would
+# show up here as badutf8inerror.cpp's err= being one higher than baselineerror.cpp's, or as a wildly
+# wrong count from a std::uint32_t underflow on a double-subtraction).
+printf 'int weirdErrorFn( int x )\n{\n    @@@ x garbage !!! more\n    return x + 1;\n}\n' > "$TMP/corpus/baselineerror.cpp"
+printf 'int weirdErrorFn( int x )\n{\n    @@@ \xff garbage !!! more\n    return x + 1;\n}\n' > "$TMP/corpus/badutf8inerror.cpp"
+
+cd "$TMP"
+
+# ── (0) presence guards ──────────────────────────────────────────────────────────────────────────────
+bundleBytes="$( wc -c < "$TMP/corpus/bundle.js" | tr -d ' ' )"
+[ "$bundleBytes" -ge 256 ] && ok "(0) bundle.js is $bundleBytes B (>=256, the minified-suspect floor)" \
+                           || no "(0) bundle.js is only $bundleBytes B — under the disclosure floor, arm (3) would pass blind"
+# NB: python3, not `tr -dc '[:space:]'` — BSD tr does not honour the class inside a complemented
+# delete set and silently counts letters instead (it read 42 "whitespace" bytes in a file with none).
+bundleWs="$( python3 -c 'import sys;print(sum(1 for c in open(sys.argv[1],"rb").read() if c in b" \t\r\n\f\v"))' "$TMP/corpus/bundle.js" )"
+bundleFreq="$( python3 -c 'import sys;print("%.4f"%(int(sys.argv[1])/int(sys.argv[2])))' "$bundleWs" "$bundleBytes" )"
+python3 -c 'import sys;sys.exit(0 if float(sys.argv[1]) < 0.07 else 1)' "$bundleFreq" \
+  && ok "(0) bundle.js whitespace frequency is $bundleFreq (under the 0.07 threshold)" \
+  || no "(0) bundle.js whitespace frequency is $bundleFreq — NOT under 0.07, so arm (3) cannot fire"
+grep -q 'return x +$' "$TMP/corpus/brokencpp.cpp" && ok "(0) brokencpp.cpp really is truncated mid-expression" \
+                      || no "(0) brokencpp.cpp is no longer truncated — arm (1) would pass by finding nothing"
+
+# ── run ──────────────────────────────────────────────────────────────────────────────────────────────
+"$BIN" corpus --skipped --no-cache > "$TMP/h.xml" 2>/dev/null
+
+hrow(){ # hrow <path-substr>  → prints the <h .../> row, empty if absent
+  python3 - "$TMP/h.xml" "$1" <<'PY'
+import re,sys
+x=open(sys.argv[1]).read(); p=sys.argv[2]
+for m in re.finditer(r'<h\b[^>]*/>', x):
+    if p in m.group(0):
+        print(m.group(0)); raise SystemExit(0)
+print("")
+PY
+}
+attr(){ python3 - "$1" "$2" <<'PY'
+import re,sys
+a=re.search(r'\b%s="([^"]*)"'%sys.argv[2], sys.argv[1])
+print(a.group(1) if a else "")
+PY
+}
+hattr(){ python3 - "$TMP/h.xml" "$1" <<'PY'
+import re,sys
+x=open(sys.argv[1]).read(); m=re.search(r'<skipped\b[^>]*>',x)
+a=re.search(r'\b%s="([^"]*)"'%sys.argv[2], m.group(0)) if m else None
+print(a.group(1) if a else "")
+PY
+}
+
+# ── (1) degraded-parse across three languages ────────────────────────────────────────────────────────
+for f in brokencpp.cpp brokenpy.py brokenjs.js; do
+  row="$( hrow "$f" )"   # R-E CORRECTION 2026-08-19: root-relative p= — root="corpus" carries the prefix
+  if [ -z "$row" ]; then
+    no "(1) no parse-health row for corpus/$f"
+    continue
+  fi
+  case "$row" in *degraded-parse*) ;; *) no "(1) corpus/$f row lacks why=\"degraded-parse\": $row"; continue ;; esac
+  e="$( attr "$row" err )"; er="$( attr "$row" err_ratio )"
+  if [ -n "$e" ] && [ "$e" -ge 1 ] 2>/dev/null && [ -n "$er" ]; then
+    ok "(1) corpus/$f degraded-parse err=$e err_ratio=$er"
+  else
+    no "(1) corpus/$f row missing err=/err_ratio=: $row"
+  fi
+done
+
+# ── (2) the valid counterparts report nothing ────────────────────────────────────────────────────────
+for f in goodcpp.cpp goodpy.py goodjs.js; do
+  row="$( hrow "$f" )"   # R-E CORRECTION 2026-08-19: root-relative p= — root="corpus" carries the prefix
+  [ -z "$row" ] && ok "(2) corpus/$f reports no parse-health finding" \
+                || no "(2) corpus/$f reported a finding it should not: $row"
+done
+
+# ── (1b) invalid UTF-8 is caught even when tree-sitter's own error recovery stays silent ───────────────
+row="$( hrow 'badutf8.cpp' )"
+if [ -z "$row" ]; then
+  no '(1b) no parse-health row for corpus/badutf8.cpp — invalid UTF-8 went undetected'
+else
+  case "$row" in *degraded-parse*) ;; *) no "(1b) corpus/badutf8.cpp row lacks why=\"degraded-parse\": $row"; row="" ;; esac
+  if [ -n "$row" ]; then
+    e="$( attr "$row" err )"
+    [ -n "$e" ] && [ "$e" -ge 1 ] 2>/dev/null && ok "(1b) corpus/badutf8.cpp flagged degraded-parse err=$e (invalid UTF-8)" \
+                                              || no "(1b) corpus/badutf8.cpp row missing err=: $row"
+  fi
+fi
+
+# ── (2b) real multi-byte UTF-8 is NOT mistaken for invalid bytes ────────────────────────────────────────
+row="$( hrow 'goodutf8.cpp' )"
+[ -z "$row" ] && ok "(2b) corpus/goodutf8.cpp (real UTF-8 in comment+string) reports no parse-health finding" \
+              || no "(2b) corpus/goodutf8.cpp reported a finding it should not (false positive on valid UTF-8): $row"
+
+# ── (1c) invalid UTF-8 INSIDE a top-most ERROR span is deduped, not double-counted ──────────────────────
+# baselineerror.cpp and badutf8inerror.cpp are byte-identical except for one byte (an ordinary letter vs
+# an invalid 0xFF) inside the same unparseable garbage token — so they must produce the SAME err= if the
+# overlap-dedup arithmetic in measureFileHealth is correct (the bad-UTF-8 position was already counted as
+# part of the top-most ERROR span). A different err= between the two — usually one higher on the bad-byte
+# side — means the dedup missed this position and double-counted it.
+baseRow="$( hrow 'baselineerror.cpp' )"
+badRow="$( hrow 'badutf8inerror.cpp' )"
+if [ -z "$baseRow" ] || [ -z "$badRow" ]; then
+  no "(1c) missing parse-health row(s): baseline=[$baseRow] badutf8inerror=[$badRow]"
+else
+  baseErr="$( attr "$baseRow" err )"; badErr="$( attr "$badRow" err )"
+  [ -n "$baseErr" ] && [ "$baseErr" = "$badErr" ] \
+    && ok "(1c) bad UTF-8 inside an ERROR span is deduped: both fixtures report err=$baseErr" \
+    || no "(1c) dedup regression: baselineerror.cpp err=$baseErr but badutf8inerror.cpp err=$badErr — the bad-UTF-8 position was double-counted (or under-counted) against the ERROR span"
+  baseRatio="$( attr "$baseRow" err_ratio )"; badRatio="$( attr "$badRow" err_ratio )"
+  [ -n "$baseRatio" ] && [ "$baseRatio" = "$badRatio" ] \
+    && ok "(1c) err_ratio= also agrees: both report $baseRatio" \
+    || no "(1c) err_ratio= disagrees between the two fixtures: baseline=$baseRatio badutf8inerror=$badRatio"
+fi
+
+# ── (3) minified-suspect ─────────────────────────────────────────────────────────────────────────────
+row="$( hrow 'bundle.js' )"
+if [ -z "$row" ]; then
+  no '(3) no parse-health row for corpus/bundle.js'
+else
+  case "$row" in *minified-suspect*) ok '(3) bundle.js carries why="minified-suspect"' ;;
+                 *) no "(3) bundle.js row lacks why=\"minified-suspect\": $row" ;; esac
+  wf="$( attr "$row" ws_freq )"
+  if [ -n "$wf" ] && python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) < 0.07 else 1)" "$wf"; then
+    ok "(3) bundle.js discloses ws_freq=$wf (< 0.07)"
+  else
+    no "(3) bundle.js ws_freq missing or not under the threshold: '$wf'"
+  fi
+fi
+
+# ── (4) still indexed — this lane discloses, it never drops ──────────────────────────────────────────
+"$BIN" corpus --no-cache > "$TMP/map.xml" 2>/dev/null
+grep -q 'p="brokencpp.cpp"' "$TMP/map.xml" && ok '(4) the degraded file is still in the map' \
+                                                  || no '(4) the degraded file VANISHED from the map — this lane must not drop'
+grep -q 'minifiedEntry' "$TMP/map.xml" && ok '(4) the minified bundle still contributes symbols' \
+                                       || no '(4) the minified bundle contributes no symbols — this lane must not drop'
+
+# ── (5) counts join the rows ─────────────────────────────────────────────────────────────────────────
+D="$( hattr degraded_parse )"; M="$( hattr minified_suspect )"
+dRows="$( grep -o '<h\b[^>]*degraded-parse[^>]*/>' "$TMP/h.xml" | wc -l | tr -d ' ' )"
+mRows="$( grep -o '<h\b[^>]*minified-suspect[^>]*/>' "$TMP/h.xml" | wc -l | tr -d ' ' )"
+[ -n "$D" ] && [ "$D" = "$dRows" ] && ok "(5) degraded_parse=$D equals the $dRows rows emitted" \
+                                   || no "(5) degraded_parse=$D but $dRows rows emitted"
+[ -n "$M" ] && [ "$M" = "$mRows" ] && ok "(5) minified_suspect=$M equals the $mRows rows emitted" \
+                                   || no "(5) minified_suspect=$M but $mRows rows emitted"
+
+# ── (6) warm cache keeps the health ──────────────────────────────────────────────────────────────────
+CACHE="$TMP/warm.codecortexcache"
+"$BIN" corpus --skipped --cache="$CACHE" > "$TMP/warm1.xml" 2>/dev/null
+"$BIN" corpus --skipped --cache="$CACHE" > "$TMP/warm2.xml" 2>/dev/null
+cmp -s "$TMP/warm1.xml" "$TMP/warm2.xml" && ok '(6) cold and warm --skipped agree (health survives the cache)' \
+                                          || { no '(6) warm run DISAGREES with the cold run — health does not round-trip the cache'; diff "$TMP/warm1.xml" "$TMP/warm2.xml" | head -4; }
+W="$( python3 - "$TMP/warm2.xml" <<'PY'
+import re,sys
+x=open(sys.argv[1]).read(); m=re.search(r'<skipped\b[^>]*>',x)
+a=re.search(r'\bdegraded_parse="([^"]*)"', m.group(0)) if m else None
+print(a.group(1) if a else "")
+PY
+)"
+[ -n "$W" ] && [ "$W" -ge 3 ] 2>/dev/null && ok "(6) warm run still reports degraded_parse=$W" \
+                                          || no "(6) warm run reports degraded_parse='$W' (want >=3)"
+
+# ── (7) determinism + well-formedness ────────────────────────────────────────────────────────────────
+"$BIN" corpus --skipped --no-cache > "$TMP/h2.xml" 2>/dev/null
+if cmp -s "$TMP/h.xml" "$TMP/h2.xml"; then ok '(7) two runs are byte-identical'; else no '(7) output is NOT deterministic'; fi
+if command -v xmllint >/dev/null 2>&1; then
+  if xmllint --noout "$TMP/h.xml" 2>/dev/null; then ok '(7) well-formed XML'; else no '(7) NOT well-formed XML'; fi
+else
+  echo "  SKIP  (7) xmllint unavailable"
+fi
+
+echo
+[ "$fail" -eq 0 ] && { echo "ALL PASS"; exit 0; } || { echo "FAILURES"; exit 1; }

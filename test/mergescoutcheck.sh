@@ -1,0 +1,543 @@
+#!/usr/bin/env bash
+# mergescoutcheck.sh — gate for L1: --merge-scout=REF[,REF...], the
+# read-only cross-branch overlap oracle.
+#
+# Fixture repo, 3 branches off one init commit:
+#   A touches f1.cpp::x
+#   B touches f1.cpp::x (same symbol as A — a TRUE conflict)
+#   C touches f2.cpp::y (a different file entirely — clean vs both A and B)
+# Asserts:
+#   - pair A-B reports f1::x as a same-symbol conflict
+#   - pairs A-C and B-C are clean (0 conflicts, 0 risks)
+#   - landing order puts C first (fewest conflicts), tie-break A before B by ref name
+#   - a same-file/different-symbol pair (D touches f1::x, E touches f1::z) is reported as a RISK, not a conflict
+#   - the dirty working tree participates as an implicit "working-tree" arm when present
+#   - an unresolvable ref refuses loudly (exit 1, names the ref) — BEFORE any output
+#   - a ref rev-parse answers with a NON-bare name (`^HEAD`, `^A~1` → `^<sha>` at rc 0) refuses the same way, and no
+#     `^<sha>` reaches a git argv; a ref beginning with `-` refuses and never reaches a git argv at all — both seen
+#     from the git child through an argv-logging PATH shim, whose liveness is its own arm
+#   - a valid ref answers byte-identically through that shim; a revision expression (A^0,C~0) still resolves and
+#     answers byte-identically to its branch-name spelling
+#   - non-git root refuses loudly (exit 1, no XML) — X9(a): was arms="0" exit 0, indistinguishable from
+#     "ran clean, no conflicts"
+#   - multi-root workspace refuses (single-root only, like --pr-context/--quality-delta)
+#   - determinism (byte-identical run-to-run) and xmllint-clean output
+#
+# Usage:
+#   test/mergescoutcheck.sh                          # uses build/codecortex
+#   CODECORTEX_BIN=asan/codecortex test/mergescoutcheck.sh
+#
+# Exits non-zero on any failure; prints PASS/FAIL per check and ALL PASS on success.
+
+set -u
+ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
+BIN="${1:-${CODECORTEX_BIN:-$ROOT/build/codecortex}}"
+[ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
+TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
+fail=0
+
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
+no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
+
+[ -x "$BIN" ] || { echo "no codecortex binary at $BIN — build first (cmake --build build -j)"; exit 2; }
+echo "mergescoutcheck: BIN=$BIN"
+
+# ── Build the fixture repo: init, then branches A / B / C off it ──────────────────────────────────────
+REPO="$TMP/repo"
+mkdir -p "$REPO"
+git -C "$REPO" init -q
+git -C "$REPO" config user.email "dev@x.com"
+git -C "$REPO" config user.name  "Dev"
+
+cat >"$REPO/f1.cpp" <<'EOF'
+int x() { return 1; }
+int z() { return 2; }
+EOF
+cat >"$REPO/f2.cpp" <<'EOF'
+int y() { return 3; }
+EOF
+git -C "$REPO" add -A
+GIT_AUTHOR_DATE="2026-06-01T12:00:00" GIT_COMMITTER_DATE="2026-06-01T12:00:00" \
+    git -C "$REPO" commit -qm "init"
+MAIN="$( git -C "$REPO" symbolic-ref --short HEAD )"
+
+git -C "$REPO" checkout -qb A
+cat >"$REPO/f1.cpp" <<'EOF'
+int x() { return 100; }
+int z() { return 2; }
+EOF
+GIT_AUTHOR_DATE="2026-06-01T13:00:00" GIT_COMMITTER_DATE="2026-06-01T13:00:00" \
+    git -C "$REPO" commit -qam "A changes x"
+git -C "$REPO" checkout -q "$MAIN"
+
+git -C "$REPO" checkout -qb B
+cat >"$REPO/f1.cpp" <<'EOF'
+int x() { return 200; }
+int z() { return 2; }
+EOF
+GIT_AUTHOR_DATE="2026-06-01T14:00:00" GIT_COMMITTER_DATE="2026-06-01T14:00:00" \
+    git -C "$REPO" commit -qam "B changes x too"
+git -C "$REPO" checkout -q "$MAIN"
+
+git -C "$REPO" checkout -qb C
+cat >"$REPO/f2.cpp" <<'EOF'
+int y() { return 300; }
+EOF
+GIT_AUTHOR_DATE="2026-06-01T15:00:00" GIT_COMMITTER_DATE="2026-06-01T15:00:00" \
+    git -C "$REPO" commit -qam "C changes y"
+git -C "$REPO" checkout -q "$MAIN"
+
+# F: branched off MAIN but never diverged (no commits of its own) — §P11.13's changed="0" case: a ref
+# with NOTHING to land, distinct from A/B/C which all have real divergent work.
+git -C "$REPO" checkout -qb F
+git -C "$REPO" checkout -q "$MAIN"
+
+# ── Run --merge-scout=A,B,C ─────────────────────────────────────────────────────────────────────────
+OUT="$( "$BIN" "$REPO" --merge-scout=A,B,C --no-cache 2>/dev/null )"
+if [ -z "$OUT" ]; then no "merge-scout: output is empty"; echo; echo "SOME CHECKS FAILED"; exit 1; fi
+echo "merge-scout output:"; echo "$OUT"; echo
+
+if echo "$OUT" | grep -q 'arms="3"'; then ok "3 arms reported"; else no "expected arms=3: $( echo "$OUT" | grep -o 'arms="[0-9]*"' | head -1 )"; fi
+
+# §A10.4: base= is a 9-hex-char sha, matching the at=/head= width every other repo-reading verb uses
+# (gitstamp.h) — it used to print the full 40-char merge-base sha, the one width outlier next to
+# --stray-content/--pr-context's base_sha= and --doctor's head=.
+BASE_ATTRS="$( echo "$OUT" | grep -oE 'base="[0-9a-f]+"' )"
+BASE_BAD="$( echo "$BASE_ATTRS" | grep -vE '^base="[0-9a-f]{9}"$' )"
+if [ -n "$BASE_ATTRS" ] && [ -z "$BASE_BAD" ]; then
+    ok "every <arm base= is a 9-hex-char sha (matches at=/head= width, §A10.4)"
+else
+    no "some <arm base= is not exactly 9 hex chars: $BASE_BAD"
+fi
+
+# A and B each report f1.cpp::x as their one changed symbol
+echo "$OUT" | grep -q '<arm ref="A"[^>]*changed="1"[^>]*><sym p="f1\.cpp" id="x"/>' \
+    && ok "arm A changed f1.cpp::x" || no "arm A did not report f1.cpp::x changed"
+echo "$OUT" | grep -q '<arm ref="B"[^>]*changed="1"[^>]*><sym p="f1\.cpp" id="x"/>' \
+    && ok "arm B changed f1.cpp::x" || no "arm B did not report f1.cpp::x changed"
+echo "$OUT" | grep -q '<arm ref="C"[^>]*changed="1"[^>]*><sym p="f2\.cpp" id="y"/>' \
+    && ok "arm C changed f2.cpp::y" || no "arm C did not report f2.cpp::y changed"
+
+# pair A-B: same-symbol conflict on x
+echo "$OUT" | grep -q '<pair a="A" b="B" conflicts="1" risks="0"><conflict p="f1\.cpp" id="x"/></pair>' \
+    && ok "pair A-B: true conflict on f1.cpp::x" \
+    || no "pair A-B wrong: $( echo "$OUT" | grep -o '<pair a=\"A\" b=\"B\"[^/]*' )"
+
+# pairs with C are clean
+echo "$OUT" | grep -q '<pair a="A" b="C" conflicts="0" risks="0"/>' \
+    && ok "pair A-C clean" || no "pair A-C not clean: $( echo "$OUT" | grep -o '<pair a=\"A\" b=\"C\"[^/]*/>' )"
+echo "$OUT" | grep -q '<pair a="B" b="C" conflicts="0" risks="0"/>' \
+    && ok "pair B-C clean" || no "pair B-C not clean: $( echo "$OUT" | grep -o '<pair a=\"B\" b=\"C\"[^/]*/>' )"
+
+# landing order: C first (0 conflicts), then A,B (tie broken by ref name asc)
+echo "$OUT" | grep -q '<landing order="C,A,B"/>' \
+    && ok "landing order = C,A,B (fewest-conflicts-first, ties by ref name asc)" \
+    || no "landing order wrong: $( echo "$OUT" | grep -o '<landing[^/]*/>' )"
+
+# ── §P11.13: F (changed="0" — no divergent work vs merge-base) is annotated and dropped from landing= ──
+FOUT="$( "$BIN" "$REPO" --merge-scout=A,B,C,F --no-cache 2>/dev/null )"
+if echo "$FOUT" | grep -q 'arms="4"'; then ok "4 arms reported (A,B,C,F)"; else no "expected arms=4: $( echo "$FOUT" | grep -o 'arms="[0-9]*"' | head -1 )"; fi
+# split the (minified, single-line) XML at every `<arm ` boundary so each arm's own block — up to but
+# NOT including the next `<arm `/`<pair`/`<landing` — can be grepped in isolation (a naive greedy
+# `<arm ref="X".*</arm>` would swallow every LATER arm's content too, since arms don't nest).
+ARM_F="$( printf '%s' "$FOUT" | sed 's/<arm /\n<arm /g; s/<pair /\n<pair /g; s/<landing /\n<landing /g' | grep '^<arm ref="F"' )"
+ARM_A="$( printf '%s' "$FOUT" | sed 's/<arm /\n<arm /g; s/<pair /\n<pair /g; s/<landing /\n<landing /g' | grep '^<arm ref="A"' )"
+if echo "$ARM_F" | grep -q 'changed="0"'; then ok "arm F reports changed=\"0\""; else no "arm F did not report changed=0: $ARM_F"; fi
+echo "$ARM_F" | grep -q '<no-work note="no divergent work vs merge-base — see --stray-content"/>' \
+    && ok "arm F (changed=0) carries the no-divergent-work <no-work note=.../> child" \
+    || no "arm F missing the <no-work note=.../> child: $ARM_F"
+echo "$ARM_A" | grep -q '<no-work' \
+    && no "arm A (has real changes) wrongly carries <no-work>" \
+    || ok "arm A (has real changes) carries no <no-work>"
+echo "$FOUT" | grep -q '<landing order="C,A,B"/>' \
+    && ok "landing= still C,A,B — F (nothing to land) excluded, real arms' order unperturbed" \
+    || no "landing order wrong with F present: $( echo "$FOUT" | grep -o '<landing[^/]*/>' )"
+echo "$FOUT" | grep -oE '<landing order="[^"]*"' | grep -q 'F' \
+    && no "landing= still names F despite it having no divergent work" \
+    || ok "landing= does not name F"
+
+# ── §L10: G — an UNRELATED-HISTORY branch (no merge-base with HEAD at all) — ok="0" AND changed="0",
+# but for a completely different reason than F: F was COMPARED and found nothing divergent; G was NEVER
+# compared (the merge-base itself is unresolvable). <no-work> is a claim about a comparison that ran —
+# it must not appear on an ok="0" arm, or it reads as "compared, found nothing" on an arm this verb
+# structurally could not compare at all. Every git command below is -C "$REPO" — this fixture must never
+# touch the actual worktree.
+git -C "$REPO" checkout -q --orphan G
+git -C "$REPO" rm -rf -q . >/dev/null 2>&1 || true
+cat >"$REPO/orphan.cpp" <<'EOF'
+int orphanFn() { return 900; }
+EOF
+git -C "$REPO" add -A
+GIT_AUTHOR_DATE="2026-06-01T17:00:00" GIT_COMMITTER_DATE="2026-06-01T17:00:00" \
+    git -C "$REPO" commit -qm "G: unrelated history root" >/dev/null
+git -C "$REPO" checkout -q "$MAIN"
+
+GOUT="$( "$BIN" "$REPO" --merge-scout=A,G --no-cache 2>/dev/null )"
+ARM_G="$( printf '%s' "$GOUT" | sed 's/<arm /\n<arm /g; s/<pair /\n<pair /g; s/<landing /\n<landing /g' | grep '^<arm ref="G"' )"
+if echo "$ARM_G" | grep -q 'ok="0"'; then ok "arm G (unrelated history) reports ok=\"0\""; else no "arm G did not report ok=0: $ARM_G"; fi
+if echo "$ARM_G" | grep -q 'changed="0"'; then ok "arm G reports changed=\"0\" (never compared, not compared-and-clean)"; else no "arm G did not report changed=0: $ARM_G"; fi
+echo "$ARM_G" | grep -q '<no-work' \
+    && no "arm G (ok=\"0\", never compared) wrongly carries <no-work> — reads as compared-and-clean" \
+    || ok "arm G (ok=\"0\") carries no <no-work> — the comparison never ran, so no verdict is claimed"
+if echo "$GOUT" | xmllint --noout - 2>/dev/null; then ok "xmllint clean (G fixture)"; else no "xmllint reported malformed XML (G fixture)"; fi
+
+# ── xmllint ─────────────────────────────────────────────────────────────────────────────────────────
+echo "$OUT" | xmllint --noout - 2>/dev/null \
+    && ok "xmllint clean" \
+    || no "xmllint reported malformed XML"
+
+# ── determinism ×3 ──────────────────────────────────────────────────────────────────────────────────
+D1="$( "$BIN" "$REPO" --merge-scout=A,B,C --no-cache 2>/dev/null )"
+D2="$( "$BIN" "$REPO" --merge-scout=A,B,C --no-cache 2>/dev/null )"
+D3="$( "$BIN" "$REPO" --merge-scout=A,B,C --no-cache 2>/dev/null )"
+if { [ "$D1" = "$D2" ] && [ "$D2" = "$D3" ]; }; then ok "determinism ×3: byte-identical"; else no "determinism: output differs across runs"; fi
+
+# ── textual risk: D and E touch DIFFERENT symbols in the SAME file ─────────────────────────────────────
+git -C "$REPO" checkout -qb D
+cat >"$REPO/f1.cpp" <<'EOF'
+int x() { return 42; }
+int z() { return 2; }
+EOF
+GIT_AUTHOR_DATE="2026-06-01T16:00:00" GIT_COMMITTER_DATE="2026-06-01T16:00:00" \
+    git -C "$REPO" commit -qam "D changes x"
+git -C "$REPO" checkout -q "$MAIN"
+
+git -C "$REPO" checkout -qb E
+cat >"$REPO/f1.cpp" <<'EOF'
+int x() { return 1; }
+int z() { return 999; }
+EOF
+GIT_AUTHOR_DATE="2026-06-01T17:00:00" GIT_COMMITTER_DATE="2026-06-01T17:00:00" \
+    git -C "$REPO" commit -qam "E changes z"
+git -C "$REPO" checkout -q "$MAIN"
+
+RISKOUT="$( "$BIN" "$REPO" --merge-scout=D,E --no-cache 2>/dev/null )"
+echo "$RISKOUT" | grep -q '<pair a="D" b="E" conflicts="0" risks="1"><risk p="f1\.cpp" a="x" b="z"/></pair>' \
+    && ok "D-E: same-file/different-symbol reported as a RISK, not a conflict" \
+    || no "D-E risk pair wrong: $( echo "$RISKOUT" | grep -o '<pair a=\"D\" b=\"E\"[^/]*' )"
+
+# ── the dirty working tree joins as an implicit arm ─────────────────────────────────────────────────
+cat >"$REPO/f1.cpp" <<'EOF'
+int x() { return 7777; }
+int z() { return 2; }
+EOF
+WTOUT="$( "$BIN" "$REPO" --merge-scout=C --no-cache 2>/dev/null )"
+echo "$WTOUT" | grep -q 'arms="2"' \
+    && ok "dirty working tree adds an implicit 2nd arm" \
+    || no "working-tree arm missing: $( echo "$WTOUT" | grep -o 'arms="[0-9]*"' )"
+echo "$WTOUT" | grep -q '<arm ref="working-tree"[^>]*changed="1"[^>]*><sym p="f1\.cpp" id="x"/>' \
+    && ok "working-tree arm reports its own uncommitted change (f1.cpp::x)" \
+    || no "working-tree arm content wrong"
+git -C "$REPO" checkout -q -- f1.cpp   # restore for the checks below
+
+# ── clean tree: no implicit working-tree arm ────────────────────────────────────────────────────────
+CLEANOUT="$( "$BIN" "$REPO" --merge-scout=C --no-cache 2>/dev/null )"
+echo "$CLEANOUT" | grep -q 'arms="1"' \
+    && ok "clean tree: no implicit working-tree arm (arms=1)" \
+    || no "clean tree wrongly added a working-tree arm: $( echo "$CLEANOUT" | grep -o 'arms="[0-9]*"' )"
+
+# ── unresolvable ref refuses loudly (exit 1, names the ref) — no XML emitted ────────────────────────
+BADOUT="$( "$BIN" "$REPO" --merge-scout=A,does-not-exist,C --no-cache 2>&1 )"; BADRC=$?
+{ [ "$BADRC" -ne 0 ] && echo "$BADOUT" | grep -q "does-not-exist"; } \
+    && ok "unresolvable ref refuses loudly, naming it (rc=$BADRC)" \
+    || no "bad-ref refusal wrong (rc=$BADRC): $BADOUT"
+echo "$BADOUT" | grep -q '<merge-scout' \
+    && no "bad-ref refusal still emitted XML output (should refuse BEFORE any output)" \
+    || ok "bad-ref refusal emits no XML"
+
+# ── a ref rev-parse ANSWERS with a non-bare name, and a ref git could read as an OPTION ─────────────────────
+# resolveAllRefs used to keep `rev-parse --verify --quiet 'REF^{commit}'`'s raw stdout. For `^REF` that stdout is
+# `^<sha>` at rc 0, so the negation counted as resolved, reached `git merge-base` as its own argv entry, and the
+# verb printed an empty ok="0" arm at exit 0 — a wrong answer where every other unresolvable ref refuses. A ref
+# beginning with `-` was stopped only because git's own rev-parse rejects it today; the token still arrived at git
+# as an argv entry. Both halves of the house rule (quality::gitResolveCommitSha) are asserted from the git CHILD's
+# side, through a PATH shim that logs every argv entry of every git call as `[entry]`.
+REALGIT="$( command -v git )"
+mkdir -p "$TMP/shim"
+cat >"$TMP/shim/git" <<EOF
+#!/bin/bash
+{ for a in "\$@"; do printf '[%s]' "\$a"; done; printf '\n'; } >> "$TMP/argv.log"
+exec "$REALGIT" "\$@"
+EOF
+chmod +x "$TMP/shim/git"
+# scout REF — one shimmed run: sets SC_OUT / SC_ERR / SC_RC and leaves exactly this run's git argv in $TMP/argv.log
+scout()
+{
+    rm -f "$TMP/argv.log"
+    SC_OUT="$( PATH="$TMP/shim:$PATH" "$BIN" "$REPO" --merge-scout="$1" --no-cache 2>"$TMP/scout.err" )"; SC_RC=$?
+    SC_ERR="$( cat "$TMP/scout.err" )"
+}
+
+# liveness control: the shim sees a VALID ref's resolve probe, and does not perturb the answer it observes
+scout C
+grep -qF '[rev-parse][--verify][--quiet][C^{commit}]' "$TMP/argv.log" 2>/dev/null \
+    && ok "shim liveness: a valid ref's resolve probe is logged as its own argv entry ([C^{commit}])" \
+    || no "shim liveness: no resolve probe for C in the argv log — every argv arm below is vacuous: $( head -c 300 "$TMP/argv.log" 2>/dev/null )"
+{ [ "$SC_RC" -eq 0 ] && printf '%s' "$SC_OUT" | grep -q 'arms="1"' && [ "$SC_OUT" = "$CLEANOUT" ]; } \
+    && ok "a valid ref (C) answers byte-identically through the shim (rc=0, same bytes as the unshimmed run)" \
+    || no "a valid ref (C) through the shim: rc=$SC_RC, or its answer differs from the unshimmed run"
+
+# an over-strict fix must not refuse a revision EXPRESSION: A^0,C~0 name the same commits as A,C, so the answers are
+# byte-identical once only the ref tokens are normalised — after asserting the tokens are really there to normalise.
+EXPR="$( "$BIN" "$REPO" --merge-scout='A^0,C~0' --no-cache 2>/dev/null )"; EXPRRC=$?
+NAMED="$( "$BIN" "$REPO" --merge-scout=A,C --no-cache 2>/dev/null )"
+{ [ "$EXPRRC" -eq 0 ] && printf '%s' "$EXPR" | grep -qF 'ref="A^0"' && printf '%s' "$EXPR" | grep -qF 'ref="C~0"'; } \
+    && ok "revision expressions A^0,C~0 resolve (rc=0, each arm carries its own ref token)" \
+    || no "revision expressions A^0,C~0 were refused or lost their ref token (rc=$EXPRRC)"
+NORM="$( printf '%s' "$EXPR" | sed 's/A\^0/A/g; s/C~0/C/g' )"
+{ printf '%s' "$NAMED" | grep -q 'arms="2"' && [ "$NORM" = "$NAMED" ]; } \
+    && ok "A^0,C~0 answers byte-identically to A,C once the ref tokens are normalised" \
+    || no "A^0,C~0 answers differently from A,C beyond the ref tokens"
+
+# kind|ref|needle — `nonbare`: rev-parse answers the ref at rc 0 with `^<sha>`; `dash`: git could read it as an option,
+# and `needle` is the payload path that must never reach a git argv (nor be written).
+ROWS="nonbare|^HEAD|
+nonbare|^A~1|
+dash|--output=$TMP/pwned-output|$TMP/pwned-output
+dash|--upload-pack=touch $TMP/pwned-uploadpack|$TMP/pwned-uploadpack"
+while IFS='|' read -r kind ref needle <&3; do
+    if [ "$kind" = nonbare ]; then
+        # presence guard: on THIS fixture rev-parse must answer the ref at rc 0 with a non-bare name, or the refusal
+        # below would pass for the boring reason (the ref simply does not resolve)
+        PROBE="$( git -C "$REPO" rev-parse --verify --quiet "$ref^{commit}" 2>/dev/null )"; PROBERC=$?
+        { [ "$PROBERC" -eq 0 ] && [ "${PROBE#^}" != "$PROBE" ]; } \
+            && ok "precondition: rev-parse answers '$ref' at rc 0 with a non-bare name (${PROBE:0:10}…)" \
+            || no "precondition: rev-parse does not answer '$ref' with a '^'-prefixed name here (rc=$PROBERC '$PROBE') — the arm cannot see the defect"
+    fi
+    scout "$ref"
+    { [ "$SC_RC" -eq 1 ] && printf '%s' "$SC_ERR" | grep -qF "unknown ref '$ref'"; } \
+        && ok "'$ref' refuses as a bad ref (exit 1, names the ref)" \
+        || no "'$ref' did not refuse as a bad ref (rc=$SC_RC): $( printf '%s' "$SC_ERR" | head -c 300 )"
+    printf '%s' "$SC_OUT" | grep -q '<merge-scout' \
+        && no "'$ref' still emitted <merge-scout> XML — a refusal comes BEFORE any output" \
+        || ok "'$ref' refusal emits no XML"
+    [ -s "$TMP/argv.log" ] \
+        && ok "'$ref': the shim logged git calls during this very run (its argv arm is live)" \
+        || no "'$ref': the shim logged nothing during this run — its argv arm is vacuous"
+    if [ "$kind" = nonbare ]; then
+        grep -Eq '\[\^[0-9a-f]{40}([0-9a-f]{24})?\]' "$TMP/argv.log" \
+            && no "'$ref': rev-parse's non-bare answer reached git as an argv entry: $( grep -Eo '\[[a-z-]+\]\[\^[0-9a-f]+\]' "$TMP/argv.log" | head -2 | tr '\n' ' ' )" \
+            || ok "'$ref': no '^<sha>' negation reached any git argv"
+    else
+        grep -qF -- "$needle" "$TMP/argv.log" \
+            && no "'$ref' reached a git argv: $( grep -F -- "$needle" "$TMP/argv.log" | head -1 | head -c 300 )" \
+            || ok "'$ref' never appears in any git argv (refused before git is asked)"
+        if [ ! -e "$needle" ]; then ok "'$ref': nothing was written at the payload path"; else no "'$ref' created $needle"; fi
+    fi
+done 3<<< "$ROWS"
+
+# ── empty ref list refuses loudly ───────────────────────────────────────────────────────────────────
+EMPTYOUT="$( "$BIN" "$REPO" --merge-scout= --no-cache 2>&1 )"; EMPTYRC=$?
+if [ "$EMPTYRC" -ne 0 ]; then ok "empty --merge-scout= refuses loudly (rc=$EMPTYRC)"; else no "empty --merge-scout= should refuse (rc=$EMPTYRC)"; fi
+
+# ── reserved arm name as a ref token refuses loudly ─────────────────────────────────────────────────
+RESOUT="$( "$BIN" "$REPO" --merge-scout=working-tree --no-cache 2>&1 )"; RESRC=$?
+if [ "$RESRC" -ne 0 ]; then ok "'working-tree' as a REF token refuses loudly (rc=$RESRC)"; else no "'working-tree' ref should refuse (rc=$RESRC)"; fi
+
+# ── non-git root refuses loudly (X9(a)): exit 1, a clear message, no XML ───────────────────────────────
+NG="$TMP/nongit"; mkdir -p "$NG"; echo 'int f(){return 0;}' >"$NG/a.cpp"
+NGOUT="$( "$BIN" "$NG" --merge-scout=A --no-cache 2>/dev/null )"; NGRC=$?
+NGERR="$( "$BIN" "$NG" --merge-scout=A --no-cache 2>&1 1>/dev/null )"
+if [ "$NGRC" -eq 1 ]; then ok "non-git root refuses loudly (exit 1)"; else no "non-git root should exit 1 (got rc=$NGRC)"; fi
+if [ -z "$NGOUT" ]; then ok "non-git root refusal emits no XML"; else no "non-git root refusal unexpectedly emitted output: $NGOUT"; fi
+echo "$NGERR" | grep -qi 'not a git repository' \
+    && ok "non-git root refusal names the reason (not a git repository)" \
+    || no "non-git root refusal missing a clear message: $NGERR"
+
+# ── multi-root workspace refuses (single-root only) ─────────────────────────────────────────────────
+MRERR="$( "$BIN" "$REPO" "$REPO" --merge-scout=A --no-cache 2>&1 )"; MRRC=$?
+{ [ "$MRRC" -ne 0 ] && echo "$MRERR" | grep -q "single-root only"; } \
+    && ok "multi-root workspace refuses --merge-scout (single-root only)" \
+    || no "multi-root refusal wrong (rc=$MRRC): $MRERR"
+
+# ── never checks anything out (read-only): the real working tree / current branch are untouched ──────
+POSTBRANCH="$( git -C "$REPO" symbolic-ref --short HEAD )"
+[ "$POSTBRANCH" = "$MAIN" ] && ok "read-only: current branch unchanged after all runs ($POSTBRANCH)" \
+                             || no "current branch changed! now on $POSTBRANCH (expected $MAIN)"
+git -C "$REPO" status --porcelain | grep -q . \
+    && no "read-only: working tree left dirty after runs" \
+    || ok "read-only: working tree clean after all runs"
+
+# ── Y1 ( P1) perf gate: warm run reuses the per-sha ingest cache ─────────────────────────────────
+# mergescout.h:115 used to hand ingest() an EMPTY cacheFile, forcing a full cold tree-sitter PARSE of
+# every arm's tree on EVERY invocation (the audited 9.15 s / 967 MB, 6-cold-ingest finding on a large private C++ corpus)
+# despite this module's own header claiming cache reuse. The fix threads a per-sha cache path (the "qms"
+# family, quality.h:1017-1021's qheadsnap convention) through indexCommittish, so a SECOND invocation
+# against the SAME shas skips tree-sitter entirely (only git-archive extraction + a content-hash lookup
+# remain) — cold and warm must still be BYTE-IDENTICAL (determinism unaffected by the cache).
+#
+# A fresh, isolated PERFROOT (own TMPDIR, so cacheDirLadder() lands in a directory we control and can
+# guarantee starts empty) hosts a purpose-built fixture: few, LARGE files (parse-cost-heavy, not
+# archive-extraction-heavy — a synthetic fixture with many tiny files is dominated by fixed per-file
+# git-archive/extraction overhead that Y1 does not touch, which would mask the win) across 6 branches (12
+# distinct trees requested; TreeIndexMemo dedupes the 6 shared merge-bases to 1, so 7 unique materializations
+# per run). median-of-3 (perl high-res timer, mirrors bench/perfgate.sh's median_ms) damps scheduler noise;
+# the bound (50%) is deliberately generous — measured on this fixture the fix consistently lands near 35%,
+# and reverting it (empty cacheFile) reproduces ~100% (no cross-run reuse at all), so 50% cleanly separates
+# "fixed" from "regressed" without chasing machine-specific noise.
+PERFRUNS=3
+run_once_ms()
+{
+    perl -MTime::HiRes=time -e '
+        open STDOUT, ">", "/dev/null" or die $!;
+        open STDERR, ">", "/dev/null" or die $!;
+        my $start = time();
+        system @ARGV;
+        my $status = $?;
+        my $elapsed = (time() - $start) * 1000.0;
+        open STDOUT, ">&", 3 or die $!;
+        printf "%.6f\n", $elapsed;
+        exit($status == -1 ? 127 : ($status >> 8));
+    ' 3>&1 -- "$@"
+}
+
+# median_ms [clear_cache_dir] CMD... — runs CMD PERFRUNS times, printing the median wall time in ms. When
+# `clear_cache_dir` is non-empty, EVERY qms cache blob under it is deleted BEFORE each of the PERFRUNS
+# timed samples (not just once before the loop) — otherwise only the FIRST sample would be genuinely cold
+# and the other PERFRUNS-1 would silently be warm hits (the qms family is unconditional, not gated on
+# --no-cache — see quality.h's own qheadsnap convention), pulling the "cold" median toward the warm number
+# and hiding the regression this gate exists to catch.
+median_ms()
+{
+    local clearDir="$1"; shift
+    local n_local=0
+    local times=()
+    for (( n_local = 0; n_local < PERFRUNS; ++n_local )); do
+        # Private-root + shard-aware lookup: $clearDir/codecortex/<xx>/blob.
+        [ -n "$clearDir" ] && { f="$( find "$clearDir" -maxdepth 3 -type f -name 'codecortex-qms-*.bin' 2>/dev/null )"; [ -n "$f" ] && rm -f $f; }
+        local elapsed
+        elapsed="$( run_once_ms "$@" )" || return 1
+        [ -z "$elapsed" ] && return 1
+        times+=( "$elapsed" )
+    done
+    printf '%s\n' "${times[@]}" | sort -n | awk -v n="$PERFRUNS" '{ a[NR]=$1 } END { mid=int((n+1)/2); if (n%2==1) print a[mid]; else print (a[mid]+a[mid+1])/2 }'
+}
+
+PERFTMP="$( mktemp -d )"
+PREPO="$PERFTMP/repo"
+mkdir -p "$PREPO/src"
+git -C "$PREPO" init -q
+git -C "$PREPO" config user.email "dev@x.com"
+git -C "$PREPO" config user.name  "Dev"
+
+PERF_NFILES=8
+PERF_NFUNCS=2000
+perf_gen_files()
+{
+    local override="$1" f k
+    for f in $( seq 0 $(( PERF_NFILES - 1 )) ); do
+        : > "$PREPO/src/m${f}.cpp"
+        for k in $( seq 0 $(( PERF_NFUNCS - 1 )) ); do
+            if [ "$f" = "0" ] && [ "$k" = "0" ] && [ -n "$override" ]; then
+                echo "int f0_0( int x ) { return x + ${override}; }" >> "$PREPO/src/m0.cpp"
+            else
+                echo "int f${f}_${k}( int x ) { int s = x; for( int i = 0; i < 8; ++i ) { if( i % 2 == 0 ) { s += i * ${k}; } else { s -= i; } } return s; }" >> "$PREPO/src/m${f}.cpp"
+            fi
+        done
+    done
+}
+perf_gen_files ""
+git -C "$PREPO" add -A
+GIT_AUTHOR_DATE="2026-06-01T10:00:00" GIT_COMMITTER_DATE="2026-06-01T10:00:00" \
+    git -C "$PREPO" commit -qm "perf-fixture init"
+PMAIN="$( git -C "$PREPO" symbolic-ref --short HEAD )"
+
+PERF_REFS=""
+for b in 1 2 3 4 5 6; do
+    git -C "$PREPO" checkout -qb "pb$b"
+    perf_gen_files "$b"
+    GIT_AUTHOR_DATE="2026-06-01T1${b}:00:00" GIT_COMMITTER_DATE="2026-06-01T1${b}:00:00" \
+        git -C "$PREPO" commit -qam "pb$b"
+    git -C "$PREPO" checkout -q "$PMAIN"
+    PERF_REFS="${PERF_REFS:+$PERF_REFS,}pb$b"
+done
+
+PERF_ISOTMP="$( mktemp -d )"   # dedicated, EMPTY TMPDIR — cacheDirLadder() lands here, so run 1 is genuinely cold
+SAVED_TMPDIR="${TMPDIR:-}"
+export TMPDIR="$PERF_ISOTMP"
+
+# one cold+warm median_ms round, in globals cold_ms/warm_ms/COLDRC/WARMRC — a function so the retry below
+# can re-run the exact same measurement rather than duplicating it.
+measure_y1()
+{
+    cold_ms="$( median_ms "$PERF_ISOTMP" "$BIN" "$PREPO" --merge-scout="$PERF_REFS" --no-cache )"
+    COLDRC=$?
+    warm_ms="$( median_ms ""            "$BIN" "$PREPO" --merge-scout="$PERF_REFS" --no-cache )"
+    WARMRC=$?
+}
+
+measure_y1
+if [ "$COLDRC" -ne 0 ] || [ "$WARMRC" -ne 0 ] || [ -z "${cold_ms:-}" ] || [ -z "${warm_ms:-}" ]; then
+    no "Y1 perf gate: timing harness failed to produce a sample (cold_rc=$COLDRC warm_rc=$WARMRC)"
+else
+    printf '  Y1 perf: cold(median x%d)=%.1f ms  warm(median x%d)=%.1f ms\n' "$PERFRUNS" "$cold_ms" "$PERFRUNS" "$warm_ms"
+    if awk -v c="$cold_ms" -v w="$warm_ms" 'BEGIN{ exit !(w < c * 0.50) }'; then
+        ok "Y1 perf: warm run < 50% of cold run (per-sha ingest cache reused across invocations)"
+    else
+        # exactly one disclosed retry (fix policy): CPU contention compresses the cold/warm gap without the
+        # underlying cache reuse being broken. Never a silent weakening, never a retry-until-pass loop — the
+        # retry is judged against the SAME unchanged 50% bound, and both rounds' numbers stay visible.
+        printf '  NOTE  Y1 perf ratio missed under load (cold=%.1f ms warm=%.1f ms) — one disclosed re-measure\n' "$cold_ms" "$warm_ms"
+        first_cold_ms="$cold_ms"; first_warm_ms="$warm_ms"
+        measure_y1
+        if [ "$COLDRC" -ne 0 ] || [ "$WARMRC" -ne 0 ] || [ -z "${cold_ms:-}" ] || [ -z "${warm_ms:-}" ]; then
+            no "Y1 perf gate: retry timing harness failed to produce a sample (cold_rc=$COLDRC warm_rc=$WARMRC)"
+        else
+            printf '  Y1 perf retry: cold(median x%d)=%.1f ms  warm(median x%d)=%.1f ms\n' "$PERFRUNS" "$cold_ms" "$PERFRUNS" "$warm_ms"
+            awk -v c="$cold_ms" -v w="$warm_ms" 'BEGIN{ exit !(w < c * 0.50) }' \
+                && ok "Y1 perf: warm run < 50% of cold run on retry (first: cold=${first_cold_ms}ms warm=${first_warm_ms}ms; retry: cold=${cold_ms}ms warm=${warm_ms}ms)" \
+                || no "Y1 perf: warm run NOT meaningfully faster than cold on retry either (first: cold=${first_cold_ms}ms warm=${first_warm_ms}ms; retry: cold=${cold_ms}ms warm=${warm_ms}ms) — per-sha cache not reused?"
+        fi
+    fi
+fi
+
+# correctness unchanged under caching: cold and warm outputs stay byte-identical (the cache must never
+# change the answer, only the time it takes to get there)
+COLDOUT="$( "$BIN" "$PREPO" --merge-scout="$PERF_REFS" --no-cache 2>/dev/null )"
+WARMOUT="$( "$BIN" "$PREPO" --merge-scout="$PERF_REFS" --no-cache 2>/dev/null )"
+[ "$COLDOUT" = "$WARMOUT" ] \
+    && ok "Y1 perf: cached run output byte-identical to uncached (cache never changes the answer)" \
+    || no "Y1 perf: cached run output DIFFERS from uncached"
+
+if [ -n "$SAVED_TMPDIR" ]; then export TMPDIR="$SAVED_TMPDIR"; else unset TMPDIR; fi
+rm -rf "$PERFTMP" "$PERF_ISOTMP"
+
+# ── TREE UNAVAILABLE: an arm whose tree could not be materialized is refused, never diffed as EMPTY ─────────────
+# materializeCommitTree (quality.h) returns no tree when `git archive` fails. indexCommittish used to hand back an EMPTY
+# index for it, and computeNamedArm diffed the other side against that under ok="1": every symbol on the base side
+# reported as the arm's own work (base_fn below). The tree's DISCLOSE sink now marks the index unavailable and the arm's
+# sink refuses it — ok="0" reason="tree_unavailable" changed="0", disclosed in-band on the row itself (T9,
+# 2026-09-19), not only on stderr. The fault is a PATH shim around the real git that fails `git archive <lane
+# tip>` — a seam that reaches the Release binary too. Control: the pass-through shim.
+TU="$TMP/treeunavail"; mkdir -p "$TU/repo" "$TU/shim" "$TU/cache"
+tu(){ git -C "$TU/repo" "$@" >/dev/null 2>&1; }
+tu init -q -b main; tu config user.email t@t; tu config user.name t; tu config commit.gpgsign false
+printf 'int base_fn( void ) { return 1; }\n' >"$TU/repo/a.c"; tu add a.c; tu commit -qm a
+tu checkout -qb lane; printf 'int lane_fn( void ) { return 2; }\n' >>"$TU/repo/a.c"; tu commit -qam lane
+tu checkout -q main; printf 'int main2_fn( void ) { return 3; }\n' >"$TU/repo/b.c"; tu add b.c; tu commit -qm main2
+LANESHA="$( git -C "$TU/repo" rev-parse lane )"; REALGIT="$( command -v git )"
+cat >"$TU/shim/git" <<SHEOF
+#!/usr/bin/env bash
+case " \$* " in
+    *" archive "*" $LANESHA "*) [ -n "\${RW_SHIM_MANGLE:-}" ] && exit 128; exec "$REALGIT" "\$@" ;;
+    *) exec "$REALGIT" "\$@" ;;
+esac
+SHEOF
+chmod +x "$TU/shim/git"
+PATH="$TU/shim:$PATH" TMPDIR="$TU/cache" XDG_CACHE_HOME="$TU/cache" "$BIN" "$TU/repo" --merge-scout=lane --no-cache >"$TU/ctl.xml" 2>/dev/null
+rm -rf "$TU/cache"; mkdir -p "$TU/cache"
+PATH="$TU/shim:$PATH" TMPDIR="$TU/cache" XDG_CACHE_HOME="$TU/cache" RW_SHIM_MANGLE=1 "$BIN" "$TU/repo" --merge-scout=lane --no-cache >"$TU/mut.xml" 2>/dev/null
+TUCTL="$( grep -o '<arm ref="lane"[^>]*>' "$TU/ctl.xml" )"; TUMUT="$( grep -o '<arm ref="lane"[^>]*>' "$TU/mut.xml" )"
+if printf '%s' "$TUCTL" | grep -q 'ok="1" changed="1"'; then
+    ok "tree unavailable (control): the pass-through shim scouts the lane — ok=\"1\" changed=\"1\" (lane_fn)"
+    printf '%s' "$TUMUT" | grep -q 'ok="0" reason="tree_unavailable" changed="0"' \
+        && ok "tree unavailable: an arm whose tree git could not archive is refused — ok=\"0\" reason=\"tree_unavailable\" changed=\"0\", nothing fabricated, reason disclosed in-band" \
+        || no "tree unavailable: the arm was diffed against an EMPTY tree, or the reason= disclosure is missing — $TUMUT (the base's own symbols reported as the arm's work)"
+else
+    no "tree unavailable (control): the pass-through shim did not scout the lane as ok=1 changed=1 — the arm is void: $TUCTL"
+fi
+
+# ── Summary ─────────────────────────────────────────────────────────────────────────────────────────
+echo
+if [ "$fail" -eq 0 ]; then echo "ALL PASS"; exit 0; else echo "SOME CHECKS FAILED"; exit 1; fi

@@ -1,0 +1,471 @@
+#!/usr/bin/env bash
+# doctorcheck.sh — gate for --doctor ( standing item): self-diagnosis verb.
+#
+# --doctor is a DIAGNOSTIC verb (environment-dependent output is its whole point), so unlike every
+# other absorb gate this one does NOT assert byte-identical / golden output. Instead it asserts:
+#   (A) happy path: exit 0, every named <c> row present, xmllint-clean, checks="N" matches N emitted rows.
+#   (B) an unwritable cache dir (via TMPDIR) makes the cache-dir row ok="0" and the whole run exit 1.
+#   (C) a non-repo target dir makes the git row ok="1" repo="0" (degrade, not a failure).
+#   (D) non-vacuity without a source mutation: assert the check COUNT in checks="N" equals the number
+#       of emitted <c ...> rows (a doctor that silently dropped a check would still exit 0/1 plausibly,
+#       but the count would betray it).
+#   (G) tracked-binary staleness: a binary committed, then its same-stem source
+#       edited in a LATER commit with the binary never recommitted, fires stale="1" ok="0" (git-commit-order,
+#       never mtime); a binary + source committed TOGETHER in their most recent touch stays stale="0" ok="1".
+#
+# Usage:
+#   test/doctorcheck.sh
+#   CODECORTEX_BIN=build_p5w4/codecortex test/doctorcheck.sh
+#
+# Exits non-zero on any failure; prints PASS/FAIL per check and ALL PASS on success.
+
+set -u
+ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
+BIN="${1:-${CODECORTEX_BIN:-$ROOT/build/codecortex}}"
+[ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
+TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
+fail=0
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
+no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
+
+[ -x "$BIN" ] || { echo "no codecortex binary at $BIN — build first (cmake --build build -j)"; exit 2; }
+. "$ROOT/test/lib/doctorvolatile.sh"                  # F6: the ONE strip list, read out of the document itself
+echo "doctorcheck: BIN=$BIN"
+
+# A small ad-hoc target dir (git repo, one file) — --doctor needs a root positional.
+REPO="$TMP/repo"
+mkdir -p "$REPO"
+echo 'int f(){return 0;}' >"$REPO/f.cpp"
+git -C "$REPO" init -q
+git -C "$REPO" config user.email "dev@x.com"
+git -C "$REPO" config user.name  "Dev"
+git -C "$REPO" add -A
+git -C "$REPO" commit -qm init >/dev/null
+
+# ── (A) happy path ──────────────────────────────────────────────────────────────────────────────
+# binary-path is the one check whose "ok" genuinely depends on this MACHINE's state (is the PATH
+# copy of codecortex the same file as the one under test?) — on a dev box with a stale `which codecortex`
+# that's a REAL finding, not a gate bug. So the happy path pins PATH to a dir containing exactly this
+# $BIN (same file, same inode either way it's resolved) to make check 1 deterministically ok="1", and
+# gives it its own scratch TMPDIR so the cache-dir row isn't at the mercy of whatever blobs already
+# live in the real one.
+BINDIR="$TMP/bin"; mkdir -p "$BINDIR"; cp "$BIN" "$BINDIR/codecortex"; chmod +x "$BINDIR/codecortex"
+HAPPYCACHE="$TMP/happycache"; mkdir -p "$HAPPYCACHE"
+
+# Cache accounting fixture: one legacy flat blob + one current one-level sharded blob are live. Locks,
+# cache-owned temporary directories, a non-hex directory, and a nested-beyond-the-shard decoy are not.
+# Sizes are deliberately unequal so a coincidentally-correct count cannot hide incorrect byte accounting.
+PRIVATECACHE="$HAPPYCACHE/codecortex"
+mkdir -p "$PRIVATECACHE/0a/nested" "$PRIVATECACHE/locks/0b" "$PRIVATECACHE/codecortex-temp-a" \
+         "$PRIVATECACHE/codecortex-temp-b" "$PRIVATECACHE/zz"
+printf 'flat'    >"$PRIVATECACHE/codecortex-flat.bin"
+printf 'sharded' >"$PRIVATECACHE/0a/codecortex-sharded.cache"
+printf 'nested'  >"$PRIVATECACHE/0a/nested/codecortex-too-deep.bin"
+printf 'lock'    >"$PRIVATECACHE/locks/0b/codecortex-edit-test.lock"
+printf 'temp-a'  >"$PRIVATECACHE/codecortex-temp-a/codecortex-decoy.bin"
+printf 'temp-b'  >"$PRIVATECACHE/codecortex-temp-b/codecortex-decoy.cache"
+printf 'nonhex'  >"$PRIVATECACHE/zz/codecortex-decoy.bin"
+
+# L1 (2026-09-19): the CLI default legend is compact (its root leads with schema= and its legend is the short form); the
+# arms reading $OUT/$GOUT/$VOUT match the full-posture root '<doctor checks=' or the FULL legend's prose, so those runs ask for it.
+OUT="$( PATH="$BINDIR:$PATH" TMPDIR="$HAPPYCACHE" "$BINDIR/codecortex" "$REPO" --doctor --legend=full --no-cache 2>/dev/null )"
+RC=$?
+echo "happy-path output:"; echo "$OUT"; echo "(exit=$RC)"; echo
+
+if [ "$RC" -eq 0 ]; then ok "happy path exits 0"; else no "happy path exit code was $RC, expected 0"; fi
+
+# 2026-09-06: the fixture's one edit-lock file (locks/0b/codecortex-edit-test.lock) is counted by the cache-dir
+# row's locks= — the blob scan still never enters locks/ (blobs= stays 2), the count is a separate walk.
+echo "$OUT" | grep -oE '<c n="cache-dir"[^<]*/>' | grep -q 'locks="1"' \
+    && ok "cache-dir row counts the fixture's one edit-lock file (locks=\"1\")" \
+    || no "cache-dir row's locks= is not 1: $( echo "$OUT" | grep -oE '<c n="cache-dir"[^<]*/>' )"
+
+# checks= is DERIVED from the rows the run actually emitted, not pinned at a literal: the literal was 6,
+# then 7 when the index-cache row landed, and a pinned count only ever measures how recently someone edited
+# this line. What is worth asserting is the INVARIANT — the denominator equals the row population — plus
+# the named row set below, which is the assertion that catches a row silently disappearing.
+EMITTED_ROWS="$( echo "$OUT" | grep -o '<c n="' | wc -l | tr -d ' ' )"
+DECLARED_CHECKS="$( echo "$OUT" | grep -o '<doctor checks="[0-9]*"' | grep -o '[0-9]*' )"
+[ -n "$DECLARED_CHECKS" ] && [ "$DECLARED_CHECKS" = "$EMITTED_ROWS" ] \
+    && ok "checks=\"$DECLARED_CHECKS\" equals the emitted <c n=> row count" \
+    || no "checks=\"${DECLARED_CHECKS:-<absent>}\" disagrees with the $EMITTED_ROWS rows actually emitted"
+
+for row in binary-path grammars cache-dir git tree-sitter tracked-binaries index-cache git-config-trust layout; do
+    echo "$OUT" | grep -q "<c n=\"$row\" ok=" \
+        && ok "row present: $row" \
+        || no "row missing: $row"
+done
+
+# §A10.4: the git row's head= is a 9-hex-char sha, matching the at= convention (gitstamp.h) every
+# other repo-reading verb uses — it used to print the full 40-char HEAD sha, a width outlier next to
+# --merge-scout's (now also fixed) base= and --stray-content/--pr-context's base_sha=.
+HEAD_ATTR="$( echo "$OUT" | grep -oE '<c n="git"[^/]*head="[0-9a-f]+"' | grep -oE 'head="[0-9a-f]+"' )"
+echo "$HEAD_ATTR" | grep -qE '^head="[0-9a-f]{9}"$' \
+    && ok "doctor git row head= is a 9-hex-char sha (matches at= width, §A10.4)" \
+    || no "doctor git row head= is not 9 hex chars: $HEAD_ATTR"
+
+if echo "$OUT" | xmllint --noout - 2>/dev/null; then ok "xmllint clean"; else no "xmllint reported malformed XML"; fi
+
+# §P11 doctor item: hint= is a FAILURE-only attribute — an all-green run must carry none.
+echo "$OUT" | grep -q 'hint=' \
+    && no "happy path (all checks ok) wrongly carries a hint= somewhere" \
+    || ok "happy path carries no hint= (hint= is failure-only)"
+
+CACHE_ROW="$( echo "$OUT" | grep -oE '<c n="cache-dir"[^<]*/>' )"
+echo "$CACHE_ROW" | grep -q 'blobs="2" bytes="11" many="0" truncated="0"' \
+    && ok "cache-dir counts flat + one-level 2-hex shards, excluding locks/temp/non-shards/deeper nesting" \
+    || no "cache-dir accounting is not exact and honest: $CACHE_ROW"
+
+# (D) non-vacuity via count assertion: checks="N" must equal the number of emitted <c rows.
+DECLARED="$( echo "$OUT" | grep -o 'checks="[0-9]*"' | grep -o '[0-9]*' )"
+EMITTED="$(  echo "$OUT" | grep -o '<c n=' | wc -l | tr -d ' ' )"
+[ "$DECLARED" = "$EMITTED" ] \
+    && ok "checks=\"$DECLARED\" matches $EMITTED emitted <c> rows (non-vacuous)" \
+    || no "checks=\"$DECLARED\" != $EMITTED emitted rows"
+
+# ── (B) unwritable cache dir → cache-dir row ok="0", overall exit 1 ────────────────────────────
+CACHEDIR="$TMP/cachedir"
+mkdir -p "$CACHEDIR"
+chmod 0500 "$CACHEDIR"
+UOUT="$( TMPDIR="$CACHEDIR" "$BIN" "$REPO" --doctor --no-cache 2>/dev/null )"
+URC=$?
+chmod 0700 "$CACHEDIR"   # restore before any cleanup/trap touches it
+
+echo "unwritable-cache output:"; echo "$UOUT"; echo "(exit=$URC)"; echo
+
+echo "$UOUT" | grep -q '<c n="cache-dir" ok="0"' \
+    && ok "unwritable cache dir -> cache-dir row ok=\"0\"" \
+    || no "unwritable cache dir did not flag cache-dir row"
+
+if [ "$URC" -eq 1 ]; then ok "unwritable cache dir -> overall exit 1"; else no "overall exit was $URC, expected 1"; fi
+
+# §P11 doctor item: a failing check carries a hint= naming the derived verdict, not just raw facts.
+echo "$UOUT" | grep -oE '<c n="cache-dir" ok="0"[^<]*/>' | grep -q 'hint="' \
+    && ok "unwritable cache dir -> cache-dir row carries hint=" \
+    || no "unwritable cache dir: cache-dir row has no hint="
+
+# ── (C) non-repo target dir → git row ok="1" repo="0" (degrade, not sickness) ───────────────────
+NONREPO="$TMP/nonrepo"
+mkdir -p "$NONREPO"
+echo 'int f(){return 0;}' >"$NONREPO/f.cpp"
+NOUT="$( "$BIN" "$NONREPO" --doctor --no-cache 2>/dev/null )"
+
+echo "non-repo output:"; echo "$NOUT"; echo
+
+echo "$NOUT" | grep -q '<c n="git" ok="1"' \
+    && ok "non-repo dir -> git row still ok=\"1\" (git itself reachable)" \
+    || no "non-repo dir: git row not ok=\"1\""
+
+echo "$NOUT" | grep -q 'repo="0"' \
+    && ok "non-repo dir -> repo=\"0\"" \
+    || no "non-repo dir: repo= attr missing/not 0"
+
+if echo "$NOUT" | xmllint --noout - 2>/dev/null; then ok "xmllint clean (non-repo)"; else no "xmllint reported malformed XML (non-repo)"; fi
+
+# ── (E) copied-but-identical binary: install.sh COPIES (never symlinks), so dev/ino always differ
+#     from a same-content build — same_file="0" alone false-positives every working install. The
+#     content-equality fallback (equal mtime AND equal size) must flag ok="1" copied="1" instead. ──
+COPYDIR="$TMP/copydir"; mkdir -p "$COPYDIR"
+cp -p "$BIN" "$COPYDIR/codecortex"; chmod +x "$COPYDIR/codecortex"   # -p preserves mtime -> identical mtime+size, different inode
+COPYCACHE="$TMP/copycache"; mkdir -p "$COPYCACHE"
+COUT="$( PATH="$COPYDIR:$PATH" TMPDIR="$COPYCACHE" "$BIN" "$REPO" --doctor --no-cache 2>/dev/null )"
+
+echo "copied-binary output:"; echo "$COUT"; echo
+
+echo "$COUT" | grep -q '<c n="binary-path" ok="1"' \
+    && ok "copied binary (equal mtime+size) -> binary-path row ok=\"1\"" \
+    || no "copied binary did not flag ok=\"1\""
+echo "$COUT" | grep -q 'copied="1"' \
+    && ok "copied binary -> copied=\"1\" attribute present" \
+    || no "copied binary missing copied=\"1\" attribute"
+
+# ── (F) genuine-stale binary: same SIZE, different CONTENT (one byte flipped), older mtime -> a real
+#     mismatch, must stay ok="0" with no copied="1". Until 2026-09-06 this fixture was the same bytes with an
+#     older mtime — i.e. the false positive the check produced on a real machine (the same 0.4.0 release
+#     installed twice came out STALE), pinned as the expected behaviour. A fixture must differ in the fact
+#     the check claims to measure. ──
+STALEDIR="$TMP/staledir"; mkdir -p "$STALEDIR"
+cp -p "$BIN" "$STALEDIR/codecortex"; chmod +x "$STALEDIR/codecortex"
+# Flip the byte at a fixed offset to a value it provably is NOT. Writing a CONSTANT here is a
+# 1-in-256 no-op PER BUILD CONFIGURATION: if that offset already holds the constant, the copy stays
+# byte-identical, --doctor correctly answers copied="1" same_bytes="1" ok="1", and every assertion
+# below inverts — the fixture reports a stale-detection bug that does not exist. Release+gcc on
+# ubuntu-24.04 drew exactly that byte (run 34299292778, the only red leg of 26). Read, then write
+# something else, so the fixture differs in the fact the check claims to measure on every toolchain.
+staleOld="$( dd if="$STALEDIR/codecortex" bs=1 skip=100000 count=1 2>/dev/null | od -An -tu1 | tr -d ' \n' )"
+staleNew=$(( ( ${staleOld:-0} + 1 ) % 256 ))
+printf "\\$( printf '%03o' "$staleNew" )" | dd of="$STALEDIR/codecortex" bs=1 seek=100000 conv=notrunc 2>/dev/null
+# and PROVE the flip landed: a silent no-op here is the whole defect, so it fails loudly instead.
+if cmp -s "$BIN" "$STALEDIR/codecortex"; then
+    no "genuine-stale fixture is byte-identical to \$BIN — the flip was a no-op, arm (F) cannot mean anything"
+fi
+touch -t 202001010000 "$STALEDIR/codecortex"   # and an older mtime, so the hint names the right side
+STALECACHE="$TMP/stalecache"; mkdir -p "$STALECACHE"
+SOUT="$( PATH="$STALEDIR:$PATH" TMPDIR="$STALECACHE" "$BIN" "$REPO" --doctor --no-cache 2>/dev/null )"
+
+echo "genuine-stale output:"; echo "$SOUT"; echo
+
+echo "$SOUT" | grep -q '<c n="binary-path" ok="0"' \
+    && ok "genuine-stale binary (contents differ) -> binary-path row ok=\"0\"" \
+    || no "genuine-stale binary did not flag ok=\"0\""
+echo "$SOUT" | grep -oE '<c n="binary-path"[^<]*/>' | grep -q 'copied="1"' \
+    && no "genuine-stale binary wrongly carries copied=\"1\"" \
+    || ok "genuine-stale binary carries no copied=\"1\" (content compare did not paper over it)"
+echo "$SOUT" | grep -oE '<c n="binary-path"[^<]*/>' | grep -q 'same_bytes="0"' \
+    && ok "genuine-stale binary -> same_bytes=\"0\"" \
+    || no "genuine-stale binary: same_bytes=\"0\" missing"
+
+# ── (F2) same BYTES, older mtime (the same release installed twice; every install is a fresh rename):
+#     ok="1" copied="1" same_bytes="1", no hint. This is the 2026-09-06 false positive, now the control. ──
+TWICEDIR="$TMP/twicedir"; mkdir -p "$TWICEDIR"
+cp -p "$BIN" "$TWICEDIR/codecortex"; chmod +x "$TWICEDIR/codecortex"
+touch -t 202001010000 "$TWICEDIR/codecortex"
+TWICECACHE="$TMP/twicecache"; mkdir -p "$TWICECACHE"
+TOUT="$( PATH="$TWICEDIR:$PATH" TMPDIR="$TWICECACHE" "$BIN" "$REPO" --doctor --no-cache 2>/dev/null )"
+TROW="$( echo "$TOUT" | grep -oE '<c n="binary-path"[^<]*/>' )"
+echo "$TROW" | grep -q ' ok="1"' && echo "$TROW" | grep -q 'same_bytes="1"' && echo "$TROW" | grep -q 'copied="1"' \
+    && ok "(F2) same bytes, older mtime -> ok=\"1\" same_bytes=\"1\" copied=\"1\" (mtime is not content)" \
+    || no "(F2) same bytes, older mtime still flagged stale: $TROW"
+echo "$TROW" | grep -q 'hint=' \
+    && no "(F2) same-bytes row wrongly carries a hint" \
+    || ok "(F2) same-bytes row carries no hint"
+
+# ── (G) NOT on PATH at all — the state every fresh install is in until the user adds ~/.local/bin, and the
+#     state in which a stranger runs this binary by absolute path to ask what is wrong. Used to be ok="1"
+#     (passed=7/7) with `codecortex` a "command not found" at the prompt. Fails the row, names the fix. ──
+NOPATHCACHE="$TMP/nopathcache"; mkdir -p "$NOPATHCACHE"
+GOUT="$( PATH="/usr/bin:/bin" TMPDIR="$NOPATHCACHE" "$BIN" "$REPO" --doctor --legend=full --no-cache 2>/dev/null )"
+GROW="$( echo "$GOUT" | grep -oE '<c n="binary-path"[^<]*/>' )"
+echo "$GROW" | grep -q ' ok="0"' && echo "$GROW" | grep -q 'on_path="0"' \
+    && ok "(G) no codecortex on PATH -> binary-path row ok=\"0\" on_path=\"0\"" \
+    || no "(G) no codecortex on PATH still passes: $GROW"
+echo "$GROW" | grep -q 'hint="NOT ON PATH:.*export PATH=' \
+    && ok "(G) not-on-PATH row's hint carries the export line" \
+    || no "(G) not-on-PATH row has no export line in its hint: $GROW"
+echo "$GOUT" | grep -q '<doctor checks="[0-9]*" passed="[0-9]*"' \
+    && [ "$( echo "$GOUT" | grep -oE 'passed="[0-9]+"' | grep -oE '[0-9]+' )" -lt "$( echo "$GOUT" | grep -oE 'checks="[0-9]+"' | grep -oE '[0-9]+' )" ] \
+    && ok "(G) passed= is below checks= when codecortex is not on PATH" \
+    || no "(G) passed= still equals checks= with codecortex off PATH"
+
+# §P11 doctor item: binary-path's ok="0" row names which of self=/which= is the STALE (older) one.
+echo "$SOUT" | grep -oE '<c n="binary-path" ok="0"[^<]*/>' | grep -q 'hint="STALE:' \
+    && ok "genuine-stale binary -> binary-path row carries hint=\"STALE: ...\"" \
+    || no "genuine-stale binary: binary-path row has no hint="
+STALEHINT="$( echo "$SOUT" | grep -oE 'hint="STALE:[^"]*"' )"
+echo "$STALEHINT" | grep -qF "$STALEDIR/codecortex" \
+    && ok "hint= correctly names the OLDER (staledir) binary as stale, not the newer one" \
+    || no "hint= did not name the older binary: $STALEHINT"
+
+# ── (G) tracked-binary staleness ─────────────────────────────────────────
+# Two dedicated repos so the fixture is unambiguous: STALEREPO commits a binary, then edits its same-
+# stem source in a LATER commit without ever recommitting the binary (the motivating "sweep committed
+# rebuilt binaries blind" shape, inverted: here the SOURCE moved and the binary was left behind — same
+# git-order violation the check is built to catch either direction of). FRESHREPO commits a binary and
+# its source TOGETHER as their most recent touch — never separately re-edited — so it must stay quiet.
+# Both use the same PATH/TMPDIR trick as the happy path so every OTHER row stays ok=1 and the overall
+# exit code is pinned entirely by the tracked-binaries row.
+STALEREPO="$TMP/stalebinrepo"; mkdir -p "$STALEREPO/bin"
+git -C "$STALEREPO" init -q
+git -C "$STALEREPO" config user.email "dev@x.com"
+git -C "$STALEREPO" config user.name  "Dev"
+printf 'int f(){return 1;}\n' >"$STALEREPO/bin/tool.cpp"
+printf 'MZ\x00\x00binarystub'  >"$STALEREPO/bin/tool"        # NUL byte -> sniffs as binary content
+git -C "$STALEREPO" add -A && git -C "$STALEREPO" commit -qm "add tool + tool.cpp together" >/dev/null
+printf 'int f(){return 2;}\n' >"$STALEREPO/bin/tool.cpp"      # source edited AFTER — binary never recommitted
+git -C "$STALEREPO" add -A && git -C "$STALEREPO" commit -qm "edit tool.cpp only" >/dev/null
+
+GOUT="$( PATH="$BINDIR:$PATH" TMPDIR="$HAPPYCACHE" "$BINDIR/codecortex" "$STALEREPO" --doctor --no-cache 2>/dev/null )"
+GRC=$?
+echo "tracked-binary-staleness (stale case) output:"; echo "$GOUT"; echo "(exit=$GRC)"; echo
+
+echo "$GOUT" | grep -q '<c n="tracked-binaries" ok="0"' \
+    && ok "G: source edited after its binary's last commit -> tracked-binaries row ok=\"0\"" \
+    || no "G: stale binary/source pair did not flag ok=\"0\""
+echo "$GOUT" | grep -qE 'stale="1"[^/]*p0="bin/tool"[^/]*src0="bin/tool\.cpp"|p0="bin/tool"[^/]*src0="bin/tool\.cpp"[^/]*stale="1"|stale="1"' \
+    && ok "G: stale count is reported (stale=\"1\")" || no "G: stale=\"1\" not reported"
+echo "$GOUT" | grep -qF 'p0="bin/tool"' && echo "$GOUT" | grep -qF 'src0="bin/tool.cpp"' \
+    && ok "G: the specific stale (binary, source) pair is named (p0/src0)" \
+    || no "G: stale pair was not named in the row"
+echo "$GOUT" | grep -oE '<c n="tracked-binaries" ok="0"[^<]*/>' | grep -q 'hint="' \
+    && ok "G: stale tracked-binaries row carries hint=" \
+    || no "G: stale tracked-binaries row has no hint="
+if [ "$GRC" -eq 1 ]; then ok "G: a stale tracked binary fails the overall --doctor exit (1)"; else no "G: overall exit was $GRC, expected 1"; fi
+if echo "$GOUT" | xmllint --noout - 2>/dev/null; then ok "G: xmllint clean (stale case)"; else no "G: xmllint reported malformed XML (stale case)"; fi
+
+FRESHREPO="$TMP/freshbinrepo"; mkdir -p "$FRESHREPO/bin"
+git -C "$FRESHREPO" init -q
+git -C "$FRESHREPO" config user.email "dev@x.com"
+git -C "$FRESHREPO" config user.name  "Dev"
+printf 'int g(){return 1;}\n' >"$FRESHREPO/bin/tool.cpp"
+printf 'MZ\x00\x00binarystub'  >"$FRESHREPO/bin/tool"
+git -C "$FRESHREPO" add -A && git -C "$FRESHREPO" commit -qm "add tool + tool.cpp together, never touched again" >/dev/null
+
+FOUT="$( PATH="$BINDIR:$PATH" TMPDIR="$HAPPYCACHE" "$BINDIR/codecortex" "$FRESHREPO" --doctor --no-cache 2>/dev/null )"
+FRC=$?
+echo "tracked-binary-staleness (fresh case) output:"; echo "$FOUT"; echo "(exit=$FRC)"; echo
+
+echo "$FOUT" | grep -q '<c n="tracked-binaries" ok="1"' \
+    && ok "G: binary + source committed together (never re-edited) -> tracked-binaries row ok=\"1\"" \
+    || no "G: fresh binary/source pair wrongly flagged"
+if echo "$FOUT" | grep -q 'stale="0"'; then ok "G: fresh pair reports stale=\"0\""; else no "G: fresh pair did not report stale=\"0\""; fi
+if [ "$FRC" -eq 0 ]; then ok "G: a fresh tracked binary does not fail the overall --doctor exit"; else no "G: overall exit was $FRC, expected 0"; fi
+if echo "$FOUT" | xmllint --noout - 2>/dev/null; then ok "G: xmllint clean (fresh case)"; else no "G: xmllint reported malformed XML (fresh case)"; fi
+
+# non-git root degrades quietly (ok=1, non_git=1) — mirrors the git-row's own non-repo degrade in (C).
+NGOUT="$( "$BIN" "$NONREPO" --doctor --no-cache 2>/dev/null )"
+echo "$NGOUT" | grep -q '<c n="tracked-binaries" ok="1"' && echo "$NGOUT" | grep -q 'non_git="1"' \
+    && ok "G: a non-git root degrades the tracked-binaries row to ok=\"1\" non_git=\"1\"" \
+    || { no "G: non-git root did not degrade cleanly"; echo "$NGOUT"; }
+
+# ── multi-root refusal (v1 single-root-only cut) ────────────────────────────────────────────────
+REPO2="$TMP/repo2"; mkdir -p "$REPO2"; echo 'int g(){return 0;}' >"$REPO2/g.cpp"
+MOUT="$( "$BIN" "$REPO" "$REPO2" --doctor --no-cache 2>&1 )"
+MRC=$?
+if [ "$MRC" -eq 1 ]; then ok "multi-root --doctor refuses (exit 1)"; else no "multi-root --doctor exit was $MRC, expected 1"; fi
+if echo "$MOUT" | grep -qi 'doctor'; then ok "multi-root refusal names --doctor"; else no "multi-root refusal message missing"; fi
+
+# §L10: a legend, and blobs_floor= when the 4096-blob scan cap fires — blobs="4096" alone cannot say
+# whether that is the TRUE count or a floor (at least that many). Built in an ISOLATED TMPDIR (never the
+# real shared cache) so the fixture cannot be perturbed by some other gate's concurrent cache writes —
+# the same isolation every other arm in this file already uses.
+echo "$OUT" | grep -q '<!-- doctor:' \
+    && ok "L10: --doctor output carries a legend" \
+    || no "L10: --doctor output has no legend comment at all"
+# tag-scoped, not a whole-document grep: the legend text above ITSELF spells "blobs_floor=" in prose to
+# define it, so a document-wide search would match the legend, not the row.
+echo "$CACHE_ROW" | grep -q 'blobs_floor=' \
+    && no "L10: happy path (2 blobs, well under the cap) wrongly carries blobs_floor=: $CACHE_ROW" \
+    || ok "L10: happy path carries no blobs_floor= (under the cap — blobs= is the true count)"
+
+CAPCACHE="$TMP/capcache"; mkdir -p "$CAPCACHE/codecortex"
+( cd "$CAPCACHE/codecortex" && for i in $( seq 1 4100 ); do : >"codecortex-blob-$i.bin"; done )
+CAPOUT1="$( TMPDIR="$CAPCACHE" "$BIN" "$REPO" --doctor --no-cache 2>/dev/null )"
+CAPOUT2="$( TMPDIR="$CAPCACHE" "$BIN" "$REPO" --doctor --no-cache 2>/dev/null )"
+CAP_ROW="$( echo "$CAPOUT1" | grep -oE '<c n="cache-dir"[^<]*/>' )"
+echo "$CAP_ROW" | grep -q 'blobs="4096"' \
+    && ok "L10: over the cap (4100 real blobs) -> blobs=\"4096\" (the scan cap, not the true count)" \
+    || { no "L10: expected blobs=\"4096\" over the cap"; echo "$CAP_ROW"; }
+echo "$CAP_ROW" | grep -q 'blobs_floor="1"' \
+    && ok "L10: over the cap -> blobs_floor=\"1\" (blobs= is now a documented floor)" \
+    || { no "L10: over the cap, blobs_floor=\"1\" is missing"; echo "$CAP_ROW"; }
+echo "$CAP_ROW" | grep -q 'truncated="1"' \
+    && ok "L10: over the cap -> truncated=\"1\" (unchanged, existing contract)" \
+    || no "L10: over the cap, truncated=\"1\" missing"
+# monotone/deterministic: the SAME static (isolated, no concurrent writer) fixture must give the SAME
+# blobs=/blobs_floor=/truncated= on every run — the flip the finding named was two runs against a LIVE,
+# shared, concurrently-mutating cache dir disagreeing; an isolated TMPDIR with nothing else touching it
+# must not.
+[ "$CAPOUT1" = "$CAPOUT2" ] \
+    && ok "L10: over-the-cap cache-dir row is byte-identical run-to-run (truncated is monotone in blobs, not a flake)" \
+    || { no "L10: over-the-cap cache-dir row DIFFERED run-to-run on a static fixture"; diff <(echo "$CAPOUT1") <(echo "$CAPOUT2"); }
+if echo "$CAPOUT1" | xmllint --noout - 2>/dev/null; then ok "L10: over-the-cap output is well-formed XML"; else no "L10: over-the-cap output malformed XML"; fi
+
+# ── (H) TWO SHAS, LABELLED: built_from= (the binary) vs at= (the tree) ──────────────────────────
+# lens2-crossverb L6 (capture-audit-2026-09-04): --version printed "git <sha>" — the commit this BINARY was
+# compiled from — while --doctor/--test-gate/--handoff printed at="<sha>", the tree's HEAD *now*. In any
+# session that commits without rebuilding (the normal state of a dev tree mid-task) those are DIFFERENT
+# shas, and nothing on either surface said which was which; --doctor's own binary-path check compares
+# mtimes and sizes and never looks at the baked sha at all. --doctor now carries both, under names that say
+# which is which. It deliberately does NOT gate on a mismatch: a binary older than HEAD is the ordinary
+# state between a commit and the next build, and a check that fails there would cry wolf every commit —
+# the FACT is the deliverable, the verdict would be noise. (Owner call if that should ever become a check.)
+HOUT="$( "$BIN" "$REPO" --doctor --no-cache 2>/dev/null )"
+VSTAMP="$( "$BIN" --version 2>/dev/null | sed -n 's/.*built_from=\([^)]*\))$/\1/p' )"   # §L10b: --version's own bare "git <sha>" is now labelled built_from= too
+BUILT="$( printf '%s' "$HOUT" | sed -n 's/.*<doctor[^>]* built_from="\([^"]*\)".*/\1/p' )"
+[ -n "$BUILT" ] \
+    && ok "H: --doctor root carries built_from= (the binary's own commit)" \
+    || { no "H: --doctor root has no built_from= — at= is then the only sha, and unlabelled"; printf '%s\n' "$HOUT" | head -c 200; echo; }
+[ -n "$VSTAMP" ] && [ "$BUILT" = "$VSTAMP" ] \
+    && ok "H: built_from= is byte-identical to the stamp --version prints ($BUILT)" \
+    || no "H: built_from=\"$BUILT\" but --version says \"$VSTAMP\" — two spellings of one fact"
+printf '%s' "$HOUT" | grep -q ' at="' \
+    && ok "H: at= (the tree's HEAD) rides beside it, so the two facts are distinguishable" \
+    || no "H: --doctor lost its at= anchor"
+if printf '%s' "$HOUT" | xmllint --noout - 2>/dev/null; then ok "H: xmllint clean"; else no "H: malformed XML"; fi
+
+
+# ── (V) F6 — the machine-dependent fields are NAMED, and everything else is deterministic under load ─────
+# --doctor's cache-dir check scans $TMPDIR/codecortex, a per-USER directory every codecortex process writes into,
+# so blobs=/bytes= (and many=/blobs_floor=/truncated=, derived from the same scan) legitimately move between
+# two back-to-back runs of a perfectly deterministic binary. Three rounds read that as a determinism failure
+# of the BINARY — capture-audit lane-L7 (shapingflagcheck (F) and gitstampcheck determinism (--doctor), both
+# green when run alone), merge-wave2 §4, the 2026-09-04 close — and each time the fix was another private
+# scrub in the gate that noticed. This arm asserts the disclosure instead: the row DECLARES which of its own
+# attributes are a live reading, and the two determinism gates strip exactly what the document names, through
+# one shared helper (test/lib/doctorvolatile.sh). See that file for why a hard-coded list was not enough.
+echo
+VOUT="$TMP/v_doctor.xml"
+"$BIN" "$REPO" --doctor --legend=full >"$VOUT" 2>/dev/null
+VLIST="$( grep -oE '<c n="cache-dir"[^>]*>' "$VOUT" | head -1 | grep -oE ' volatile="[^"]*"' | sed -E 's/.*="([^"]*)"/\1/' )"
+if [ -z "$VLIST" ]; then
+    no "(V) the cache-dir row does not declare volatile= — the fields that read live machine state are unnamed, so every reader has to guess (and two gates guessed differently)"
+else
+    ok "(V) the cache-dir row declares volatile=\"$VLIST\""
+    vmissing=""
+    for a in $( printf '%s' "$VLIST" | tr ',' ' ' ); do
+        case "$a" in blobs_floor ) continue ;; esac      # emitted only when the scan cap fired — presence is itself volatile
+        grep -oE '<c n="cache-dir"[^>]*>' "$VOUT" | grep -q " $a=\"" || vmissing="$vmissing $a"
+    done
+    [ -z "$vmissing" ] \
+        && ok "(V) every attribute volatile= names is actually on the row (no phantom declaration)" \
+        || no "(V) volatile= names attribute(s) the row does not carry:$vmissing"
+    case "$VLIST" in
+        *blobs*) case "$VLIST" in *bytes*) ok "(V) the declaration covers the two live counters (blobs, bytes)" ;; *) no "(V) volatile= does not name bytes=" ;; esac ;;
+        *)       no "(V) volatile= does not name blobs=" ;;
+    esac
+fi
+
+# the strip must actually do work — otherwise the determinism arm below is vacuous
+if [ -n "$VLIST" ]; then
+    stripDoctorVolatile "$VOUT" >"$TMP/v_stripped.xml"
+    if cmp -s "$VOUT" "$TMP/v_stripped.xml"; then
+        no "(V) stripDoctorVolatile removed NOTHING — the helper cannot see the declared fields, so the arm below proves nothing"
+    else
+        ok "(V) stripDoctorVolatile removes the declared fields ($( wc -c <"$VOUT" | tr -d ' ' ) B -> $( wc -c <"$TMP/v_stripped.xml" | tr -d ' ' ) B)"
+    fi
+    # the ORDER-INDEPENDENCE the old hand-rolled sed did not have: the same row with blobs_floor= spliced in
+    # between blobs= and bytes= (the shape the scan cap actually emits) must strip to the same text.
+    printf '<doctor><c n="cache-dir" ok="1" dir="/d" blobs="4096" bytes="7" many="1" truncated="0" volatile="blobs,blobs_floor,bytes,many,truncated"/></doctor>' >"$TMP/v_a.xml"
+    printf '<doctor><c n="cache-dir" ok="1" dir="/d" blobs="4096" blobs_floor="1" bytes="9" many="1" truncated="1" volatile="blobs,blobs_floor,bytes,many,truncated"/></doctor>' >"$TMP/v_b.xml"
+    [ "$( stripDoctorVolatile "$TMP/v_a.xml" )" = "$( stripDoctorVolatile "$TMP/v_b.xml" )" ] \
+        && ok "(V) the strip is ORDER-INDEPENDENT: the capped shape (blobs_floor= spliced mid-row) strips to the same text as the uncapped one" \
+        || no "(V) the capped cache-dir shape does not strip to the same text — the exact residual that kept gitstampcheck flaking"
+fi
+
+# determinism under ARTIFICIAL LOAD: saturate the machine, and churn the shared cache dir between the two
+# runs (which is the real disturbance, not CPU), then compare the stripped documents byte for byte.
+loadpids=""
+for _i in 1 2 3 4; do ( while :; do :; done ) >/dev/null 2>&1 & loadpids="$loadpids $!"; done
+"$BIN" "$ROOT" --top-k=5 >/dev/null 2>&1                       # writes blobs into the shared cache dir
+"$BIN" "$REPO" --doctor >"$TMP/v_load1.xml" 2>/dev/null
+"$BIN" "$ROOT/src" --top-k=5 >/dev/null 2>&1                   # …and more, between the two doctor runs
+"$BIN" "$REPO" --doctor >"$TMP/v_load2.xml" 2>/dev/null
+for p in $loadpids; do kill "$p" 2>/dev/null; done
+wait 2>/dev/null
+stripDoctorVolatile "$TMP/v_load1.xml" >"$TMP/v_load1.stripped"
+stripDoctorVolatile "$TMP/v_load2.xml" >"$TMP/v_load2.stripped"
+cmp -s "$TMP/v_load1.stripped" "$TMP/v_load2.stripped" \
+    && ok "(V) two --doctor runs under load, with the shared cache dir churned between them, are byte-identical once the DECLARED fields are stripped" \
+    || { no "(V) --doctor is non-deterministic in a field it does NOT declare volatile:"; diff "$TMP/v_load1.stripped" "$TMP/v_load2.stripped" | head -6 | sed 's/^/        /'; }
+
+# the legend has to define the attribute a reader meets on the first screen
+printf '%s' "$( sed 's/-->.*//' "$VOUT" )" | grep -q 'volatile=' \
+    && ok "(V) the doctor legend defines volatile=" \
+    || no "(V) volatile= is emitted but undefined in the legend"
+
+# ONE strip list, not three: both determinism gates must go through the shared helper and carry no private
+# cache-dir attribute list of their own. This is the assertion that keeps the fix from being re-forked.
+for g in gitstampcheck shapingflagcheck; do
+    grep -q 'test/lib/doctorvolatile.sh' "$ROOT/test/$g.sh" \
+        && ok "(V) test/$g.sh reads the strip list through the shared helper" \
+        || no "(V) test/$g.sh does not source test/lib/doctorvolatile.sh — a second, driftable strip list"
+    # CODE lines only: both gates now explain in PROSE what the old contiguous pattern got wrong, and that
+    # explanation quotes it. A comment describing a retired defect is not a second strip list.
+    grep -vE '^[[:space:]]*#' "$ROOT/test/$g.sh" | grep -qE 'blobs="[0-9N]+" bytes=' \
+        && no "(V) test/$g.sh still carries its own hard-coded cache-dir attribute list in code" \
+        || ok "(V) test/$g.sh carries no private cache-dir attribute list in code"
+done
+
+echo
+if [ "$fail" -eq 0 ]; then echo "ALL PASS"; exit 0; else echo "SOME CHECKS FAILED"; exit 1; fi

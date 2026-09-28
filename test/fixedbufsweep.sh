@@ -1,0 +1,711 @@
+#!/usr/bin/env bash
+# fixedbufsweep.sh — CA4 §B14: THE SWEEP. Every fixed `char[]` buffer whose contents can reach stdout as
+# markup, classified, with a gate that fails when a NEW one appears.
+#
+# ══ WHY A SWEEP AND NOT A THIRD FIX ═════════════════════════════════════════════════════════════════════
+# This class has now been fixed three times at the site that failed, and the RULE never became a sweep:
+#   1. test/tracecheck.sh:246-249 records it verbatim for renderTraceBlock's `char row[640]` — fixed, gated,
+#      and scoped to tracelocus.h ONLY.
+#   2. test/churnjoincheck.sh:580-590 asserts the same idea on the INPUT side and greps src/gitmine.h ONLY,
+#      leaving prcontext.h and quality.h outside both the grep and the claim.
+#   3. §B14 then found SIX live emitters snprintf'ing already-escaped, unbounded path text into char[512].
+# So this gate does not test a site. It re-derives the whole POPULATION from source every run and refuses to
+# pass on a member it has never been told about.
+#
+# ══ THE RULE (stated once, in src/serialize.h above escapeXml — read it there) ═══════════════════════════
+# Never snprintf ALREADY-ESCAPED or already-markup text into a fixed char[]. Compose it on std::string. The
+# test that separates a breaching site from a safe one is WHICH SIDE OF THE BUFFER THE ESCAPER SITS ON:
+#   escape-then-snprintf  -> the cut lands in the ESCAPED form (mid-entity, mid-attribute-name, mid-UTF-8,
+#                            or before the element's own `/>`): a broken document at exit 0.
+#   snprintf-then-escape  -> the cut only shortens PROSE, and the escaper runs over the shortened text.
+# Length is not the danger; the escaping is. A char[512] breaks at 228 RAW bytes once `&` expands 5:1 and
+# `'` 6:1 before the buffer is written.
+#
+# ══ THE ENUMERATION ═════════════════════════════════════════════════════════════════════════════════════
+# Method: balanced-paren extraction of every `snprintf(` in `git ls-files src/`, so a call broken across
+# lines counts ONCE. Note the audit's "156 snprintf mentions / 37 %s-bearing calls" mixed two units — 156 is
+# a LINE count (`git grep -c`) and the %s figure was a line count too; calls and lines are not the same
+# population, which is why the gate reports all of them separately.
+#
+# NO CURRENT COUNT IS WRITTEN IN THIS COMMENT. The header used to carry "after the 8 conversions: 153
+# mentions" while the gate PRINTED 154 — stale in the merge that landed it, which is the exact rot this file
+# exists to prevent, committed by the file preventing it. The live figures are DERIVED and printed by the
+# INFO line and PINNED by arm (S6); the only historical numbers kept here are the before-picture, which is
+# history and cannot rot: 156 mentions / 146 calls / 36 %s-bearing lines before §B14's 8 conversions.
+#
+# CLASSIFICATION OF THE SURVIVORS: 0 breaching · everything else safe / latent / not-markup
+# (see the TABLE below; every row carries its worst-case arithmetic). The two LATENT rows both sit outside
+# the lane that wrote this gate and are carried forward, not fixed:
+#   prcontext.h  tail[256]  248 B worst case -- SEVEN bytes of margin
+#   serialize.h  hb[176]    ~160 B worst case -- acd/nccd are %.1f/%.2f on DOUBLES, formally unbounded
+#
+# THE 8 CONVERTED (6 breaching + 2 latent), and what each did at a 612-616 B corpus path:
+#
+#   #  site                                    buffer        BEFORE (base_w3)              AFTER
+#   1  editcheck.h  <edit-check> head          char[512]     document REJECTED by xmllint  parses
+#   2  editcheck.h  <c> caller row             char[512]     4 of 4 rows unterminated      0 of 4
+#   3  packtask.h   buildD1Row <s>             char[512]     rows truncated + swallowed    0 of 3
+#   4  packtask.h   renderNameOnlyRows <s>     char[512]     (same document, <far> tier)   0 of 3
+#   5  packtask.h   <test> row (TWO unbounded  char[512]     document REJECTED             0 of 1
+#                   interpolands: path+runner)
+#   6  serialize.h  mermaid node line          char[512]     8 node lines collapsed to 1,  8 lines,
+#                                                            each losing `"]` AND its \n   0 malformed
+#   7  serialize.h  map header stats           char[480]     latent: 496 B worst case      composed
+#   8  serialize.h  partAttr / rb              char[40]/[24] latent: 41 B / off-by-one      composed
+#
+#   Sites 1-5 breach G4 AT EXIT 0 — a caller cannot detect them. Site 6 never breached G4 (it lives inside
+#   appendCdataSafe); it is the "well-formed but says something FALSE" member, and only a SHAPE assertion
+#   sees it, which is why arm (S5) carries one. Site 7's cut deletes the trailing ` -->` and turns the
+#   entire document into one unterminated comment.
+#
+#   Row counts are given as "n of m" only on the AFTER side by design: on the broken binary a truncated row
+#   swallows its successors, so the document is one malformed blob and per-row counting is not meaningful.
+#   The measurement that IS meaningful on both sides is the parse verdict, and it is in the table above.
+#
+# ══ ARMS ════════════════════════════════════════════════════════════════════════════════════════════════
+#   (S1) POPULATION — every snprintf call in src/ that interpolates a STRING is a KNOWN row in the table
+#        below. An unknown one FAILS: a new emitter must be classified, not merely written. "Interpolates a
+#        string" means ANY string conversion — `%s`, `%.*s`, `%-20s`, `%.9s` — not the literal two characters
+#        `%s`, which is what this arm matched for one round while src/ already used `%.*s` in an XML open tag.
+#   (S2) NO STALE ROWS — a table row matching nothing FAILS too, so the table cannot rot into fiction the way
+#        xmlCommentText's "all six echo sites" did (trap #12).
+#   (S3) THE SIX CONVERTED SITES stay converted — the fixed emitters must not carry a fixed buffer again.
+#   (S4) §B4 ANTI-ROT — serialize.h's `CALL-SITES: N` for xmlCommentText must equal the re-derived count.
+#   (S5) LIVE — the six converted emitters, exercised at a ~600-byte corpus path, must be xmllint-clean.
+#        A static gate proves the shape; this proves the fix. (test/det-gate.sh and test/xmlwellformed.sh
+#        carry the same width fixture for the determinism and G4 halves — see §B15.)
+#   (S6) THE COUNTS ARE ASSERTED — mentions / calls / string-interpolating sites / rows / width-form sites
+#        are pinned next to the table and re-derived every run, so no figure in this file is printed without
+#        being checked. The header's own count had already rotted by one before this arm existed.
+#
+# Usage:  test/fixedbufsweep.sh [BIN]   |   CODECORTEX_BIN=asan/codecortex bash test/fixedbufsweep.sh
+# Exits non-zero on any failure; prints PASS/FAIL per check, ALL PASS on success.
+
+set -u
+ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+BIN="${1:-${CODECORTEX_BIN:-$ROOT/build/codecortex}}"
+[ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
+
+fail=0
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
+no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
+
+[ -x "$BIN" ] || { echo "no codecortex binary at $BIN — build first (cmake --build build -j)"; exit 2; }
+command -v python3 >/dev/null 2>&1 || { echo "python3 required for the source sweep"; exit 2; }
+
+echo "fixedbufsweep: BIN=$BIN"
+
+TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
+
+# ── (S1)+(S2)+(S3)+(S4): the static sweep ───────────────────────────────────────────────────────────────
+python3 - "$ROOT" <<'PY'
+import os, re, subprocess, sys
+
+ROOT = sys.argv[1]
+bad  = 0
+def ok_( m ): print( "  PASS  " + m )
+def no_( m ):
+    global bad
+    bad = 1
+    print( "  FAIL  " + m )
+
+# ── THE TABLE. One row per (file, buffer name), with the count of call sites sharing that buffer and the
+#    classification. Re-derived from source 2026-07-30, AFTER §B14's six conversions.
+#
+#    breaching : an interpoland is already-escaped/already-markup AND unbounded. There must be none.
+#    safe      : the cut can only shorten prose, or every interpoland is bounded by construction and the
+#                buffer provably fits the widest format.
+#    latent    : bounded by construction, but the margin is thin enough that a future edit can cross it.
+#                Recorded, not fixed — each row says why, and what it costs when it goes.
+#    not-markup: the result never reaches stdout as a document (a cache filename, a stderr diagnostic).
+# NOTE on the count in each row (changed with the std::print conversion): it is the number of format calls
+# into that buffer, ALL of them, not only the string-interpolating ones it used to be. "{}" is type-erased,
+# so the narrower figure is no longer derivable from source. The PROSE in each row still describes the
+# string-interpolating site(s) that earned the row -- that is what the hand analysis was about -- while the
+# number is now the whole buffer's traffic, which is what (S2) can actually re-derive and hold you to.
+TABLE = {
+    # ── the paper-round (2026-08-28) serving-shape emitters — all three interpolate ONLY fixed vocabulary
+    # and integers, so every worst case is compile-time arithmetic, not input-dependent ───────────────────
+    # capture-audit 2026-09-04 (L6, H14): moved verbatim from src/verbs_for.h to src/lexical.h with the
+    # ForConfidence struct it fills — the MCP `for` twin serves confidence=/margin_pct= from the same
+    # derivation now instead of omitting the routing gauge. The buffer, the format and the bound are
+    # unchanged; only the file is.
+    ( "src/lexical.h", "attrBuf" ):  ( 1, "safe", "attrBuf[48]: ' confidence=\"%s\" margin_pct=\"%d\"' where %s is the two-value literal high|low and %d is a 0..100 percent — worst case ' confidence=\"high\" margin_pct=\"100\"' = 34 B against 47 usable + NUL, 13 B of margin. No user text can reach either interpoland." ),
+    ( "src/packtask.h", "tag" ):       ( 2, "safe", "tag[112], two sites: '<bodies shown=\"0\" total=\"%zu\" capped=\"%d\"%s></bodies>' — %zu is a vector size (20 digits at absolute most), %d is 0|1, %s is the literal ' compress=\"1\"' or empty. Worst case 40 fixed + 20 + 1 + 13 = 74 B against 111 usable. The render-failed marker '<bodies shown=\"0\" total=\"%zu\" render_failed=\"1\"></bodies>' is 54 fixed + 20 = 74 B. Escaper irrelevant: no interpoland carries text." ),
+    ( "src/serialize.h", "open" ): ( 4, "safe", "open[112]: '<bodies shown=\"%zu\" total=\"%zu\" capped=\"%d\"%s>' — two sizes, a 0|1, and the same fixed compress literal. Worst case 33 fixed + 40 + 1 + 13 = 87 B against 111 usable. Same all-numeric/fixed-vocab class as its packtask.h sibling." ),
+    # ── src/arch.h ───────────────────────────────────────────────────────────────────────────────────────
+    ( "src/arch.h", "hex" ):           ( 1, "not-markup", "hex[17] in archWriteBaseline: '{:016x}' of ONE uint64 violation hash and no string argument — exactly 16 lowercase digits + NUL = 17 B, so it cannot truncate. Appended to the .codecortex_arch_baseline sidecar's bytes, which go to that file through pathguard::writeAllAndClose; never emitted as a document." ),
+    # ── src/cli.h ────────────────────────────────────────────────────────────────────────────────────────
+    ( "src/cli.h", "example" ):        ( 1, "not-markup", "example[64]: ' %s=100' with the FLAG NAME from kIntFlags/the paging arms (longest ~20 B). A stderr refusal example, never a document." ),
+    ( "src/cli.h", "flag" ):           ( 1, "not-markup", "flag[32] (`%.*s`, so INVISIBLE to the pre-wave-3 population): applyIntFlag's echoed flag name. `bare` is f.prefix minus its trailing '=', and f.prefix is a literal in the compile-time kIntFlags table — 13 rows, longest '--connect-radius=' ⇒ bare 16 B against 31 usable + NUL, 15 B of margin. The `.*` precision is int( bare.size() ) and bounds NOTHING; the bound is the table. Result goes to refuseFlagValue, which fprintf's it to STDERR — never a document." ),
+    # ── src/infra/profileScope.h — the opt-in self-profiler's REPORT formatter ───────────────────────────
+    # Not markup by construction, and doubly so: the report is human-readable text printed to stdout by
+    # prof::report(), never an element of the XML document; and the whole facility compiles to ((void)0)
+    # unless -DCODECORTEX_PROFILE=ON, so none of these three buffers exists in a normal binary. A truncation
+    # here shortens one line of a developer's timing table. It cannot land inside a tag.
+    ( "src/infra/profileScope.h", "nameBuf" ):  ( 2, "not-markup", "nameBuf[160] x2 at :721/:723: '%s [%s]' over trim_pretty's fn[96] plus Site::description, a compile-time string literal from the PROFILE_SCOPE_DESCRIBE call site. Printed as a timing-table row, never emitted as a document." ),
+    ( "src/infra/profileScope.h", "locBuf" ):   ( 1, "not-markup", "locBuf[64] at :724: '%s:%d' over Site::file (__FILE__, a compile-time literal) and Site::line. Same timing table; a truncated path costs a developer legibility, nothing else." ),
+    ( "src/infra/profileScope.h", "indented" ): ( 1, "not-markup", "indented[208] at :759: '%*s%s%s' — a width-form pad (depth*2, and depth is capped at 64 by print_tree_node's own guard) over nameBuf[160] plus the literal ' *'. Same timing table." ),
+    # ── src/infra/diagnostics.cpp — the Diagnostics reporters (ASSUME / PANIC / ASSUME_SAME_THREAD / DISCLOSE) ──
+    # Not markup: both buffers go to STDERR as a diagnostic notice and never into a document. They are TABLE rows, not
+    # NUMERIC_ONLY, for the arch.h `hex` reason: they have no pre-conversion printf format to derive a class from (the
+    # reporters wrote through std::cerr until 2026-09-16, when they began formatting first so a notice is ONE write).
+    ( "src/infra/diagnostics.cpp", "notice" ): ( 1, "not-markup", "notice[4096] in writeNotice: every reporter's whole notice — the assert, panic and thread-violation banners and the one-line degraded notice — interpolating the caller's expression text, file name, __PRETTY_FUNCTION__ and description, none escaped and none needing it, because the bytes go to stderr in one stdio call. A longer notice is cut by markTruncated and the cut is stated on the notice's own last line (test/diagnoticecheck.sh arm L)." ),
+    ( "src/infra/diagnostics.cpp", "marker" ): ( 1, "not-markup", "marker[96] in markTruncated: ' ... [notice truncated: kept {} of {} bytes]\\n' of TWO std::size_t (bytes kept, full length) and no string argument — 42 literal B + two 20-digit counts + NUL = 83 B against 96, so it cannot truncate; formatted twice through one lambda (sized with the largest K first, then the real K), which is one call site. Copied over the tail of notice[] on stderr; never a document." ),
+    # ── src/lanes.h — THE REFERENCE SAFE SHAPE ───────────────────────────────────────────────────────────
+    ( "src/lanes.h", "buf" ): ( 10, "safe",       "buf[640] x3: snprintf-THEN-escape. :723 interpolates an UNBOUNDED file path and is still safe for exactly that reason — the warning text is escaped downstream, so a cut shortens prose and can never land inside markup. This is the shape §B14's six were not." ),
+    # ── src/main.cpp ─────────────────────────────────────────────────────────────────────────────────────
+    ( "src/main.cpp", "fileOpen" ): ( 1, "safe", "fileOpen[200] in chooseExpandServe (PR #215 review): '<ctx mode=\"whole-file\" reason=\"file {}B &lt; bundle {}B\">' — 53 B of literal and TWO std::size_t byte counts, 20 digits each at absolute most, so 93 B against 199 usable + NUL: 106 B of margin. No string interpolation at all, so no escaper can sit on either side of the buffer; the &lt; is written as an entity IN THE LITERAL, not produced by escapeXml. The bound matters twice here, because the caller reads std::strlen of this buffer back as the disclosure's own byte length — a truncated write would make the price it charges wrong as well as the document malformed, which is why the row states the margin rather than just the class. It is a TABLE row and not NUMERIC_ONLY for arch.h hex[17]'s reason: a buffer that never existed before the std::print conversion has no pre-conversion format to derive a class from." ),
+    ( "src/main.cpp", "bundleOpen" ): ( 1, "safe", "bundleOpen[200] in chooseExpandServe (PR #215 review): '<ctx mode=\"bundle\" reason=\"bundle {}B &lt;= file {}B\">' — fileOpen's exact twin, the same two std::size_t and no string: 50 B of literal + 40 digits = 90 B against 199 usable + NUL, 109 B of margin. Same strlen-read-back, same reason for being a row rather than a derivation." ),
+    ( "src/main.cpp", "noteBuf" ): ( 1, "safe", "noteBuf[220] in runDefaultMap (issue #289, the ride-along note= attribute; reworded payload-neutral, CodeRabbit PR #292 finding 4052087924): ' note=\"the ranked top-{} map below rides along with the requested payload; --top-k=0 for the payload alone (--top-k=1 for a minimal map)\"' — 135 B of fixed literal plus ONE interpoland, mapTopK (an int: 11 digits worst case including a sign), so 146 B against 219 usable + NUL: 73 B of margin. No string interpolation at all — mapTopK is a count, not caller text — so no escaper can sit on either side of the buffer; nothing here is markup composed from user input. It is a TABLE row and not NUMERIC_ONLY for arch.h hex[17]'s reason: a buffer that never existed before the std::print conversion has no pre-conversion format to derive a class from." ),
+    ( "src/main.cpp", "probeBuf" ): ( 1, "safe", "probeBuf[220] in runDefaultMap's noteBytesForTopK lambda (CodeRabbit PR #292 finding 4052087920: the §F5 --max-tokens search/verdict must price the ride-along note= per candidate top-K, not assume its size) — the SAME kMapRidesAlongFmt format string noteBuf fills, formatted once per probed k rather than once for the final mapTopK: identical 135 B fixed literal + ONE interpoland (an int, 11 digits worst case), 146 B against 219 usable + NUL, 73 B of margin. Same reasoning as noteBuf's own row: no string interpolation, nothing markup-composed, a TABLE row for the same not-NUMERIC_ONLY reason." ),
+    ( "src/main.cpp", "tail" ): ( 1, "not-markup", "tail[48]: the shallow-clone cache DIR suffix (\"/codecortex-remote-\" + a fixed-width 16-hex). Bounded and never emitted. Was 2 sites: defaultCachePath's cache FILENAME left this buffer when the root-key unification moved its assembly into quality.h::rootKeyedCachePath, which is where its row now lives." ),
+    # ── src/lexical.h ────────────────────────────────────────────────────────────────────────────────────
+    ( "src/lexical.h", "db" ): ( 1, "safe", "db[200] in deriveForConfidence (T14, 2026-09-20, docs/research/adaptive-short-query.md): the homonym-pool decline clause appended to confidence='s note, ' [{} symbols share this exact name; the drop above is tie-break order among them, not relevance, so confidence stays low even though margin_pct is nonzero]', ONE interpoland (cut.positiveHits, a std::size_t: 20 digits worst case) — 153 B of literal + 20 digits = 173 B against 199 usable + NUL: 26 B of margin (widened from an as-written 176 whose margin was 2 B, per the house rule against tight margins). No string interpolation at all — positiveHits is a count, never caller text — so no escaper can sit on either side of the buffer." ),
+    ( "src/verbs_for.h", "nb" ): ( 16, "safe",       "nb[160] x2: the mention/doc-mention/siblift/expand header notes. Every %s is the plural '' or 's'; everything else is %u. T14 (2026-09-20): +2 sites, the homonym-pool decline branch's own note in emitCandidates (nb[208], '<!-- adaptive: declined - {} symbols share this exact name; ... top-{} -->', two interpolands: ac.positiveHits a std::size_t at 20 digits worst case, topK an int at 11 digits worst case incl. sign — 138 B literal + 31 digits = 169 B against 207 usable + NUL, 38 B margin) and runForLens's twin (nb[200], the bracketed non-XML-comment spelling, 132 B literal + 31 digits = 163 B against 199 usable + NUL, 36 B margin). Neither interpoland is caller text; both are counts." ),
+    ( "src/verbs_report.h", "exemptAttr" ): ( 1, "safe",       "exemptAttr[40]: ' exempt=\"%s\"' with groupExemptKind's fixed vocabulary (longest 'fixture' = 7 B, total 19 B)." ),
+    ( "src/verbs_report.h", "hdr" ):    ( 1, "safe",       "hdr[768]: writeSkippedHeader's <skipped ...> root for runSkipped (§L1). 237 B of literal + FOURTEEN integer counters at 20 B worst case = 280 B, + ignore_mode's closed label (12 B, 'root-ignored'), + skippedHealthRootAttrs' two absent-at-zero integer counts under fixed names (' extent_suspect_files=\"N\"' 44 B + ' macro_blanked_files=\"N\"' 43 B worst case), + nestAttr (the bounded buffer rowed above, 36 B worst case), + escAttr (§SEC1, its twin, 36 B worst case), + the compile-time literal ' rows_capped=\"1\"' or '' (16 B) = 704 B against 767 usable. No path, no name, nothing user-supplied reaches this buffer — every emitted path goes through escapeXml straight into the writer, outside it." ),
+    ( "src/verbs_report.h", "nestAttr" ): ( 1, "safe",  "nestAttr[48]: ' nest_refused=\"%llu\"' — one integer count of the Kotlin nesting guard's refusals, no string: 16 B of literal + 20 B worst-case digits = 36 B against 47 usable + NUL. Written only when the count is non-zero, and passed into runSkipped's hdr as a string_view of that bounded buffer." ),
+    ( "src/verbs_report.h", "escAttr" ): ( 1, "safe",   "escAttr[48]: ' escaped_root=\"%llu\"' (§SEC1) — one integer count of the files the crawl refused because a symlink left the root, no string: 16 B of literal + 20 B worst-case digits = 36 B against 47 usable + NUL. nestAttr's exact twin above, same conditional write, same string_view hand-off into runSkipped's hdr. The PATHS of the refused files never touch this buffer — they go through escapeXml into the writer on the <f why=\"escaped-root\"/> rows, outside it." ),
+    ( "src/verbs_report.h", "clause" ):   ( 1, "safe",  "clause[1024]: writeNestRefusedLegend's conditional legend comment — a fixed ~620 B literal whose ONE interpoland is the compile-time constant kMaxKotlinStringNestDepth (3 digits). No path, no name, nothing user-supplied; 400 B of margin, so a truncation that would drop the closing '-->' needs the literal itself to grow by 60%." ),
+    ( "src/verbs_report.h", "row" ): ( 5, "safe",       "row[96] + row[192], runSkipped's two row emitters (§L1). row[96] at the <f> drop row: '\" why=\"%s\" bytes=\"%llu\" ext=\"' where %s is the CLOSED vocabulary {oversize, excluded, unsupported-ext, ignored, ignored-dir, nest-refused, extract-partial, escaped-root} (15 B longest: unsupported-ext and extract-partial; escaped-root is 12) = ~60 B. row[192] at the <h> parse-health row: three %s from the closed why= vocabulary (31 B for the joined 'degraded-parse,minified-suspect'), one %u, two %.3f of ratios that are <=1.0 by construction (errBytes sums DISJOINT top-most ERROR spans, ws sample is its own denominator) and 14 B even if a future edit broke that, one %u = ~131 B. Both p= values are written by escapeXml OUTSIDE the buffer." ),
+    # ── src/mcpverbs.h ───────────────────────────────────────────────────────────────────────────────────
+    ( "src/mcpverbs.h", "nb" ): ( 7, "safe",       "nb[160] x4: the CLI notes' MCP twins, byte-identical format. Plural '' / 's' only." ),
+    ( "src/pageview.h", "buf + written" ): ( 3, "safe",   "THREE appends into the TAIL of a caller buffer, all bounded by (bufCap - written) and guarded by a written-versus-bufCap test, and all three sized against kPageDisclosureCap by construction. (1) pageDisclosure's H8 floor marker (capture-audit L4): the %s is syn.floor, one of TWO fixed literals. (2,3) pagingDisclosure's two dialect arms (C1-b, 2026-09-13): the paging half is written after an OPTIONAL leading total=, so an element that already spells its total under its own name (the map's <recent of=>) can skip it — the arms interpolate counts and the syntax table's boolean literals only, nothing user-supplied and nothing escaped." ),
+    # ── src/packtask.h ───────────────────────────────────────────────────────────────────────────────────
+    ( "src/packtask.h", "open" ):      ( 3, "safe",       "open[160] (`%.*s` x2, so INVISIBLE to the pre-wave-3 population, and it is an XML OPEN TAG — the shape §B14 is about): packTaskListSection's '<TAG EXTRA shown=\"%zu\" total=\"%zu\" capped=\"%d\">'. Safe by ARITHMETIC, not by shape. 30 B of literal ('<' 1 + ' shown=\"' 8 + '\" total=\"' 9 + '\" capped=\"' 10 + '\">' 2). tag comes from the THREE call sites (:901 'far', :1385 'callers', :1452 'notes' — 'tests' left this helper in the review of #214, see the third site below) ⇒ 7 B. extraAttr is farAttr[32]/callersAttr[32] or the empty literal, and those two are themselves ' of_top=\"%zu\"' snprintf'd into a char[32] ⇒ 31 B at most. Two %zu ⇒ 20 digits each, %d ⇒ 1. Worst case 30+7+31+20+20+1 = 109 B + NUL against 160: 50 B of margin. NOTE both `.*` precisions are int( v.size() ) — they print a string_view, they do not clamp it; the bound is the caller vocabulary and the char[32] feeding extraAttr. SECOND SITE (review of #214, :420): packTaskTestsSection writes the <tests> open tag itself, because that section cuts over its own GROUPED rendering rather than over independent entries. Its own open[160], and the narrowest of the three: the tag is the LITERAL 'tests' (no %.*s at all), so the format is a fixed 35 B ('<tests shown=\"' 14 + '\" total=\"' 9 + '\" capped=\"' 10 + '\">' 2) plus two %zu at 20 digits and one %d at 1 — worst case 76 B + NUL against 160, 83 B of margin. All-numeric, no caller vocabulary to bound. THIRD SITE (2026-08-28 serving-shape round, :1091): restatePackTaskBodiesWrapper restates the bodies open tag into its own open[112] — two %zu at 20 digits, a fixed capped literal, and a %s that is the 13 B compress literal or empty, ~35 B of literal in total, worst case 88 B against 111 usable. All-numeric/fixed-vocab, same class as the first site." ),
+    # ── src/partition.h ──────────────────────────────────────────────────────────────────────────────────
+    ( "src/partition.h", "h" ):        ( 2, "safe",       "h[288] x2: <bundle role=\"%s\" ...>; role is the fixed 'core'/'slice' vocabulary, the rest %zu/%u/%d." ),
+    ( "src/partition.h", "pb" ):       ( 1, "safe",       "pb[96]: the JSON part header; the %s is '' or ',' (the separator)." ),
+    # ── src/prcontext.h ──────────────────────────────────────────────────────────────────────────────────
+    ( "src/prcontext.h", "tail" ):     ( 1, "latent",     "tail[320]: truncated=\"%s\" is ESCAPE-THEN-SNPRINTF in shape, but the value is bounded — kPrTrims[].dropped is a const table (longest 48 B) plus ';budget-floor-exceeded' (22 B) plus ';est-unmeasured' (15 B), none of which escapes, and the last two CAN co-occur (a small --max-tokens puts even the unmeasured empty-body envelope over budget). Worst case 88 lit + 90 digits + 85 label = 263 B + NUL against 320: 56 B of margin. WAS tail[256] at 248 B — SEVEN bytes — and the review of #214 spent 15 of them on est-unmeasured, which is the 'one more attribute crosses it' this row used to warn about; the buffer moved in the same commit as the label. formatTo was never the thing saving it: it truncates silently and its return is not read here, so an overrun drops the closing quote of truncated=\" and ships a malformed root (a G4 breach with no diagnostic). A sixth trim level or one more label needs this recomputed again." ),
+    # ── src/quality.h ────────────────────────────────────────────────────────────────────────────────────
+    ( "src/quality.h", "tail" ):       ( 2, "not-markup", "tail[96] in shaKeyedCachePath: the qsnap/qheadsnap cache FILENAME; family + two hex digests + %016llx, all fixed-width. tail[64] in rootKeyedCachePath: the lean/rich + mcp cache FILENAME, a literal prefix + the 16-hex root key + a literal suffix — every part a compile-time or fixed-width constant. Neither is emitted." ),
+    ( "src/packtask.h", "bodylessAttr" ): ( 2, "safe", "bodylessAttr[40], TWO call sites, same shape: line 1253 in restatePackTaskBodiesWrapper (issue #60, integration/train-12); line 1758 in the bare-wrapper placeholder branch (t14-cleanup #6) — the section-dropped <bodies> tag that never calls packBodies, so it could not reuse serialize.h's emitter and needed its own copy of the same attribute. Both format ' bodyless=\"{}\"' — 12 B of literal (' bodyless=\"' 11 + '\"' 1) and ONE interpoland, a std::size_t: 20 digits at absolute most, so 32 B against 39 usable + NUL, 7 B of margin. No string interpolation at all — the count is a count, never caller text — so no escaper can sit on either side of the buffer. It is a TABLE row and not NUMERIC_ONLY for arch.h hex[17]'s reason: a buffer that never existed before the std::print conversion has no pre-conversion format to derive a class from. THE ORIGINAL BUFFER WAS DECLARED [32] WHEN IT ARRIVED, which is 1 B short of its own worst case (32 B of text needs 33 with the NUL); formatTo truncates rather than overruns, so the failure mode was a dropped closing quote and a document that stops being well-formed, not a memory breach. Widened to 40 in the same commit as that row; the second site was declared [160]/[40] correctly from the start." ),
+    # ── src/serialize.h ──────────────────────────────────────────────────────────────────────────────────
+    ( "src/serialize.h", "bodylessAttr" ): ( 1, "safe", "bodylessAttr[40] in packBodies (issue #60, integration/train-12): the exact twin of the packtask.h row above — same format, same 12 B of literal, one std::size_t (bodylessCount), 32 B against 39 usable + NUL, 7 B of margin, no string interpoland. Same [32]-on-arrival correction, widened in the same commit." ),
+    ( "src/serialize.h", "fitAttr" ):  ( 1, "safe",       "fitAttr[96]: two %zu plus the literal ' over_ceiling=1'." ),
+    ( "src/serialize.h", "attr" ):     ( 2, "safe",       "attr[352] x2: the per-symbol metric attrs. Widest 26 lit + 4x10 digits + 11 role + qbuf(<=95) + ambs(<=35: amb= + lpin=) + kbuf(<=23) = 230 B." ),
+    ( "src/serialize.h", "tail" ):     ( 2, "safe",       "tail[192] x2: the <d> row tail. Widest 34 lit+digits + inAttr(<=23) + lens(qbuf, <=79) + pure(9) = 145 B." ),
+    ( "src/serialize.h", "hdr" ): ( 15, "safe",       "hdr[64] x2 (packBodies/packOutline): '<b t=\"%s\" l=\"%u\" p=\"' — symTag's fixed vocabulary + a line number. THE ESCAPED PATH IS APPENDED AFTER, on std::string. snprintf-then-append: textbook safe." ),
+    ( "src/serialize.h", "db" ):       ( 1, "safe",       "db[64 + kPageDisclosureCap]: <deps files=...> plus pageDisclosure's own capped buffer, sized against that cap by construction." ),
+    ( "src/serialize.h", "hb" ): ( 3, "latent",     "hb[176]: <health .../>; shape= is a fixed vocabulary but acd/nccd are %.1f/%.2f on DOUBLES, formally unbounded. Realistic worst case 66 lit + 60 digits + 24 float + 10 shape = 160 B, ~16 B of margin. Truncation drops the '/>' and orphans the element." ),
+    ( "src/serialize.h", "fit" ):      ( 1, "safe",       "fit[160]: the JSON max_tokens/fit_bytes twin; the %s is the literal ',\"over_ceiling\":true'." ),
+    ( "src/serialize.h", "num" ): ( 25, "safe",       "num[64]: ',\"calls_total\":%u,\"calls_capped\":%s,...' — the %s is 'true'/'false'. Worst case 56 B." ),
+}
+
+# -- NUMERIC_ONLY -- the rest of the population, classified BY DERIVATION rather than by hand ------------
+# Until the std::print conversion this gate could tell a string-interpolating call from a numeric one by
+# reading the FORMAT: "%s" named the argument's type. std::format's "{}" does not -- it is type-erased, and
+# no amount of reading the format recovers what used to be free. A detector built on the ARGUMENT text was
+# tried and rejected: it found 6 of the 29 known rows.
+#
+# So the population is now the SUPERSET -- every fixed-buffer format call in src/, whatever it interpolates.
+# That is stricter than before, and it matches this gate's own stated premise ("re-derives the whole
+# POPULATION from source every run and refuses to pass on a member it has never been told about"), which the
+# "%s" filter never quite honoured.
+#
+# The 29 rows in TABLE above keep their hand-written safety analysis. The rows below are the remainder, and
+# their classification is DERIVED, not asserted: each carried NO string conversion in its pre-conversion
+# printf format at 4c10be9d -- checked mechanically against that commit -- so none can be the
+# escape-then-buffer shape this gate exists to catch. The conversion changed no argument and no buffer.
+# Cross-check run at the same time: of the 29 string-interpolating rows, ZERO vanished in the conversion --
+# every previously dangerous site still exists, with the same buffer and the same multiplicity.
+#
+# A NEW row here still fails the gate until someone adds it, which is the point. When you add one, say which
+# set it belongs in and why: a string argument makes it a TABLE row, with real prose.
+NUMERIC_ONLY = {
+    ( "src/serialize.h", "p" ): 2,
+    ( "src/degradedscan.h", "hit.errRatio" ): 1,
+    ( "src/dmm.h", "value" ): 1,
+    ( "src/editcheck.h", "callersOpen" ): 1,
+    ( "src/editcheck.h", "cc" ): 1,
+    ( "src/editcheck.h", "defsAttr" ): 1,
+    ( "src/graphlegend.h", "buf" ): 5,
+    ( "src/handoff.h", "degBuf" ): 1,
+    ( "src/handoff.h", "sBuf" ): 1,
+    ( "src/htmlexport.h", "rankBuf" ): 1,
+    ( "src/infra/blanktext.h", "hex" ): 1,
+    ( "src/infra/jsonesc.h", "b" ): 1,
+    ( "src/infra/profileScope.h", "buf" ): 5,
+    ( "src/ingest_astquery.h", "suffix" ): 1,
+    ( "src/ingest_docpass.h", "blobName" ): 1,
+    ( "src/lsp.h", "hdr" ): 1,    # 2026-09-16 (--lsp Phase 1): lspWriteMessage's "Content-Length: {}\r\n\r\n" — ONE size_t, 20 digits worst case: 40 B against 63 usable + NUL. No %s, nothing escaped.
+    ( "src/lsp.h", "buf" ): 1,    # 2026-09-16 (--lsp Phase 1): lspRangeJson's range object — 61 fixed chars + FOUR uint32 line/character numbers, 10 digits worst case: 101 B against 127 usable + NUL. No %s, nothing escaped; the strings around it (URI, name) are composed on std::string by the callers, never through this buffer.
+    ( "src/main.cpp", "hdr" ): 1,
+    ( "src/main.cpp", "nb" ): 4,
+    ( "src/main.cpp", "open" ): 2,   # PR #215 review: chooseExpandServe's four openers became two early-return refusals plus the two rowed buffers above
+    ( "src/mcp.h", "buf" ): 1,
+    ( "src/mcpedit.h", "name" ): 1,
+    ( "src/mcpedit.h", "oldStamp" ): 1,
+    ( "src/mcpindex.h", "buf" ): 1,
+    ( "src/mcpverbs.h", "connectCeiling" ): 1,
+    ( "src/mcpverbs.h", "d" ): 1,
+    ( "src/mcpverbs.h", "deg" ): 1,
+    ( "src/naminglens.h", "idfBuf" ): 1,
+    ( "src/packtask.h", "b" ): 10,
+    ( "src/packtask.h", "callersAttr" ): 1,
+    ( "src/packtask.h", "farAttr" ): 1,
+    ( "src/pageview.h", "buf" ): 6,
+    ( "src/partition.h", "b" ): 1,
+    ( "src/partition.h", "nb" ): 1,
+    ( "src/quality.h", "b" ): 1,
+    ( "src/quality.h", "cidHex" ): 1,
+    ( "src/quality.h", "hex" ): 7,
+    ( "src/quality.h", "name" ): 1,
+    ( "src/recall.h", "scoreText" ): 1,
+    ( "src/serialize.h", "...)" ): 1,
+    ( "src/serialize.h", "callsHdr" ): 2,
+    ( "src/serialize.h", "cb" ): 1,
+    ( "src/serialize.h", "changedAttr" ): 1,
+    ( "src/serialize.h", "eb" ): 1,
+    ( "src/serialize.h", "estAttr" ): 1,
+    ( "src/serialize.h", "gb" ): 1,
+    ( "src/serialize.h", "gfb" ): 1,
+    ( "src/serialize.h", "inAttr" ): 1,
+    ( "src/serialize.h", "kbuf" ): 1,
+    ( "src/serialize.h", "lb" ): 4,   # row 6 (2026-09-12): collectCalleeNameRow's line buffer (the merged <c n= l=> row) joined the two
+                                      #   …and a FOURTH (2026-09-13, PR #215 item 8): appendMergedCalleeNameRows joins the row's
+                                      #   line numbers itself now, because l= is sorted ASCENDING at append time rather than
+                                      #   accumulated as text in walk order. Same shape as the site three lines above it —
+                                      #   "{}" of one std::uint32_t, ten digits worst case against 15 usable + NUL, no %s and
+                                      #   nothing escaped, so it does not join the string-interpolating population
+    ( "src/serialize.h", "lineAttr" ): 1,
+    ( "src/serialize.h", "nb" ): 1,   # row 6 (2026-09-12): appendCalleeNameRow's `"\" l=\"{}\"/>"` buffer went with the merge
+    ( "src/serialize.h", "precAttr" ): 1,
+    ( "src/serialize.h", "rankAttr" ): 1,
+    ( "src/serialize.h", "rc" ): 1,
+    ( "src/serialize.h", "rootsAttr" ): 1,
+    ( "src/serialize.h", "sh" ): 1,
+    ( "src/serialize.h", "skippedAttr" ): 1,
+    ( "src/serialize.h", "vb" ): 1,
+    ( "src/testmap.h", "buf" ): 6,
+    ( "src/verbs_report.h", "buf" ): 2,
+}
+
+# ── THE POPULATION, and why it is not `"%s" in text` ────────────────────────────────────────────────────
+# It was, for one round, and the wave-3 verifier proved that blind: a WIDTH/PRECISION string conversion
+# (`%.*s`, `%-20s`, `%.9s`) is a string interpoland and did not match. src/ already used that form in an XML
+# OPEN TAG (packtask.h:134). The verifier injected a NEW char[512] emitter interpolating an already-escaped
+# path into an XML attribute via `%.*s` — the exact §B14 defect — and this gate reported its counts
+# UNCHANGED and ALL PASS. So the population is every STRING CONVERSION.
+#   * scanned over the call's STRING LITERALS only, so a `n % size` in an ARGUMENT cannot masquerade as a
+#     "% s" conversion (' ' is a legal printf flag, so the naive scan has that false positive);
+#   * `%%` is consumed as its own token, so an escaped percent is never read as a conversion;
+#   * `%.*s` and `%*s` consume TWO arguments — a precision/width int AND the pointer. That precision is NOT
+#     a clamp when it is spelled `int( v.size() )`: it is just how a string_view is printed. A row's
+#     arithmetic must bound the VIEW, never assume the `.*` bounds it.
+STRLIT = re.compile( r'"(?:[^"\\]|\\.)*"' )
+CONV   = re.compile( r'%%|%[-+ #0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?(?:hh|h|ll|l|j|z|t|L)?(?P<conv>[diouxXeEfgGaAcsp])' )
+
+# ── re-derive every snprintf call in src/, balanced-paren, so a call broken across lines is one call ─────
+files = subprocess.run( [ "git", "ls-files", "src/" ], cwd = ROOT, capture_output = True, text = True ).stdout.split()
+found    = {}
+formsAt  = {}
+mentions = 0
+calls    = 0
+for rel in files:
+    if rel == "src/infra/emit.h": continue   # defines the primitives; its buf is a parameter, not a call site
+    src = open( os.path.join( ROOT, rel ), "rb" ).read().decode( "utf-8", errors = "replace" )
+    mentions += sum( 1 for L in src.split( "\n" ) if ( "snprintf" in L or "formatTo" in L ) )
+    for m in re.finditer( r"(?:rw::)?formatTo(?:Runtime)?\s*\(|snprintf\s*\(", src ):
+        j = m.end() - 1
+        depth = 0;  instr = False;  inchr = False;  esc = False
+        while j < len( src ):
+            c = src[j]
+            if   esc:      esc = False
+            elif c == "\\": esc = True
+            elif instr:
+                if c == '"':  instr = False
+            elif inchr:
+                if c == "'":  inchr = False
+            elif c == '"':  instr = True
+            elif c == "'":  inchr = True
+            elif c == "(":  depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0: break
+            j += 1
+        text  = " ".join( src[ m.start() : j + 1 ].split() )
+        calls += 1
+        forms = sorted( set( mm.group( 0 ) for mm in CONV.finditer( "".join( STRLIT.findall( text ) ) )
+                             if mm.group( 0 ) != "%%" and mm.group( "conv" ) == "s" ) )
+        # No "if not forms: continue" any more -- see NUMERIC_ONLY above. "{}" is type-erased, so the format
+        # can no longer say whether a string is interpolated; the population is every fixed-buffer call.
+        buf  = text[ text.index( "(" ) + 1 : ].split( "," )[0].strip()
+        line = src[ : m.start() ].count( "\n" ) + 1
+        found.setdefault( ( rel, buf ), [] ).append( line )
+        formsAt.setdefault( ( rel, buf ), set() ).update( forms )
+
+sites  = sum( len(v) for v in found.values() )
+widths = sorted( k for k, v in formsAt.items() if any( f != "%s" for f in v ) )
+print( "  INFO  re-derived: %d format mentions (lines), %d calls, %d fixed-buffer sites (%d of them "
+       "via a printf width/precision form -- 0 after the std::print conversion), %d (file,buffer) rows, in %d src/ files"
+       % ( mentions, calls, sites, len( widths ), len( found ), len( files ) ) )
+for k in widths:
+    print( "  INFO  width/precision string conversion: %s buffer '%s' line(s) %s forms %s — invisible to the "
+           "pre-wave-3 `\"%%s\" in text` population" % ( k[0], k[1], ",".join( str(x) for x in found[k] ), sorted( formsAt[k] ) ) )
+
+# (S1) every derived site is a known row, with the expected multiplicity
+KNOWN = dict( TABLE )
+KNOWN.update( { k: ( n, "numeric", "derived: no string conversion in the pre-conversion format" ) for k, n in NUMERIC_ONLY.items() } )
+unknown = sorted( k for k in found if k not in KNOWN )
+if unknown:
+    for f, b in unknown:
+        no_( "UNCLASSIFIED fixed-buffer format call: %s buffer '%s' at line(s) %s -- classify it in test/fixedbufsweep.sh's "
+             "TABLE (breaching/safe/latent/not-markup) and, if the escaper runs BEFORE the buffer, compose on "
+             "std::string instead (see the FIXED-BUFFER RULE above escapeXml in src/serialize.h)"
+             % ( f, b, ",".join( str(x) for x in found[ (f,b) ] ) ) )
+else:
+    ok_( "(S1) all %d fixed-buffer format call sites in src/ are classified (%d hand-classified TABLE rows, %d derived NUMERIC_ONLY rows)"
+         % ( sum( len(v) for v in found.values() ), len( TABLE ), len( NUMERIC_ONLY ) ) )
+
+for key, ( n, cls, why ) in sorted( KNOWN.items() ):
+    got = len( found.get( key, [] ) )
+    if got == 0:
+        no_( "(S2) STALE table row: %s buffer '%s' matches nothing in source -- delete the row" % key )
+    elif got != n:
+        no_( "(S2) %s buffer '%s': table says %d call site(s), source has %d (lines %s) -- update the row"
+             % ( key[0], key[1], n, got, ",".join( str(x) for x in found[key] ) ) )
+if not bad:
+    ok_( "(S2) no stale or miscounted table rows" )
+
+# (S6) THE COUNTS ARE ASSERTED, not narrated. Until wave 3 this gate's own header carried "after the 8
+# conversions: 153 'snprintf' mentions" while the gate PRINTED 154 — stale in the very merge that landed it,
+# which is precisely the "count in a comment nobody re-derives" §B4 and this file exist to prevent. A number
+# that is printed but not checked is the thing this round has now caught four times. So the numbers live
+# HERE, in one place, and drifting one reds the gate with the new value already spelled out.
+# RE-PIN 2026-07-30 (§B11.3, the edit-check fold disclosure). mentions 154 -> 155 and calls 136 -> 137: a
+# CONSTANT +1 on both, which is the signature of a single fixed-size addition, and it is exactly that —
+# `std::snprintf( defsAttr, sizeof( defsAttr ), " defs=\"%zu\"", … )` in editcheck.h. Re-derived from the
+# diff rather than from the delta: the src/ diff adds two snprintf LINES and removes one, and the
+# removed/added pair is the SAME `callersOpen` call with `incompatible="%zu"` appended to its format, so the
+# net new CALL is one. editcheck.h itself goes 4 -> 5 mentions, which is that same one call. sites/rows are
+# unmoved because the new call interpolates only %zu — it is not a string-interpolating site, so it neither
+# joins the 30 nor needs a TABLE row, and (S1)/(S2) both stayed green across the change.
+#            2026-09-08 (issue #66): +3 calls/+4 mentions over whatever main's base is (203/225 at the
+#            2026-09-08 rebase onto 26abcc79 -> 206/229), sites and rows UNCHANGED — all three are in
+#            src/graphlegend.h and were read before this pin moved: graphGaugeAttrXml and graphGaugeAttrJson
+#            each gained a SECOND snprintf (the with-graph_unindexed= arm beside the without- arm; buf grew
+#            96 -> 160 B, worst case ~119 B at three 20-digit size_t), and graphUnindexedTextClause is one new
+#            snprintf into buf[256] (~198 B worst case). No %s in any of them, so none is a width form.
+#            mentions is +3 for those and +1 more for the buf[256] site's own explanatory comment.
+#            2026-09-09 (the printf-family -> std::print conversion): every pin moves, and all five move for
+#            ONE reason -- the population definition changed, not the code. calls 206 -> 213 and mentions
+#            229 -> 314 because the enumeration now matches rw::formatTo/formatToRuntime as well as snprintf
+#            (mentions counts LINES, and the conversion added an emit.h include line to 64 files, which is
+#            most of the +85). sites 42 -> 213 and rows 29 -> 92 because "{}" is type-erased: the format can
+#            no longer say which calls interpolate a string, so the population is every fixed-buffer call
+#            (see NUMERIC_ONLY above -- 63 of those 92 rows are derived from the pre-conversion format at
+#            4c10be9d, not asserted). widthforms 3 -> 0 because a width/precision "form" was a printf
+#            spelling (%.9s, %-11s); std::format spells the same thing as {:.9}/{:<11}, and the INFO arm
+#            that counted them now has nothing to count. Re-derived, then read: of the 29 hand-classified
+#            rows ZERO vanished in the conversion, so no dangerous site was lost -- only the cheap way of
+#            spotting one was.
+#            2026-09-09 (serialize.h REVERTED per the parity fence): -2 calls/-5 mentions/-1 row. Six labels
+#            (flagless expand around connect pack_signatures pack_task) moved on the macOS CI legs and NOT on
+#            Linux, all of them map-shaped and all sharing serialize.h's attribute buffers, so the converting
+#            file was reverted rather than the manifest re-pinned — which is this gate family's rule and the
+#            whole point of the fence. serialize.h is back on snprintf; its `p` row is a formatTo-only buffer
+#            and goes with it.
+#            2026-09-09 (the appendf clamps stop reading a would-have-written length): calls 211 -> 210,
+#            mentions 309 -> 313, rows unchanged at 91. The three clamps now call std::format_to_n directly
+#            and bound themselves by its OUT POINTER, so they are no longer rw::formatTo call sites; the
+#            buffer they write through is `p` (two sites) and serialize.h's `qp` row leaves with them.
+#            2026-09-09 (the amb=/lpin= cursor stops reading a would-have-written length): calls 210 -> 208,
+#            mentions -> 311, rows 91 -> 89. That pair wrote amb= then lpin= AT THE OFFSET the first write
+#            reported, so a count an implementation computed rather than wrote placed lpin= inside the
+#            half-written amb=. It now cursors by std::format_to_n's out pointer, so `ambs` and
+#            `ambs + ambLen` are no longer rw::formatTo call sites and their rows leave with them.
+#            2026-09-09 (pageview's runtime format becomes two literals): calls 208 -> 211, mentions -> 314,
+#            rows unchanged. pageDisclosure/pagingDisclosure each branched into an XML and a JSON call, so
+#            the same buffer is now written from six sites rather than three. formatToRuntime is gone with
+#            them: it was the only format in the tree not checked at compile time, and the only one that
+#            could fail at runtime and return an empty buffer.
+#            2026-09-11 (Kotlin nesting guard rows in --skipped, PR #126): calls 212 -> 214, mentions 315 -> 317,
+#            sites 212 -> 214, rows 88 -> 90 — re-read, not re-counted. Both new calls are in verbs_report.h and both
+#            are TABLE rows above: `nestAttr[48]` takes one integer count, and `clause[1024]` takes the compile-time
+#            kMaxKotlinStringNestDepth into a fixed legend literal. Neither interpolates a path or a name.
+#            2026-09-11 (tier-3 decline disclosure): +1 call/+1 mention/+1 site, rows/widthforms unmoved — re-read, not
+#            re-counted: writeJsonMapHeader's `"declined":{},` formatTo into the EXISTING hdr[256], one size_t and no
+#            string argument (11 literal + 20 digits + ',' + NUL = 33 B), the `"external":{},` twin beside it; nothing
+#            escaped. It is serialize.h's fourteenth hdr site, so that TABLE row moves 13 -> 14.
+#            2026-09-11 (main d752d953 merged into PR #126): the two entries above touch disjoint buffers and add over
+#            their shared 766913d0 base (315/212/212/88) — +2 and +1 calls/mentions/sites, rows +2 — re-derived by (S6).
+#            2026-09-11 (§SEC1, the crawl-boundary symlink fix): calls 215 -> 217, mentions 318 -> 320, sites
+#            215 -> 217, rows 90 -> 91 — re-derived by reading both new sites, not by accepting the delta.
+#            (a) verbs_report.h `escAttr[48]`, a NEW TABLE row below: ' escaped_root="%llu"' — ONE integer
+#            count of the crawl's refused symlinks, no %s, nothing escaped, the exact twin of `nestAttr[48]`
+#            beside it, written only when the count is non-zero and passed into runSkipped's hdr as a
+#            string_view of that bounded buffer. (b) serialize.h's EXISTING `hdr[256]` gains a fifteenth
+#            site in writeJsonMapHeader: `"escaped_root":{},` with one unsigned long long and no string
+#            argument (17 literal + 20 digits + NUL = 38 B), the `"skipped_oversize":{},` twin two lines
+#            above it — so that TABLE row moves 14 -> 15 and no new buffer appears there. The three OTHER
+#            emit sites this change adds (darkflags.h's ` escaped_root="N"` on <flags>, docdrift.h's on
+#            <doc-drift>, serialize.h's buildEscapedRootAttr for the XML map header) compose on std::string
+#            or write straight to a FILE*, so none of them joins this population at all.
+#            2026-09-12 (the arch baseline writer moves onto pathguard::writeAllAndClose): calls 217 -> 218,
+#            mentions 320 -> 322, sites 217 -> 218, rows 91 -> 92 — re-read from the diff, not accepted from the
+#            delta. The one new call is archWriteBaseline's `hex[17]`, a NEW TABLE row above (src/arch.h):
+#            '{:016x}' of one uint64, no string argument, exactly 16 digits + NUL, and the bytes go to the sidecar
+#            file, never to a document. It is a TABLE row and not NUMERIC_ONLY because it has no pre-conversion
+#            format to derive a class from — the same reason nestAttr and escAttr are rows. mentions is +2 because
+#            the comment on that buffer names formatTo as well; arch.h's third mention, its emit.h include line,
+#            predates this change. The code it replaced wrote through emitRaw/emitTo, which this gate does not count.
+#            2026-09-13 (PR #215 review item 8, the merged <c n= l=> row's ascending l=): +1 call/+1 mention,
+#            +1 site, rows/widthforms UNMOVED — re-derived from `git diff 6e8dd75a -- src/`, not accepted from
+#            the delta. The one new call is serialize.h appendMergedCalleeNameRows' `char lb[16]`, which joins
+#            the EXISTING ( serialize.h, lb ) row above (3 -> 4 sites) rather than opening a new one: the row
+#            now holds four buffers of that name in that file. MergedCalleeNameRow stopped carrying its lines
+#            as accumulated text — the walk pushes uint32 line numbers and the append sorts them ascending, so
+#            one fact stopped having two spellings between queries — and the digits are formatted here instead.
+#            "{}" of one std::uint32_t: no %s, nothing escaped, ten digits worst case against 15 usable + NUL,
+#            so it does not join the string-interpolating population and rows is unmoved.
+#            2026-09-14 (PR #215 review, --expand serving priced by ONE function): mentions 323 -> 324, rows
+#            92 -> 94, calls/sites/widthforms UNMOVED at 219/219/0 — re-derived by reading every site, not
+#            accepted from the delta. chooseExpandServe used to write its four `<ctx mode= reason=>` openers
+#            into one `open[160]`; the comparison is now made by a fixpoint that must charge each candidate
+#            the spelling IT would carry, so the two COMPARED openers moved into their own buffers
+#            (`fileOpen[200]`, `bundleOpen[200]`, both NEW TABLE rows above) and `open[200]` kept only the two
+#            refusal paths that make no comparison — 4 sites - 2 + 1 + 1 = 219, which is why the call and site
+#            totals do not move while rows gains exactly the two new buffers. Every one of the four formats
+#            interpolates std::size_t byte counts and nothing else: no %s, no path, no name, nothing that has
+#            been through escapeXml, so none of them is the escape-then-buffer shape this gate exists to catch.
+#            mentions is +1 and not +2 because the two new buffers are written by two formatTo calls on lines
+#            that already carried one between them.
+#            2026-09-14 (review of #214, --pr-context's est-unmeasured disclosure): mentions 323 -> 324,
+#            calls/sites/rows/widthforms ALL UNCHANGED at 219/219/92/0 — re-read from `git diff` and not
+#            accepted from the delta. The single added line is a COMMENT, not a call: prBudgetTail's buffer
+#            grew 256 -> 320 for the new ';est-unmeasured' label (its TABLE row above carries the recomputed
+#            worst case, 248 -> 263 B, margin 7 -> 56) and the comment explaining the growth names formatTo,
+#            because formatTo's SILENT truncation is precisely what was not saving the old bound — it writes
+#            at most cap-1 and its return is not read there, so an overrun would have dropped the closing
+#            quote of truncated=" and shipped a malformed root. Same buffer, same one call, same one row.
+#            2026-09-14 (MERGE of lane/recent-scope with #214, and the reason this pin is re-derived rather
+#            than resolved): BOTH sides moved this pin from the SAME base 49220049 — mentions 322 -> 324,
+#            calls/sites 218 -> 219 — for DIFFERENT reasons (this lane: --in=DIR's scoped-recent emitters,
+#            pageview.h's `buf + written` tail going one entry to three and serialize.h's `rc` re-derived;
+#            #214: prcontext's est-unmeasured label and the tail[256] -> tail[320] growth). Identical text on
+#            both sides means git auto-merges the line CLEAN at 324/219/219, and that value describes NEITHER
+#            tree: the merged population carries both sets of additions. Re-derived from the merged source by
+#            the gate's own arithmetic — mentions 326, calls 220, sites 220 — and cross-checked against the two
+#            deltas summing (322+2+2, 218+1+1). rows/widthforms UNCHANGED at 92/0, and (S1)/(S2)/(S1b) pass on
+#            the merged tree, so every one of the 220 sites is classified, no TABLE row is stale, and no new row
+#            is owed: only the counts moved. A pin two lanes raised to the same number from the same base is the
+#            case where neither side is correct (memory: trap-neither-side-of-a-pin-conflict-is-correct).
+#            2026-09-14 (MERGE of lane/sc-legend with main at 0b118ac1 — NEITHER SIDE'S NUMBER WAS RIGHT):
+#            mentions 326, calls 220, sites 220, rows 94. Both sides of this line said 324, and both were
+#            correct about their own tree: this lane re-derived 323 -> 324 for the chooseExpandServe split,
+#            and #214 re-derived 323 -> 324 for the prBudgetTail comment. They are not the same +1, the two
+#            lanes did not share a base (#214's diff shows 322/218/218/92 as ITS base), and main also carried
+#            packtask.h's `open` row from 2 sites to 3 — so the merged total is neither 324 nor the 325 that
+#            adding the two deltas would give. It was DERIVED by running the gate on the merged tree, which is
+#            the only method this file accepts, and the derivation is corroborated rather than assumed: (S1)
+#            classifies all 220 sites and (S2) reports no stale or miscounted row, so every member is
+#            accounted for and every row's multiplicity already matches source — the two new TABLE rows of
+#            this lane (fileOpen[200], bundleOpen[200]), `main.cpp open` at 2, and packtask.h's `open` at 3
+#            among them. Only the totals line moved.
+#            2026-09-14 (MERGE with #215, and the THIRD lane to raise this pin to the same number from a
+#            different base): main before #215 stood at 324/219/219; this lane derived 326/220/220 from it and
+#            #215 independently derived 326/220/220 from it, each +2 mentions and +1 call/site for unrelated
+#            reasons — so for the third time the two sides agree on a value that describes NEITHER merged tree,
+#            and git auto-merges everything except the rows field. #215 landed first, so its delta is in the
+#            baseline and this lane's has to be added on top: 324+2+2 = 328 mentions, 219+1+1 = 221 calls and
+#            sites. Re-derived from the merged source by the gate itself rather than accepted as arithmetic, and
+#            (S1) confirms the MEMBER SET behind the numbers: 221 sites over 35 hand-classified TABLE rows (33
+#            plus #215's two new ones) and 59 derived NUMERIC_ONLY rows, with (S2) reporting no stale row and
+#            (S1b) nothing breaching. rows is 94 from #215's two additions, which this lane does not touch.
+#            2026-09-16 (the Diagnostics reporters write each notice ONCE): mentions 328 -> 331, calls 221 -> 223,
+#            sites 221 -> 223, rows 94 -> 96, widthforms unmoved — re-read from `git diff origin/main -- src/`, not
+#            accepted from the delta. src/infra/diagnostics.cpp stopped building notices from std::cerr insertions
+#            and now formats each whole notice into `notice[4096]` (writeNotice) before one stdio call, cutting an
+#            over-long one with a size_t-only marker formatted into `marker[96]` (markTruncated): two calls, two
+#            sites, two NEW TABLE rows above. mentions is +3 because the comment explaining the stack buffer names
+#            rw::formatTo on a third line. No site interpolates escaped text, and neither buffer reaches a document.
+#            2026-09-16 (--lsp Phase 1): +2 calls/+2 mentions/+2 sites/+2 rows (331 -> 333 on integration/train-4) — the two NEW fixed-buffer
+#            format sites in src/lsp.h, rowed in NUMERIC_ONLY above with their worst-case arithmetic
+#            (hdr: 40 B max in 63 usable; buf: 101 B max in 127 usable; both integer-only, no %s, nothing
+#            escaped). Not printf conversions at 4c10be9d — they are new code, rowed for their shape, and
+#            (S1) re-derives the member set from source rather than from this arithmetic.
+#            2026-09-18 (train-6, lane/expand-ambiguous-bodies, issue #289): +1 call/+1 mention/+1 site/+1 row
+#            (333 -> 334 mentions, 225 -> 226 calls/sites, 98 -> 99 rows) — runDefaultMap's new ride-along
+#            `note=` attribute, formatted into `char noteBuf[220]`: 121 B of fixed literal plus ONE int
+#            (mapTopK, 11 digits worst case) = 132 B against 219 usable + NUL, 87 B of margin. No %s, nothing
+#            escaped, nothing user-supplied — a TABLE row (main.cpp noteBuf) for the same reason fileOpen/
+#            bundleOpen are rows and not NUMERIC_ONLY: the buffer is new, so there is no pre-conversion printf
+#            format to derive a class from.
+#            CodeRabbit PR #292 finding 4052087920 (2026-09-19): +1 call/+1 mention/+1 site/+1 row.
+#            noteBytesForTopK (runDefaultMap, ahead of the §F5 search) formats the SAME kMapRidesAlongFmt
+#            string into a new `char probeBuf[220]` once per probed top-K, so the §F5 search/verdict price
+#            the note= the bundle selector already counted. Classified alongside noteBuf (main.cpp
+#            probeBuf): identical margin, same reasoning, a second row rather than a derivation for the
+#            same not-NUMERIC_ONLY reason.
+#            2026-09-20 (integration/train-12, lane/t12-filescope-calls, issue #60): +2 calls/+4 mentions/
+#            +2 sites/+2 rows (336 -> 340 mentions, 228 -> 230 calls/sites, 100 -> 102 rows). One
+#            `bodylessAttr` in packBodies (serialize.h) and one in its restating wrapper (packtask.h), both
+#            formatting ' bodyless="{}"' for the #60 module-scope owner that has no body to serve. Each is a
+#            TABLE row with its own arithmetic — and each arrived declared [32], one byte short of its own
+#            worst case, so the row records the widening to [40] rather than a latent class. MENTIONS MOVES
+#            BY FOUR, NOT TWO, AND THE EXTRA TWO ARE PROSE: mentions counts every LINE holding the token, and
+#            each new site's comment names the formatter to say why truncation, not overrun, is its failure
+#            mode. That is the same population definition that took +85 for include lines at the std::print
+#            conversion; the comments were left as written rather than reworded around a grep. Only
+#            calls/sites/rows count call sites, and those moved by exactly the two. The lane ran the gates its
+#            verbs named; this one greps SOURCE and names no verb, which is how both sites reached a train
+#            unclassified.
+#            2026-09-20 (T14, adaptive homonym-pool decline, docs/research/adaptive-short-query.md): +3
+#            calls/+3 mentions/+3 sites/+1 row (340 -> 343 mentions, 230 -> 233 calls/sites, 102 -> 103
+#            rows). Three NEW format call sites, all counts-only (no %s of caller text, nothing escaper-
+#            adjacent): lexical.h deriveForConfidence's new `db[200]` (ONE new row — the decline clause
+#            appended to confidence='s note) and TWO new sites on the EXISTING `verbs_for.h nb` row
+#            (emitCandidates' and runForLens' own decline branches, same buffers as their four existing
+#            sibling branches, so no new row there). Mentions moves by the same +3 as calls/sites (each
+#            new site is one line), not +more — no extra prose-only mentions this round.
+#            2026-09-20 (T14, pack-task bodyless placeholder, t14-cleanup #6): +1 call/+1 mention/+1 site,
+#            rows UNCHANGED — the bare-wrapper placeholder branch in packtask.h gained a SECOND call site
+#            on the EXISTING `src/packtask.h bodylessAttr` row (count 1 -> 2 in TABLE), same format, same
+#            bodylessAttr[40], one std::size_t and no string interpoland, so it joins the row rather than
+#            opening one. Re-derived on the train-14 merge, not summed from the two lanes: the adaptive
+#            lane's +3/+3/+3/+1 and this +1/+1/+1/+0 are disjoint sites in different files.
+EXPECTED = { "mentions": 344, "calls": 234, "sites": 234, "rows": 103, "widthforms": 0 }
+#            2026-09-04 (capture-audit L6, H9): +1 call/+1 mention, sites/rows UNCHANGED — re-read, not
+#            re-counted. packConnect gained ONE snprintf into a new `char connectCeiling[32]` for the
+#            H9 ` max_tokens="%d"` ceiling disclosure: a single %d of a caller-supplied INTEGER, no %s,
+#            nothing escaped, worst case ' max_tokens="-2147483648"' = 26 B against 31 usable + NUL. It
+#            therefore does not join the string-interpolating population that (S1)/(S2) enumerate, which
+#            is why sites and rows are unmoved. The verbs_for.h attrBuf row above moved file (H14) with
+#            no change to its buffer, format or bound.
+#            2026-09-04 (capture-audit wave-1 merge, L4): +4 calls/+4 mentions, +1 site/+1 row — re-derived from `git diff ec5e3c3 -- src/`, not from the delta: (a) graphGaugeAttrXml/Json (graphlegend.h, M15): two %zu into a local buf, no %s; (b) serialize.h's rank-adaptive `<sigs shown=%zu total=%zu capped="1">` open tag (lens 4 F7): two %zu into open[], no %s; (c) pageview.h:293, the H8 floor marker appended after the paging half — the ONE new string-interpolating site, and the new TABLE row above (fixed literal, sized by the remaining capacity). L5's packLego hdr pair (the pin below) is unchanged.
+#            2026-09-04 (capture-audit L5, H6/F2): +1 call/+1 mention — packLego's iface start-tag snprintf became an if/else PAIR so the TARGETED form can carry defs= (serialize.h ~5460). Re-derived from the diff, not from the delta: one snprintf line became two, both into the SAME `char hdr[64]` (widened from 48 for the extra ` defs="%zu"`), and both interpolate only %zu — no %s, nothing escaped — so neither joins the string-interpolating population and sites/rows are unmoved. (S1)/(S2) stayed green across the change
+#            2026-09-07 (head-to-head vs Graft, F1+F3): +4 calls/+4 mentions, sites/rows/widthforms unmoved — re-derived from `git diff 5726d4d9 -- src/`, not from the delta: (a) testmap.h testRowEvidence: TWO snprintf into a local `char buf[48]`, formats from a per-dialect TABLE (one %s of a constant attribute NAME — never user text, nothing escaped — and one %u), so neither joins the string-interpolating population; (b) serialize.h writeRecentRows: TWO snprintf into `char rc[64]` — the <recent n=%zu of=%zu> open tag and the age_d=%u w=%.3g row tail — no %s. The path itself is written through XmlWriter after escapeXml, outside the buffer.
+#            2026-09-08 (Ruby constant receivers, parser version 83 — structure vs use): +2 calls/+2 mentions, sites/rows/widthforms unmoved — re-derived from `git diff c771066e -- src/`, not from the delta: both in serialize.h packDeps: (a) the <health> line gains ` lazy_edges=%llu` written into a new local `char lb[40]` (one %llu, no %s); (b) the per-file row header `hdr` (now 144 B) is written by one of TWO snprintf branches — with `lazy_edges=%u` or without — %zu/%u/%.2f only, no %s; the path is still written through XmlWriter after escapeXml, outside the buffer. Neither joins the string-interpolating population.
+#            2026-09-03 (Phase 5 external= round): +1 call/+1 mention — the JSON header's `"external":%zu,` snprintf into the existing hdr[256] (one %zu, ≤ 32 B, the `"locality_pinned":%zu,` twin beside it); no %s, nothing escaped — re-read and sized before this pin
+#            2026-09-03 (round 5 merge): mentions 213 -> 216 with calls/sites/rows UNCHANGED. Re-read, not re-counted:
+#            all three new mentions are DATA, not buffers -- src/externalnames.h lists "snprintf"/"vsnprintf" as C stdlib
+#            NAMES the external-name veto recognises, and its provenance comment quotes <stdio.h>'s contents. No new
+#            snprintf CALL and no new fixed buffer entered src/ in this round beyond the one Phase 5 site already rowed.
+# 2026-09-03 (round 4 merge): +1 call/+1 mention — quality.h ack-ledger lockfile name "codecortex-sidecar-%016llx.lock" into a sized buffer, bounded hex (re-read, not just counted)
+derived  = { "mentions": mentions, "calls": calls, "sites": sites, "rows": len( found ), "widthforms": len( widths ) }
+drift    = { k: ( EXPECTED[k], derived[k] ) for k in EXPECTED if EXPECTED[k] != derived[k] }
+if drift:
+    no_( "(S6) the pinned enumeration has drifted: %s — re-derive the TABLE against the new population, then "
+         "set EXPECTED in test/fixedbufsweep.sh to { %s }. Do not update the number without re-reading the "
+         "sites it counts: that is how this gate's own header rotted."
+         % ( ", ".join( "%s pinned %d, source has %d" % ( k, a, b ) for k, ( a, b ) in sorted( drift.items() ) ),
+             ", ".join( '"%s": %d' % ( k, derived[k] ) for k in sorted( derived ) ) ) )
+else:
+    ok_( "(S6) the enumeration is ASSERTED and holds: %d mentions, %d calls, %d fixed-buffer sites "
+         "(%d via a width/precision form), %d table rows" % ( mentions, calls, sites, len( widths ), len( found ) ) )
+
+# (S1b) nothing is allowed to be classified 'breaching'
+breaching = [ k for k, v in TABLE.items() if v[1] == "breaching" ]
+if breaching:
+    no_( "(S1b) %d site(s) still classified 'breaching': %s" % ( len( breaching ), breaching ) )
+else:
+    ok_( "(S1b) zero sites classified 'breaching'" )
+
+# (S3) the six §B14 conversions stay converted: these (file, buffer) pairs must NOT reappear
+CONVERTED = [ ( "src/editcheck.h", "head" ), ( "src/editcheck.h", "row" ),
+              ( "src/packtask.h",  "head" ), ( "src/packtask.h",  "row" ),
+              ( "src/serialize.h", "line" ), ( "src/serialize.h", "stats" ),
+              ( "src/serialize.h", "partAttr" ), ( "src/serialize.h", "rb" ) ]
+back = [ k for k in CONVERTED if k in found ]
+if back:
+    for f, b in back:
+        no_( "(S3) §B14 REGRESSION: %s buffer '%s' is a fixed char[] with a string interpoland again (line %s)"
+             % ( f, b, found[ (f,b) ] ) )
+else:
+    ok_( "(S3) all 8 §B14 conversions still compose on std::string (6 breaching + 2 latent, editcheck/packtask/serialize)" )
+
+# (S4) §B4 anti-rot: serialize.h's stated CALL-SITES count for xmlCommentText == the re-derived count.
+ser = open( os.path.join( ROOT, "src/serialize.h" ) ).read()
+m   = re.search( r"^//\s+CALL-SITES:\s*(\d+)\s*$", ser, re.M )
+if not m:
+    no_( "(S4) serialize.h has no '// CALL-SITES: N' line above xmlCommentText -- the §B4 enumeration is unstated again" )
+else:
+    stated = int( m.group( 1 ) )
+    live   = 0
+    for rel in files:
+        s = open( os.path.join( ROOT, rel ), "rb" ).read().decode( "utf-8", errors = "replace" )
+        for mm in re.finditer( r"\bxmlCommentText\s*\(", s ):
+            # a CALL, not a mention. Two exclusions, both of which this gate got wrong on its first run:
+            #   * the definition itself (`inline std::string xmlCommentText(`);
+            #   * every occurrence inside a `//` comment — the name appears in prose across five files
+            #     ("xmlCommentText (serialize.h) is the ONE scrub"), and a bare `git grep -c` counts those
+            #     four extra hits as call sites. Counting mentions instead of calls is the same defect this
+            #     arm exists to catch, one level up.
+            lineStart = s.rfind( "\n", 0, mm.start() ) + 1
+            before    = s[ lineStart : mm.start() ]
+            if "//" in before: continue
+            if "inline" in before: continue
+            live += 1
+    if stated == live:
+        ok_( "(S4) xmlCommentText's stated CALL-SITES (%d) == the re-derived count -- §B4's 'all six' cannot rot again" % stated )
+    else:
+        no_( "(S4) serialize.h says 'CALL-SITES: %d' for xmlCommentText, source has %d -- update the LIST and the number "
+             "together (this is exactly the rot §B4 recorded: a count in a comment that nobody re-derives)" % ( stated, live ) )
+
+sys.exit( bad )
+PY
+[ $? -eq 0 ] || fail=1
+
+# ── (S5) LIVE: the six converted emitters at a corpus path wide enough to have broken them ──────────────
+# A static gate proves the SHAPE; only a run proves the FIX. Same sandbox shape test/det-gate.sh's width arm
+# uses, in pure shell so this gate has no more dependencies than the sweep above.
+WDIR="$TMP/wide"; WD="$WDIR"
+WSEG="$( printf 'd%.0s' $( seq 1 60 ) )"
+mkdir -p "$WDIR"
+while [ "${#WD}" -lt 580 ]; do
+    if mkdir -p "$WD/$WSEG" 2>/dev/null; then WD="$WD/$WSEG"; else break; fi
+done
+
+if [ "${#WD}" -lt 520 ]; then
+    printf '  SKIP  (S5) live width arm — filesystem capped the sandbox path at %s B (need >=520)\n' "${#WD}"
+elif ! command -v xmllint >/dev/null 2>&1; then
+    printf '  SKIP  (S5) live width arm — xmllint not installed\n'
+else
+    cat > "$WD/w.cpp" <<'WEOF'
+int helperOne( int a ) { return a + 1; }
+int tgt( int a, int b ) { return helperOne( a ) + b; }
+int callerA( int x ) { return tgt( x, 1 ); }
+int callerB( int x ) { return tgt( x, 2 ) + callerA( x ); }
+WEOF
+    mkdir -p "$WD/test"
+    printf 'int test_tgt() { return tgt( 1, 2 ); }\n' > "$WD/test/tgt_test.cpp"
+
+    live_case(){
+        label="$1"; shift
+        "$BIN" "$WDIR" "$@" --no-cache >"$TMP/live.xml" 2>/dev/null
+        if [ ! -s "$TMP/live.xml" ]; then no "(S5) $label produced no output at width"; return; fi
+        xmllint --noout "$TMP/live.xml" 2>"$TMP/live.lint" \
+            && ok "(S5) $label at a ${#WD} B corpus path — xmllint clean" \
+            || { no "(S5) $label at width — xmllint rejected the output at exit 0 (a fixed buffer cut inside the markup)"; head -3 "$TMP/live.lint"; }
+    }
+    live_case "--edit-check (sites 1-2: <edit-check> head, <c> row)"        --edit-check=tgt
+    live_case "--pack-task (sites 3-5: <s> d1, <s> far, <test> + runner)"   --pack-task="tgt helper one"
+    live_case "--for --with-graph (site 6: mermaid node line)"              --for=tgt --with-graph
+
+    # site 6 is the "well-formed but says something false" member: it lives inside appendCdataSafe, so it
+    # never breached G4 — the tell is that a truncated node label lost its closing `"]` AND its newline and
+    # glued the next declaration on. Assert the SHAPE, not just the parse: every mermaid node line must end
+    # in `"]` and each declares exactly one node.
+    # NOT an awk range on /^flowchart LR/: the whole XML document is ONE line (G4 forbids '\n' outside
+    # CDATA), so `flowchart LR` sits mid-line behind `<![CDATA[` and never matches a line anchor — the range
+    # selected nothing and the arm passed on the BROKEN binary. The node declarations themselves DO start
+    # their own lines (inside the CDATA), so match those directly, and require at least one.
+    "$BIN" "$WDIR" --for=tgt --with-graph --no-cache 2>/dev/null >"$TMP/graph.xml"
+    merm_n=$(     grep -cE '^n[0-9]+\['            "$TMP/graph.xml" || true )
+    merm_bad=$(   grep -E  '^n[0-9]+\['            "$TMP/graph.xml" | grep -cvE '"\]$' || true )
+    merm_glued=$( grep -cE '^n[0-9]+\[.*\].*n[0-9]+' "$TMP/graph.xml" || true )
+    if [ "$merm_n" -lt 2 ]; then
+        no "(S5) mermaid arm found only $merm_n node declaration(s) — it is not measuring the graph it claims to"
+    elif [ "$merm_bad" = 0 ] && [ "$merm_glued" = 0 ]; then
+        ok "(S5) all $merm_n mermaid node lines close with \"] and none glues a second declaration on (site 6)"
+    else
+        no "(S5) mermaid corruption at width: $merm_bad of $merm_n node line(s) unterminated, $merm_glued glued"
+    fi
+fi
+
+echo
+[ "$fail" = 0 ] && echo "ALL PASS" || echo "SOME CHECKS FAILED"
+exit "$fail"

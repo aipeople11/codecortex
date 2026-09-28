@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# mentioncheck.sh — B8: the query-mention anchor on the --for lens.
+#
+# Default-on: a file, dotted module, or Scope.symbol literally NAMED in the task text has its SCORE lifted
+# to within 5% of the top score (a score promise, not a rank one — see the §L10 arm below). Pinned promises
+# (each measured in the 4-arm head-to-head as the #1 loss bucket):
+#   (i)   SIGNAL — a path mention ("pkg/beta.py"), a URL-embedded mention, a dotted module ("pkg.beta"),
+#         and a Scope.symbol mention ("Widget.render") each lift the named target into the top ranks,
+#         while the same query WITHOUT the boost leaves it low/absent.
+#   (ii)  NEVER DISPLACES #1 — the top-1 candidate is identical boost-on vs boost-off.
+#   (iii) INERT WITHOUT MENTIONS — prose that names nothing indexed (incl. "e.g." / version numbers) is
+#         BYTE-IDENTICAL boost-on vs boost-off.
+#   (iv)  SCOPE — --query and --for --no-route are untouched even with the boost active.
+#   (v)   DETERMINISM ×3, xmllint-clean, env (CODECORTEX_NO_MENTION=1) == flag (--no-mention-boost)
+#         byte-for-byte, and the flag alone refuses loudly.
+#   (vi)  PACKAGE-DIR MENTION — a backticked bare name or dotted chain that names a source DIRECTORY
+#         (not a file) lifts that package's index file (__init__.py & friends). Measured: r2 head-to-head
+#         loss micropython-lib-947 (gold requests/__init__.py at 35; the `requests` mention anchored
+#         nothing). Precision-first: only the dir's index file lifts, never the whole directory.
+#
+# Usage:  bash test/mentioncheck.sh   |   CODECORTEX_BIN=asan/codecortex bash test/mentioncheck.sh
+
+set -u
+ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+BIN="${1:-${CODECORTEX_BIN:-$ROOT/build/codecortex}}"
+[ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
+TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
+fail=0
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
+no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
+
+[ -x "$BIN" ] || { echo "no codecortex binary at $BIN — build first (cmake --build build -j)"; exit 2; }
+echo "mentioncheck: BIN=$BIN"
+
+# ── fixture: no git needed — the anchor is pure string work over the INDEX ──────────────────────────
+# pkg/alpha.py holds the strong lexical matches; pkg/beta.py shares NO word with any query prose (its
+# rank without an anchor is low); root-level delta.py holds Widget.render for the Scope.symbol case.
+FIX="$TMP/fix"
+mkdir -p "$FIX/pkg"
+cat > "$FIX/pkg/alpha.py" <<'PY'
+def widget_pipeline_process(records):
+    """Process widget records through the pipeline."""
+    return [r for r in records if r]
+
+def widget_records_pipeline(records):
+    """Pipeline stage: validate widget records."""
+    return records
+
+def process_widget_records(records):
+    """Process the records for each widget in the pipeline."""
+    return len(records)
+PY
+cat > "$FIX/pkg/beta.py" <<'PY'
+def flush_stale_cache(entries):
+    """Evict stale cache entries."""
+    return [e for e in entries if e.fresh]
+PY
+mkdir -p "$FIX/plugins/requests"
+cat > "$FIX/plugins/requests/__init__.py" <<'PY'
+def open_http_session(url):
+    """Create the session used for outbound calls."""
+    return url
+
+def encode_basic_credentials(user, pw):
+    """Base64 header assembly for outbound calls."""
+    return user + pw
+PY
+cat > "$FIX/delta.py" <<'PY'
+class Widget:
+    def render(self):
+        """Draw the widget."""
+        return "ok"
+
+    def hidden_helper(self):
+        return 1
+PY
+
+cands(){ "$BIN" "$FIX" --for="$1" --format=candidates --top-k=20 --no-cache "${@:2}" 2>/dev/null; }
+rankOf(){ printf '%s' "$1" | grep -o "<cand r=\"[0-9]*\" [^>]*n=\"$2\"" | grep -o 'r="[0-9]*"' | grep -o '[0-9]*' | head -1; }
+
+# ── (i) signal, four mention shapes ──────────────────────────────────────────────────────────────────
+sig(){ # $1=label $2=query $3=expected-symbol
+    ON="$( cands "$2" )"; OFF="$( cands "$2" --no-mention-boost )"
+    rOn="$( rankOf "$ON" "$3" )"; rOff="$( rankOf "$OFF" "$3" )"
+    if [ -n "$rOn" ] && [ "$rOn" -le 5 ] && { [ -z "$rOff" ] || [ "$rOn" -lt "$rOff" ]; }; then
+        ok "$1: $3 lifted to rank $rOn (default) vs ${rOff:-absent} (--no-mention-boost)"
+    else no "$1: expected a lift (on=${rOn:-absent} off=${rOff:-absent})"; fi
+}
+sig "path mention"      "widget pipeline process records — the fix belongs in pkg/beta.py"                       flush_stale_cache
+sig "URL mention"       "widget pipeline process records, see https://github.com/x/y/blob/main/pkg/beta.py#L2"   flush_stale_cache
+sig "dotted module"     "widget pipeline process records regression traced to pkg.beta"                          flush_stale_cache
+sig "Scope.symbol"      "widget pipeline process records break inside Widget.render"                             render
+
+# ── (vi) package-dir mention: bare backticked name / dotted chain naming a DIRECTORY ─────────────────
+sig "pkg-dir backtick"  'widget pipeline process records leak inside the `requests` module'                      open_http_session
+sig "pkg-dir dotted"    "widget pipeline process records regression traced to plugins.requests"                   open_http_session
+# a backticked word matching NO directory stays inert (precision guard)
+ONX="$( cands 'widget pipeline process records inside the `nonexistentpkg` module' )"
+OFFX="$( cands 'widget pipeline process records inside the `nonexistentpkg` module' --no-mention-boost )"
+if [ "$ONX" = "$OFFX" ]; then ok "unmatched backtick stays inert"; else no "unmatched backtick moved the ranking"; fi
+
+# header note appears when (and only when) something anchored
+"$BIN" "$FIX" --for="widget pipeline in pkg/beta.py" --no-cache 2>/dev/null | grep -q 'mention anchor:' \
+    && ok "--for header names the anchor" || no "--for header note missing"
+
+# ── §L10 (2026-09-04): the note promises a SCORE lift (within kMentionTopGapStep of the top score), not a
+#    RANK lift. The old wording ("lifted to just below the top hit" / "lifted near the top") read as a rank
+#    promise, and the "path mention" case above already falsifies a literal rank-2 reading: flush_stale_cache
+#    lands at rank 3, not 2, because two genuine matches (process_widget_records, widget_pipeline_process)
+#    already score inside that same 5% band above it. Pin both halves so neither regresses silently: the
+#    wording says "score", and the rank gap the old wording got wrong is a real, reproduced fact here, not a
+#    one-off measurement on a different corpus.
+# L1 (2026-09-19): the CLI default legend is compact; this arm reads the FULL header note's wording, so it asks for it.
+NOTE_ON="$( "$BIN" "$FIX" --for="widget pipeline process records — the fix belongs in pkg/beta.py" --no-cache --legend=full 2>/dev/null )"
+printf '%s' "$NOTE_ON" | grep -q 'score lifted to within 5% of the top score' \
+    && ok "L10: mention-anchor note promises a SCORE lift, not a rank one" \
+    || { no "L10: mention-anchor note does not carry the score-lift wording"; printf '%s' "$NOTE_ON" | grep -o '\[mention anchor:[^]]*\]'; }
+
+rOn2="$( rankOf "$( cands "widget pipeline process records — the fix belongs in pkg/beta.py" )" flush_stale_cache )"
+[ -n "$rOn2" ] && [ "$rOn2" -gt 2 ] \
+    && ok "L10: the anchored hit is not simply 'just below the top hit' (landed at rank $rOn2, with $(( rOn2 - 1 )) genuine matches ahead of it) — a score promise holds here where a rank-2 promise would not" \
+    || no "L10 fixture drifted: expected the path-mention case to land below rank 2 (the case the old wording got wrong), got rank ${rOn2:-absent}"
+
+# ── (ii) never displaces #1 ──────────────────────────────────────────────────────────────────────────
+ON="$( cands "widget pipeline process records — the fix belongs in pkg/beta.py" )"
+OFF="$( cands "widget pipeline process records — the fix belongs in pkg/beta.py" --no-mention-boost )"
+top1on="$( printf '%s' "$ON" | grep -o '<cand r="1" [^>]*id="[^"]*"' )"
+top1off="$( printf '%s' "$OFF" | grep -o '<cand r="1" [^>]*id="[^"]*"' )"
+[ -n "$top1on" ] && [ "$top1on" = "$top1off" ] && ok "top-1 identical boost-on vs boost-off" \
+    || no "top-1 displaced:  ON<<$top1on>>  OFF<<$top1off>>"
+
+# ── (iii) inert without mentions (incl. dotted-prose false-positive guards: e.g., i.e., 3.10) ────────
+Q_PLAIN="widget pipeline process records, e.g. python 3.10 i.e. the usual"
+"$BIN" "$FIX" --for="$Q_PLAIN" --no-cache >"$TMP/p1.xml" 2>/dev/null
+"$BIN" "$FIX" --for="$Q_PLAIN" --no-mention-boost --no-cache >"$TMP/p2.xml" 2>/dev/null
+cmp -s "$TMP/p1.xml" "$TMP/p2.xml" && ok "inert on mention-free prose (byte-identical, e.g./3.10 ignored)" \
+    || no "NOT inert on mention-free prose"
+grep -q 'mention anchor:' "$TMP/p1.xml" && no "header note must not appear when nothing anchored" \
+    || ok "no header note when nothing anchored"
+
+# ── (iv) scope: --query and --no-route untouched even when active ────────────────────────────────────
+QM="widget pipeline in pkg/beta.py"
+"$BIN" "$FIX" --query="$QM" --no-cache >"$TMP/q1.xml" 2>/dev/null
+CODECORTEX_NO_MENTION=1 "$BIN" "$FIX" --query="$QM" --no-cache >"$TMP/q2.xml" 2>/dev/null
+if cmp -s "$TMP/q1.xml" "$TMP/q2.xml"; then ok "--query path untouched"; else no "--query path affected"; fi
+"$BIN" "$FIX" --for="$QM" --no-route --no-cache >"$TMP/nr1.xml" 2>/dev/null
+"$BIN" "$FIX" --for="$QM" --no-route --no-mention-boost --no-cache >"$TMP/nr2.xml" 2>/dev/null
+cmp -s "$TMP/nr1.xml" "$TMP/nr2.xml" && ok "--no-route path keeps its pre-routing bytes" \
+    || no "--no-route path affected"
+
+# ── (v) determinism ×3, xmllint, env==flag, refuse-loudly ────────────────────────────────────────────
+"$BIN" "$FIX" --for="$QM" --no-cache >"$TMP/d1.xml" 2>/dev/null
+"$BIN" "$FIX" --for="$QM" --no-cache >"$TMP/d2.xml" 2>/dev/null
+"$BIN" "$FIX" --for="$QM" --no-cache >"$TMP/d3.xml" 2>/dev/null
+cmp -s "$TMP/d1.xml" "$TMP/d2.xml" && cmp -s "$TMP/d2.xml" "$TMP/d3.xml" && ok "determinism x3 (anchored)" \
+    || no "anchored output not deterministic"
+if command -v xmllint >/dev/null; then
+    if xmllint --noout "$TMP/d1.xml" 2>/dev/null; then ok "anchored bundle is xmllint-clean (G4)"; else no "anchored bundle not well-formed"; fi
+else ok "xmllint not present — skipped (G4 covered by xmlwellformed.sh)"; fi
+"$BIN" "$FIX" --for="$QM" --no-mention-boost --no-cache >"$TMP/f1.xml" 2>/dev/null
+CODECORTEX_NO_MENTION=1 "$BIN" "$FIX" --for="$QM" --no-cache >"$TMP/f2.xml" 2>/dev/null
+cmp -s "$TMP/f1.xml" "$TMP/f2.xml" && ok "CODECORTEX_NO_MENTION=1 == --no-mention-boost (byte-identical)" \
+    || no "env disable and flag disable diverge"
+"$BIN" "$FIX" --no-mention-boost >/dev/null 2>"$TMP/refuse.err"
+if [ $? -ne 0 ] && grep -q 'no-mention-boost' "$TMP/refuse.err"; then ok "flag alone refuses loudly"; else no "flag alone did not refuse"; fi
+
+# ── §L10b (finding #1): mention_anchored= is a root ATTRIBUTE, not just legend prose — the "mention
+#    anchor: N file + M symbols..." note had no machine-readable twin. The XML root now carries
+#    mention_anchored="N+M" (N+M read straight out of the note's own counts, so this arm survives a fixture
+#    edit that changes how many files/symbols anchor) whenever the note fires, ABSENT (never
+#    mention_anchored="0") when it does not; the JSON dialect gets the matching numeric key.
+NOTE_COUNTS="$( grep -o 'mention anchor: [0-9]* file[s]\{0,1\} + [0-9]* symbol' "$TMP/d1.xml" | grep -o '[0-9]*' )"
+NOTE_TOTAL="$( printf '%s\n' $NOTE_COUNTS | awk '{s+=$1} END{print s}' )"
+MA_ATTR="$( grep -o 'mention_anchored="[0-9]*"' "$TMP/d1.xml" | head -1 | grep -o '[0-9]*' )"
+[ -n "$NOTE_TOTAL" ] && [ "$MA_ATTR" = "$NOTE_TOTAL" ] \
+    && ok "L10b: XML root carries mention_anchored=\"$MA_ATTR\" (matches the note's own file+symbol count)" \
+    || no "L10b: XML root mention_anchored= missing or disagrees with the note (attr='${MA_ATTR:-<absent>}' note_total='${NOTE_TOTAL:-<none>}')"
+grep -q 'mention_anchored=' "$TMP/p1.xml" && no "L10b: mention_anchored= present on a query nothing anchored" \
+    || ok "L10b: mention_anchored= absent when the note did not fire (never mention_anchored=\"0\")"
+JSON_HIT="$( "$BIN" "$FIX" --for="$QM" --json --no-cache 2>/dev/null )"
+printf '%s' "$JSON_HIT" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d.get('mention_anchored')==$NOTE_TOTAL, d.get('mention_anchored')" \
+    && ok "L10b: --json carries the matching \"mention_anchored\":$NOTE_TOTAL" \
+    || no "L10b: --json mention_anchored key missing or wrong"
+
+[ "$fail" = 0 ] && echo 'ALL PASS' || echo 'FAILURES ABOVE'
+exit "$fail"

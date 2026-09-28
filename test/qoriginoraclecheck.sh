@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# qoriginoraclecheck.sh — r27 gate for the four ORIGIN-ORACLE suspicions raised against the r26 origin split
+# (fbc527e). The origin axis decides which findings GATE, so every one of these is an exit-code correctness
+# question, not a cosmetic one.
+#
+#   (A) `originOracleOk = !base.locBySym.empty()` CONFLATED "the sidecar is in the pre-Q1 format" with "HEAD
+#       genuinely has no canonId symbols" (a README-only first commit, a docs/JSON-only HEAD, a root pointed at
+#       a non-source subdirectory). In the second case the oracle is PERFECT — nothing existed, so every
+#       finding is new — yet every finding was classified preexisting-worse and GATED, under an alert claiming
+#       the baseline was in a stale pre-Q1 format. Wrong answer and wrong explanation.
+#   (A2) `readBaseline` returned true for a 0-byte sidecar purely because the ifstream opened — so a truncated
+#       or failed write became "a valid baseline in which nothing existed".
+#   (B) `cloneGroupIsNew` walked its members without first asking whether the oracle was available at all, so
+#       a group of key-0 (canonId-less) members classified new-symbol — one kind silently disarming the exit
+#       code while every other kind failed CLOSED on the same missing oracle.
+#   (C) "the reused helper is preexisting BY CONSTRUCTION" was asserted in the comments (and in fbc527e's
+#       commit message) but never ENFORCED: kReusedHelperMinFanin=3 is trivially reached by brand-new code, so
+#       an all-new blob duplicating ITSELF was reported under a kind whose entire meaning is eroded pre-existing
+#       reuse.
+#
+# Checks:
+#   (a) a HEAD with NO indexable source: findings classify origin="new-symbol", exit 0, and NO pre-Q1 alert.
+#   (b) a 0-byte sidecar is treated as ABSENT (falls back to the git-HEAD auto-baseline) and gives the same
+#       answer as having no sidecar at all.
+#   (c) a genuine pre-Q1 sidecar (records but no `loc ` lines) is REFUSED (since a8c71a02, 2026-09-07; it used
+#       to be honored fail-closed): named on the root and on stderr, no was=0 now=0 phantom row, and computeDelta's
+#       fail-closed pre-Q1 alert does NOT fire, because the sidecar never reaches the delta.
+#   (d) all-new code that duplicates itself with fan-in >= 3 is reported as `duplication` but NOT as
+#       `new-clone-of-reused-helper`.
+#   (e) a clone of a genuinely PREEXISTING high-fan-in helper IS still reported as new-clone-of-reused-helper
+#       (the enforcement narrows the kind; it must not empty it).
+#
+# Own temp repos. Needs git. The DEGRADED alerts are compiled out under NDEBUG, so (c)'s no-alert sub-check is
+# skipped when --version names a Release/RelWithDebInfo/MinSizeRel build (the CI-builds-Release blind spot, CLAUDE.md).
+# Usage:  test/qoriginoraclecheck.sh   |   CODECORTEX_BIN=build/codecortex test/qoriginoraclecheck.sh
+set -u
+ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
+BIN="${1:-${CODECORTEX_BIN:-$ROOT/build/codecortex}}"
+[ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
+fail=0
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
+no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
+
+[ -x "$BIN" ] || { echo "no codecortex binary at $BIN — build first"; exit 2; }
+command -v git >/dev/null 2>&1 || { echo "  SKIP  qoriginoraclecheck (git not available)"; exit 0; }
+
+WORK="$( mktemp -d )"; trap 'rm -rf "$WORK"' EXIT
+echo "qoriginoraclecheck: BIN=$BIN"
+
+mkrepo(){ mkdir -p "$1" && ( cd "$1" && git init -q && git config user.email t@t && git config user.name t ); }
+commit(){ ( cd "$1" && git add -A >/dev/null 2>&1 && git commit -qm "$2" >/dev/null 2>&1 ); }
+
+# a big, complex, PUBLIC function — reliably produces complexity/verbosity/nesting/api-surface rows.
+gnarly(){ cat <<'EOF'
+int gnarly( int a, int b, int c ) {
+    int r = 0;
+    for( int i = 0; i < a; ++i ) {
+        if( i % 2 == 0 ) { if( i > b ) { r += i; } else { r -= 1; } }
+        else { for( int j = 0; j < b; ++j ) { if( j > c ) { r += j; } else { r--; } } }
+        while( r > c && r > b ) { r = r - 1; if( r % 3 == 0 ) { r += 2; } else { r -= 2; } }
+        if( r < 0 ) { if( a > b ) { r = a; } else { r = b; } }
+        if( r > 1000 ) { for( int k = 0; k < c; ++k ) { r -= k; } }
+    }
+    return r;
+}
+EOF
+}
+
+# ── (a) a HEAD with NO canonId symbols ─────────────────────────────────────────────────────────────────────
+# A comment-only translation unit: the file IS indexed (so computeHeadSnapshot's own "HEAD ingested empty"
+# degrade — which needs BOTH files and symbols empty — does not fire, and we reach computeDelta) but it
+# defines zero canonId symbols, so the baseline Snapshot is WHOLLY empty. The oracle is available and says
+# "nothing existed" — every finding is new. NB a markdown file does NOT work as a fixture here: headings
+# become Section symbols and even a heading-free .md is enough to populate locBySym on some trees.
+# MEASURED before/after on this exact fixture (r27):
+#   pre-fix  exit 2, `<r kind="api-surface" ... surface="contract-change" gating="1"/>`  (a false gate)
+#   post-fix exit 0, `<r kind="api-surface" ... origin="new-symbol" sev="minor"/>`
+E="$WORK/emptyhead"; mkrepo "$E"
+printf '// a translation unit with no symbols at all\n' > "$E/empty.cpp"
+commit "$E" init
+mkdir -p "$E/inc"
+gnarly > "$E/inc/new.h"
+# L1 (2026-09-19): the CLI default legend is compact and spells `<r kind= sym= …>` inside its comment; this counts real rows, so it asks for the full legend.
+OUT="$( cd "$E" && "$BIN" . --quality-delta --no-cache --legend=full 2>"$WORK/e_err" )"; rce=$?
+NROWS="$( printf '%s' "$OUT" | tr '<' '\n' | grep -c '^r kind=' )"
+[ "$NROWS" -gt 0 ] && ok "empty-HEAD fixture reports $NROWS findings (non-vacuous)" \
+                   || { no "empty-HEAD fixture reported nothing"; printf '%s\n' "$OUT" | head -c 400; }
+NOTNEW="$( printf '%s' "$OUT" | tr '<' '\n' | grep '^r kind=' | grep -vc 'origin="new-symbol"' )"
+{ [ "$rce" -eq 0 ] && [ "$NOTNEW" -eq 0 ]; } \
+    && ok "HEAD with no indexable source: every finding is origin=\"new-symbol\", exit 0 (oracle is VALID, not missing)" \
+    || { no "empty-HEAD misclassified: exit=$rce, $NOTNEW row(s) not new-symbol"; printf '%s' "$OUT" | tr '<' '\n' | grep '^r kind=' | grep -v 'origin="new-symbol"' | head -3; }
+grep -q 'pre-Q1' "$WORK/e_err" \
+    && { no "empty HEAD still alerts 'pre-Q1 format' — the wrong explanation for the right tree"; } \
+    || ok "no false 'pre-Q1 format' alert on an empty HEAD"
+
+# ── (b) a 0-byte sidecar is ABSENT, not 'an empty baseline' ────────────────────────────────────────────────
+S="$WORK/zerosidecar"; mkrepo "$S"; mkdir -p "$S/inc"
+printf 'int seed( int a );\n' > "$S/inc/api.h"
+printf 'int seed( int a ) { return a + 1; }\n' > "$S/lib.cpp"
+commit "$S" init
+gnarly >> "$S/inc/api.h"
+NOSIDE="$( cd "$S" && "$BIN" . --quality-delta --no-cache 2>/dev/null )"; rcn=$?
+: > "$S/.codecortex_quality_baseline"
+ZERO="$( cd "$S" && "$BIN" . --quality-delta --no-cache 2>"$WORK/s_err" )"; rcz=$?
+# 2026-09-06 (stranger audit): a 0-byte sidecar is a file that EXISTS and cannot be read as a baseline. The
+# ROWS and the exit are the no-sidecar answer (nothing was compared against it); the root marker and stderr now
+# say so — the old message "no <file>" about a file sitting on disk was the audit's finding.
+rows_of(){ printf '%s' "$1" | tr '<' '\n' | grep '^r ' ; }
+{ [ "$( rows_of "$ZERO" )" = "$( rows_of "$NOSIDE" )" ] && [ "$rcz" -eq "$rcn" ]; } \
+    && ok "a 0-byte sidecar gives the SAME rows and exit as no sidecar (nothing compared against it, exit $rcz)" \
+    || { no "0-byte sidecar changed the answer (exit no-sidecar=$rcn zero=$rcz)"; printf '%s' "$ZERO" | tr '<' '\n' | grep '^quality-delta'; }
+printf '%s' "$ZERO" | grep -q 'baseline="git-HEAD (sidecar unreadable)"' \
+    && ok "the 0-byte sidecar is named on the root: baseline=\"git-HEAD (sidecar unreadable)\" (never \"no sidecar existed\")" \
+    || { no "0-byte sidecar: root does not carry the unreadable marker"; printf '%s' "$ZERO" | tr '<' '\n' | grep '^quality-delta'; }
+grep -q 'exists but is not a readable baseline' "$WORK/s_err" && grep -q 'auto-comparing the working tree vs git HEAD' "$WORK/s_err" \
+    && ok "stderr names the unreadable sidecar and the git-HEAD fallback (with the re-pin)" \
+    || { no "no unreadable-sidecar message for the 0-byte sidecar"; head -3 "$WORK/s_err"; }
+
+# ── (c) a genuine pre-Q1 sidecar still fails CLOSED, for every kind ────────────────────────────────────────
+( cd "$S" && git checkout -q -- . ) ; rm -f "$S/.codecortex_quality_baseline"
+( cd "$S" && "$BIN" . --quality-baseline --no-cache >/dev/null 2>&1 )
+grep -v '^loc ' "$S/.codecortex_quality_baseline" > "$WORK/preq1" && cp "$WORK/preq1" "$S/.codecortex_quality_baseline"
+gnarly >> "$S/inc/api.h"
+cat >> "$S/lib.cpp" <<'EOF'
+int copyA( int a ) { int q = 0; for( int i = 0; i < a; ++i ) { q += i * 7; } return q; }
+int copyB( int a ) { int q = 0; for( int i = 0; i < a; ++i ) { q += i * 7; } return q; }
+EOF
+PQ="$( cd "$S" && "$BIN" . --quality-delta --no-cache 2>"$WORK/pq_err" )"; rcp=$?
+# 2026-09-06 (stranger audit): a pre-Q1 sidecar used to be HONORED with every finding gated fail-closed, and
+# the report named phantom findings — `api-surface <sym> (was=0 now=0)` — instead of saying the sidecar could
+# not be read. It is REFUSED now, like the foreign-header sidecar: the root says so, stderr names the re-pin,
+# and the tree is compared against git HEAD. The two copies below ARE new against HEAD, so new-symbol rows
+# are the truth here, not a disarmed gate; what must never appear is a was=0 now=0 phantom.
+PQPHANTOM="$( printf '%s' "$PQ" | tr '<' '\n' | grep '^r kind=' | grep -c 'was="0" now="0"' )"
+{ [ "$PQPHANTOM" -eq 0 ] && printf '%s' "$PQ" | grep -q 'baseline="git-HEAD (sidecar unreadable)"'; } \
+    && ok "pre-Q1 sidecar: refused and named on the root (sidecar unreadable), no was=0 now=0 phantom row (exit $rcp)" \
+    || { no "pre-Q1 sidecar: $PQPHANTOM phantom row(s), root marker: $( printf '%s' "$PQ" | grep -o 'baseline="[^"]*"' )"; printf '%s' "$PQ" | tr '<' '\n' | grep 'was="0" now="0"' | head -3; }
+grep -q 'pre-Q1' "$WORK/pq_err" && grep -q 'quality-baseline' "$WORK/pq_err" \
+    && ok "pre-Q1 sidecar: stderr names the format and the re-pin (the Release-visible line — this refusal raises no debug alert)" \
+    || { no "pre-Q1 sidecar: stderr does not name pre-Q1 + the re-pin"; head -3 "$WORK/pq_err"; }
+# 2026-09-16: the row that stood here was "pre-Q1 sidecar emits the degrade alert", asserted as `--version runs &&
+# stderr says pre-Q1` — the Release-visible line the row above already pins, never the alert (CONTRIBUTING §2 shape
+# 7), with an NDEBUG skip on its else branch that a plain build reached whenever that LINE went missing. And the
+# alert it named cannot fire here: since a8c71a02 readBaseline refuses a pre-Q1 sidecar before computeDelta runs, so
+# computeDelta's fail-closed "baseline has no per-symbol loc map (pre-Q1 format)" alert — the voice of the old
+# honor-and-gate-everything behaviour — is reached only if the sidecar is honored again. Measured on the plain build:
+# stderr carries the refusal line and no alert at all. So the row asserts that the alert does NOT fire. An absent
+# alert is evidence only on a binary that prints alerts: the row decides from --version's build type (kotlincheck
+# §12) and, on a flavour that compiles alerts IN, first proves this binary prints one with a --scip index that opens
+# and fails to decode (the degrade qualitystalecheck.sh probes; the index lives in $WORK, outside the checkout).
+PQ_FLAVOUR="$( "$BIN" --version 2>/dev/null | sed -nE 's/^[^(]*\(([^,)]*).*/\1/p' )"
+case "$PQ_FLAVOUR" in
+    Release|RelWithDebInfo|MinSizeRel)
+        echo "  SKIP  pre-Q1 sidecar: 'computeDelta's fail-closed pre-Q1 alert does not fire' — this $PQ_FLAVOUR build defines NDEBUG, so DISCLOSE is compiled out and the absence is true of every run; the plain-flavour leg proves it" ;;
+    *)
+        printf 'not a scip index at all\n' > "$WORK/probe.scip"
+        "$BIN" "$ROOT/test/fixture" --scip="$WORK/probe.scip" --top-k=1 --no-cache >/dev/null 2>"$WORK/probe.err"
+        if ! grep -qF '[math degraded] --scip: corrupt/truncated index' "$WORK/probe.err"; then
+            no "pre-Q1 sidecar: positive control — '${PQ_FLAVOUR:-unknown}' is a non-NDEBUG build, yet an undecodable --scip index raised no DISCLOSE, so an absent pre-Q1 alert proves nothing: $( head -c 200 "$WORK/probe.err" )"
+        elif grep -qF '[math degraded] quality: baseline has no per-symbol loc map (pre-Q1 format)' "$WORK/pq_err"; then
+            no "pre-Q1 sidecar: computeDelta's fail-closed pre-Q1 alert FIRED — the sidecar reached the delta instead of being refused: $( grep -F '[math degraded]' "$WORK/pq_err" | head -1 | head -c 200 )"
+        else
+            ok "pre-Q1 sidecar: refused BEFORE the delta — computeDelta's fail-closed pre-Q1 alert does not fire (on a '${PQ_FLAVOUR:-unknown}' build the --scip decode control proved prints alerts)"
+        fi ;;
+esac
+
+# ── (d) all-new self-duplication with fan-in >= 3 is NOT 'new-clone-of-reused-helper' ──────────────────────
+N="$WORK/allnew"; mkrepo "$N"
+printf 'int anchor( int a ) { return a; }\n' > "$N/base.cpp"
+commit "$N" init
+cat > "$N/fresh.cpp" <<'EOF'
+int freshHelper( int a ) { int q = 0; for( int i = 0; i < a; ++i ) { q += i * 11; } return q; }
+int freshTwin( int a )   { int q = 0; for( int i = 0; i < a; ++i ) { q += i * 11; } return q; }
+int useOne( int a )   { return freshHelper( a ) + 1; }
+int useTwo( int a )   { return freshHelper( a ) + 2; }
+int useThree( int a ) { return freshHelper( a ) + 3; }
+int useFour( int a )  { return freshHelper( a ) + 4; }
+EOF
+AN="$( cd "$N" && "$BIN" . --quality-delta --no-cache 2>/dev/null )"
+printf '%s' "$AN" | grep -q 'kind="duplication"' \
+    && ok "all-new self-duplication IS reported as duplication (nothing lost)" \
+    || { no "all-new duplication not reported at all — fixture vacuous"; printf '%s' "$AN" | tr '<' '\n' | grep '^r kind='; }
+printf '%s' "$AN" | grep -q 'kind="new-clone-of-reused-helper"' \
+    && { no "all-new code reported as new-clone-of-reused-helper — the 'reused helper is preexisting' claim is still unenforced"; printf '%s' "$AN" | tr '<' '\n' | grep 'reused-helper'; } \
+    || ok "all-new self-duplication is NOT new-clone-of-reused-helper (claim now enforced)"
+
+# ── (e) a clone of a genuinely PREEXISTING reused helper is still reported ─────────────────────────────────
+P="$WORK/preexist"; mkrepo "$P"
+cat > "$P/base.cpp" <<'EOF'
+int sharedHelper( int a ) { int q = 0; for( int i = 0; i < a; ++i ) { q += i * 13; } return q; }
+int callA( int a ) { return sharedHelper( a ) + 1; }
+int callB( int a ) { return sharedHelper( a ) + 2; }
+int callC( int a ) { return sharedHelper( a ) + 3; }
+int callD( int a ) { return sharedHelper( a ) + 4; }
+EOF
+commit "$P" init
+cat > "$P/copy.cpp" <<'EOF'
+int reinvented( int a ) { int q = 0; for( int i = 0; i < a; ++i ) { q += i * 13; } return q; }
+EOF
+PE="$( cd "$P" && "$BIN" . --quality-delta --no-cache 2>/dev/null )"
+printf '%s' "$PE" | grep -q 'kind="new-clone-of-reused-helper"' \
+    && ok "a new clone of a PREEXISTING reused helper is still reported (the kind is narrowed, not emptied)" \
+    || { no "the reuse-decline kind no longer fires on its own headline case"; printf '%s' "$PE" | tr '<' '\n' | grep '^r kind='; }
+
+[ "$fail" -eq 0 ] && echo "qoriginoraclecheck: ALL PASS" || { echo "qoriginoraclecheck: SOME CHECKS FAILED"; exit 1; }

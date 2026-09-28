@@ -1,0 +1,749 @@
+#pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+
+
+// graphlegend.h — the ONE floor marker and the ONE shared legend wording for the five GRAPH-COUNT verbs
+// (--uses, --callers, --callees, --impact, --edit-check).
+//
+// WHY A HEADER AND NOT FIVE STRING LITERALS. Each of these verbs answers with a NUMBER a reader treats as
+// exhaustive ("count=1 caller, so one call site to fix"). §H4 proved the number can be silently short: a
+// plainly written `ns::inner::fn()` produced no reference at all, so --edit-check said callers="1" about a
+// symbol with two callers and nothing in the document hinted otherwise. The widening (option A) fixed the
+// qualified-call class; it did NOT — and no static extractor can — fix dynamic dispatch, callbacks, macros
+// or most-vexing-parse declarations. So the counts stay FLOORS, and every one of the five has to say so in
+// the SAME words: the round-series' standing law is that a CLI legend and its MCP twin are byte-identical
+// wording, and the §B4 failure family is exactly "the clause landed at 3 of its 5 echo sites".
+//
+// THE ATTRIBUTE. `counts_floor="1"` (XML) / `"counts_floor":true` (JSON), appended LAST on the root element
+// of all five verbs, in every dialect they ship (XML, --format=columnar, --json, and the MCP payloads).
+// It is deliberately NOT spelled with the `_capped` suffix of src/pageview.h rule 4: that marker means "a
+// CAP or a BUDGET stopped the scan before it finished counting", which is a property of THIS RUN and is
+// raisable with limit=N. This one means "the underlying graph does not model every call", which no flag can
+// raise. Two different facts under one attribute name is the §P8 collision class, so they get two names.
+// It is a constant "1" today because the tool cannot detect the absence it is disclosing — a 0 would be a
+// claim of exhaustiveness that nothing in the pipeline can support.
+//
+// H8 AMENDMENT (capture-audit 2026-09-04). The READING of counts_floor= is "every count on this element
+// is a floor"; the CAUSE is disclosed beside it, never encoded in the name. On a graph verb the cause is the
+// floor sentence below (the graph misses edges — nothing raises it). On a collection-capped scan (--match /
+// --lint / --grep / --pattern / --ensemble / --quality-panel) the cause is the rule-4 marker on the same root
+// (hits_capped= / findings_capped=) and it IS raisable — narrow the query. Two causes, one reading, one
+// attribute: a parser that treats counts_floor="1" as "do not trust these totals" is right in both cases,
+// which it was not when the capped scans carried no marker at all and printed has_more="0" capped="0" over
+// a floored total (the complete-last-page lie). pageview.h's PageSyntax::floor spells the identical bytes.
+//
+// Gate: test/floormarkcheck.sh (all five verbs, CLI ≡ MCP wording, and the retired absolutism absent).
+
+#include <array>
+#include <cstdint>
+#include <utility>
+#include <cstdio>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace rw
+{
+
+// M15 (capture-audit 2026-09-04, lens 7 F-GAUGE-1) — THE GAUGE PAIR. Every graph verb said "floor" and none
+// said HOW MUCH of the graph was guessed; the magnitude lived only in the map header's ambiguous=/unresolved=,
+// on a verb the agent had not run. Every root that carries the graph's counts_floor="1" now carries the same
+// two whole-graph numbers beside it — graph_ambiguous= (calls the resolver split over several in-repo defs,
+// graph.h ambOut) and graph_unresolved= (calls to an in-repo name whose every def was language-filtered,
+// unresolvedOut) — computed by the ONE fold the map header uses, so the pair can never be a second
+// derivation. Gate: test/floormarkcheck.sh arm (11) (value-equal to the map header on the same corpus).
+//
+// #66 THIRD GAUGE (2026-09-08, @snrmwg). `graph_unindexed=` joins the pair: the files the crawl could not
+// read AT ALL (the map header's `unindexed=` roll-up, summed to files). It answers the question the other
+// two cannot — a call FROM a file that was never parsed produces no reference, so it can raise neither
+// ambOut nor unresolvedOut, and the reporter's corpus showed both sitting at 0 beside a count="0" whose
+// real cause was 154 unread .astro files. OMITTED AT ZERO, unlike the pair: absence is the confident case
+// ("no file in this corpus went unread"), and a marker printed on every root of every clean corpus is one
+// ONE fold for both dialects: the XML and JSON emitters each summed these inline, which made them a
+// clone pair the moment a third gauge widened both (--quality-delta, 2026-09-08).
+inline std::pair<std::size_t, std::size_t> graphGaugeTotals( const std::vector<std::uint32_t>& ambOut,
+                                                             const std::vector<std::uint32_t>& unresolvedOut ) noexcept
+{
+    std::size_t amb = 0, unresolved = 0;
+    for( std::uint32_t k : ambOut ) { amb += k; }
+    for( std::uint32_t k : unresolvedOut ) { unresolved += k; }
+    return { amb, unresolved };
+}
+
+// an agent correctly learns to skip. Gate: test/blindspotcheck.sh arms (A) value-equality and (B) absence.
+inline std::string graphGaugeAttrXml( const std::vector<std::uint32_t>& ambOut, const std::vector<std::uint32_t>& unresolvedOut,
+                                      std::size_t unindexedFiles = 0 )
+{
+    const auto [amb, unresolved] = graphGaugeTotals( ambOut, unresolvedOut );
+    char buf[160];
+    if( unindexedFiles > 0 )
+    {
+        rw::formatTo( buf, sizeof( buf ), " graph_ambiguous=\"{}\" graph_unresolved=\"{}\" graph_unindexed=\"{}\"", amb, unresolved, unindexedFiles );
+    }
+    else
+    {
+        rw::formatTo( buf, sizeof( buf ), " graph_ambiguous=\"{}\" graph_unresolved=\"{}\"", amb, unresolved );
+    }
+    return buf;
+}
+inline std::string graphGaugeAttrJson( const std::vector<std::uint32_t>& ambOut, const std::vector<std::uint32_t>& unresolvedOut,
+                                       std::size_t unindexedFiles = 0 )
+{
+    const auto [amb, unresolved] = graphGaugeTotals( ambOut, unresolvedOut );
+    char buf[160];
+    if( unindexedFiles > 0 )
+    {
+        rw::formatTo( buf, sizeof( buf ), ",\"graph_ambiguous\":{},\"graph_unresolved\":{},\"graph_unindexed\":{}", amb, unresolved, unindexedFiles );
+    }
+    else
+    {
+        rw::formatTo( buf, sizeof( buf ), ",\"graph_ambiguous\":{},\"graph_unresolved\":{}", amb, unresolved );
+    }
+    return buf;
+}
+
+// The gauge's one-sentence definition, spliced into every floor legend below (and the verify / nonlocal-state /
+// test-gate legends, which carry their own floor sentence). Short on purpose: the shared floor essay sits
+// inside test/graphlegendbudgetcheck.sh's byte budget.
+inline constexpr const char* kGraphGaugeLegend =
+    "graph_ambiguous=/graph_unresolved= are the whole graph's resolver gauge (calls split over several defs / calls whose in-repo defs were all language-filtered), the map header's ambiguous=/unresolved=. ";
+
+// The floor sentence. Shared verbatim by all five verbs on every surface that can carry prose. Written with
+// NO "--" digraph anywhere: this string is spliced into an XML comment, where "--" is a well-formedness
+// error (G4), which is why the verbs are named bare here ("the uses verb") rather than with their flags.
+//
+// C1 density fix (lane/fa-legend, 2026-08-28): every fact below survived a rewrite from full sentences to
+// terse defined-clauses — none was cut, see test/graphlegendbudgetcheck.sh's honesty-marker arm and
+// test/floormarkcheck.sh's exact-phrase anchors ('is a FLOOR, never a total', 'most-vexing-parse'), both of
+// which this string must keep matching verbatim. docs/EVALS.md §5 has the measured before/after byte table.
+inline constexpr const char* kGraphCountFloorLegend =
+    "counts_floor=\"1\" means every count here is a FLOOR, never a total: edges are extracted from source TEXT by NAME. Missing: dynamic dispatch (virtual/interface/duck-typed), a most-vexing-parse declaration with no call expression, a function-pointer/callback bound to more than one function in scope (reassigned, table-indexed, lambda-bound, or address-taken/reference-bound), and a plain-name binding (fp=handler) whose variable type is not PROVABLY a function pointer (a same-file typedef/declarator; a HEADER typedef is missed; auto/template types are read as unpinned, so KEPT). A macro-generated call site is role=\"macro\" only when its name uniquely names an indexed function-like #define (C-family, t=\"macro\"); a shared name stays a plain call, an unindexed macro is no edge. Read a zero as \"none found\", never as \"none exists\". graph_ambiguous=/graph_unresolved= are the whole graph's resolver gauge (calls split over several defs / calls whose in-repo defs were all language-filtered), the map header's ambiguous=/unresolved=. ";
+
+// ── the #66 third gauge's clause, emitted exactly when graph_unindexed= is ────────────────────────────
+// ONE wording, one emission rule, every dialect. `on` is the emitter's own attribute-present condition
+// (g.unindexedFiles > 0), never a re-derivation of it — the same contract rootRelPathsLegend( bool ) has.
+inline constexpr const char* kGraphUnindexedLegend =
+    "graph_unindexed=N is a third gauge: files no grammar could read (the map header's unindexed=), whose calls "
+    "raise neither gauge above; absent when zero, and so is this sentence. ";
+inline const char* graphUnindexedLegend( bool on ) noexcept { return on ? kGraphUnindexedLegend : ""; }
+
+// The same sentence as its OWN XML comment, for the legends that are one closed <!-- ... --> literal rather
+// than a %s inside one. Wrapped, never re-spelled: a second copy of this sentence is the drift
+// this header exists to stop, and splicing the bare clause after a closing "-->" is not a wording bug but a
+// WELL-FORMEDNESS one (test/floormarkcheck.sh arm (9) caught exactly that during this change).
+// legendcoveragecheck reads the whole LEADING RUN of comments as the legend, so an adjacent comment IS the
+// legend -- the rule kRootRelPathsLegend already relies on.
+//
+// FOUR USERS, and the fourth-to-first of them is why this paragraph is here. #66 landed the clause into the
+// three SHARED legend builders below (graphCountDisclosure, graphCountFloorBrief, graphUnindexedTextClause)
+// plus --connect through this wrapper -- but the ATTRIBUTE rides a different code path entirely
+// (graph.h graphCountFloorAttrXml/Json, whose only condition is g.unindexedFiles > 0). So every verb whose
+// legend is a hand-spelled closed literal rather than a call into a builder got the attribute and no clause:
+// --lego (kLegoLegend below, CLI and MCP), --verify (verify.h kVerifyLegend) and --nonlocal-state
+// (nonlocalstate.h kNonLocalStateLegend) shipped that way in v0.6.0. They now take this wrapper, which is
+// what it was written for. `on` is always the emitter's own g.unindexedFiles > 0, never a re-derivation.
+// Gate: test/blindspotcheck.sh arm (F) (attribute => clause, every surface, both dialects) and (G) (the
+// mirror: neither, on a corpus with nothing unindexed).
+inline std::string graphUnindexedLegendComment( bool on )
+{
+    return on ? std::string( "<!-- " ) + kGraphUnindexedLegend + "-->" : std::string();
+}
+
+// H5 (capture-audit 2026-09-04, lens 7 F-FLOOR-1) — the BRIEF floor clause for the graph-count verbs that
+// are not one of the five above: --path / --connect / --affected / --exercises / --seams / --dead-code /
+// --communities / --community / --zoom / --lego, whose roots read reachable=/nodes=/reached=/reaches=/
+// seam_pairs=/implementors=/isolated= off the SAME name-based CSR and said nothing. The full sentence above
+// is ~900 B and those verbs' whole legends are shorter than that; this clause keeps the two anchors the
+// gate matches verbatim ('is a FLOOR, never a total', 'none found') and drops the taxonomy of misses, which
+// the reader can get from any of the five. No "--" digraph (it lands inside XML comments).
+inline constexpr const char* kGraphCountFloorBriefLegend =
+    "counts_floor=\"1\": every graph-derived count here is a FLOOR, never a total. Call edges are extracted from source text by NAME, so dynamic dispatch, callbacks, macros and cross-language calls can be missing; read a zero as \"none found\", never as \"none exists\". graph_ambiguous=/graph_unresolved= are the whole graph's resolver gauge (calls split over several defs / calls whose in-repo defs were all language-filtered), the map header's ambiguous=/unresolved=. ";
+
+// The BRIEF floor legend with the same conditional clause, as ONE string. Returned rather than exposed as a
+// second printf argument so the nine emitters that splice the brief legend keep their format strings exactly
+// as they were - a new %s at nine call sites is nine chances to land the B4 partial fix, and
+// test/printffmtparitycheck.sh would only catch the ones that change bytes.
+inline std::string graphCountFloorBrief( bool hasUnindexed )
+{
+    return std::string( kGraphCountFloorBriefLegend ) + graphUnindexedLegend( hasUnindexed );
+}
+
+// The same facts for the one graph-count report that is TEXT (--situ's [1] blast radius) — as ATTRIBUTES,
+// not as a paragraph. A5 (2026-09-13, PLAN_OUTPUT_ROUTING_LOOP §1.5): this line ran 601 B on every --situ
+// answer to say four things that are names with values — counts_floor, the two resolver gauges and, when a
+// file could not be read at all, the third — plus the two readings a consumer cannot supply for itself:
+// that the counts are floors, and how to read a zero. The names are now spelled exactly as the XML/JSON
+// dialects spell them (graph_ambiguous=/graph_unresolved=/graph_unindexed=, counts_floor=1), so the three
+// dialects share one vocabulary, and the two readings stay as the short clause after them. Nothing was
+// dropped: METHODOLOGY §9 puts honesty in the attributes, and the sentence was never the honest part.
+// The trailing {} is the #66 gauge — EMPTY when nothing went unindexed, so this dialect keeps the same
+// omit-at-zero reading as the attribute rather than printing a bare "0" the other two never print.
+// Review of #219: an attribute with no reading is a token, not a disclosure — and this is the ONE dialect
+// with no legend to look a token up in (--situ refuses --legend=compact; compactlegendcheck (R)). So the
+// floor's CAUSE (a name-based call graph) and what an unindexed file IS stay on the line. They are the
+// price of having no legend, not prose the compression was entitled to.
+// Gate: test/situshapecheck.sh (1) and (8); test/floormarkcheck.sh (9) keeps the two anchor phrases.
+inline constexpr const char* kGraphCountFloorTextLine =
+    "        counts_floor=1 graph_ambiguous={} graph_unresolved={}{} (the map header's own gauges) — every count above is a FLOOR, never a total: "
+    "call edges are name-based, so dynamic dispatch, callbacks and macros can be missing; a zero is \"none found\", never \"none exists\"\n"; // std::format FORMAT: two gauge totals + the clause
+
+// The #66 clause for the prose dialect. "" at zero — the absence IS the confident case, same as the attribute.
+inline std::string graphUnindexedTextClause( std::size_t unindexedFiles )
+{
+    if( unindexedFiles == 0 )
+    {
+        return {};
+    }
+    char buf[128]; // literal 63 B + one size_t at 20 digits = 83 B worst case; snprintf truncates regardless
+    rw::formatTo( buf, sizeof( buf ), " graph_unindexed={} (files no grammar in this build could read at all)", unindexedFiles );
+    return buf;
+}
+
+// --lego shipped with NO legend at all (a bare <ctx root=><lego>…); one literal for the CLI verb and its MCP
+// twin, so the two dialects cannot describe implementors= differently.
+inline constexpr const char* kLegoLegend =
+    "<!-- codecortex lego: ONE interface/base type — its method contract (<m>, where the language captures it soundly) and every implementor (<impl>) the extends/implements edges reach, own-language only; implementors= counts them. counts_floor=\"1\": every graph-derived count here is a FLOOR, never a total. Call edges are extracted from source text by NAME, so dynamic dispatch, callbacks, macros and cross-language calls can be missing; read a zero as \"none found\", never as \"none exists\". graph_ambiguous=/graph_unresolved= are the whole graph's resolver gauge (calls split over several defs / calls whose in-repo defs were all language-filtered), the map header's ambiguous=/unresolved=. On a NAMED target only, methods=\"0\" caveat=\"not-extracted-for-lang\" means the method contract itself is not read soundly for this interface's language (currently C++/ObjC only) — implementors= still stands, this caveat is about <m> rows alone. -->";
+
+// The COUNTING-UNIT clause (the L-CS routing item).
+//
+// V3 H-1 REWRITE, and the reason it is worth reading before touching this string. The first version said all
+// four non-uses verbs "count DISTINCT (caller,callee) PAIRS". That was FALSE for three of them and it
+// contradicted the sentence printed 300 bytes earlier in the same comment (kCallHierarchyLegendOpen's
+// "count= the number of DISTINCT neighbour symbols"), which is what the emitters actually implement:
+//   * callers/callees dedup by neighbour NodeId (main.cpp's `seen[]`), so `--callers=buf` reports 8 caller
+//     SYMBOLS even though push_back calls BOTH defs of buf — 2 (caller,callee) pairs, 1 row.
+//   * --impact's reaches= is |transitiveCallers()|, a node-SET size; there are no pairs in it at all.
+//   * --edit-check's callers= is callerIds.size(), a 1-hop distinct-symbol count.
+//   * --graph-query's count= is the size of the node set the expression selected.
+//   * V4 MED-3: --pr-context is the SEVENTH surface counting off this graph — hundreds of per-symbol
+//     `<s … callers="N">` attributes read from the same in-edge CSR --callers reads, plus `<impact
+//     dependents=>` reach counts. Both units are already named above, so it joins the shared clause by NAME
+//     rather than getting a wording of its own.
+// Only the map header's edges= is pair-counted (graph.h's accumulator keys on (from,to), so N calls from one
+// caller to one callee become ONE edge whose multiplicity lives in nref/weight). A disclosure that states the
+// wrong unit is a new false claim inside the honesty fix, which is strictly worse than the silence it
+// replaced — so the clause below names the unit PER VERB FAMILY and nothing else.
+//
+// V3 L-5: the map header's edges= is still named, because the reader who compares these numbers against it
+// is exactly the reader this clause exists for — but the sentence now says outright that the map carries
+// neither this marker nor this clause, so no one can read the disclosure as covering that document.
+inline constexpr const char* kCallCountUnitLegend =
+    "COUNTING UNIT differs by verb: callers, callees, edit-check, graph-query and pr-context counts are DISTINCT SYMBOLS (repeated calls from one caller, and calls to two overloads, collapse into ONE row; multiplicity survives only in the call graph's edge weight). The reach counts (impact's reaches=, pr-context's dependents=) are the size of a transitive reach SET, each symbol counted once. The uses verb counts call SITES, one row per occurrence — a larger count there for the same symbol is these units agreeing, not disagreeing. The map header's edges= is a unit again different — distinct (caller,callee) PAIRS — and that document carries neither this marker nor this clause. ";
+
+// The two clauses in the order every legend prints them, so a caller that just wants "the shared tail" cannot
+// get the order wrong. Returned by value (std::string) because the two constants cannot be concatenated at
+// compile time through `const char*`; every call site splices it once, into a legend built at most once per run.
+inline std::string graphCountDisclosure( bool hasUnindexed )
+{
+    return std::string( kGraphCountFloorLegend ) + graphUnindexedLegend( hasUnindexed ) + kCallCountUnitLegend;
+}
+
+// The root-element attribute, one spelling per dialect. Appended LAST (after the page disclosure and after
+// --edit-check's at= stamp) so no existing attribute ADJACENCY assertion in test/ can break on it — the same
+// placement rule gitstamp::atAttr already follows in editcheck.h.
+inline constexpr const char* kGraphCountFloorAttrXml = " counts_floor=\"1\"";
+inline constexpr const char* kGraphCountFloorAttrJson = ",\"counts_floor\":true";
+
+// ---- the root-relative path disclosure, ONE sentence for every verb that emits root= --------------------
+// R-E fix (2026-08-19): the root-relative round gave 30 first screens a root= attribute and defined it in
+// none of them. test/legendcoveragecheck.sh caught it, and its baseline file may only be edited DOWNWARD —
+// so the fix is the TEXT, not a baseline line. Hoisted here rather than pasted into eighteen legends: it is
+// one claim, --grep already shipped it, and a second wording would be exactly the §B4 echo-site drift this
+// header exists to stop. Each emitter concatenates it into its own legend (a trailing "%s" before the -->).
+// It is emitted as its OWN comment, immediately after the verb's legend and before the root element, rather
+// than spliced into eighteen string literals: legendcoveragecheck's legendOf() reads the whole LEADING RUN
+// of comments, so an adjacent comment IS the legend, and one shared literal cannot drift from itself the way
+// eighteen hand-edited tails can. Emit it through rootRelPathsLegend( bool ) so the text appears exactly when
+// root= does — a legend that defines an attribute the document did not emit is the mirror-image false claim.
+inline constexpr const char* kRootRelPathsLegend =
+    "<!-- root= on this element is the crawl root every p= below is RELATIVE to (single-root runs only; absent => p= is the path ingest itself used, unchanged). -->";
+
+// `on` is the emitter's own root=-present condition, never a re-derivation of it.
+inline const char* rootRelPathsLegend( bool on ) noexcept { return on ? kRootRelPathsLegend : ""; }
+
+// W3-S item 5 (2026-08-19) — the ONE deliberate second wording of the clause above, for the ONE call site
+// (--for's two dialects: CLI main.cpp forLensHeaderText, MCP mcpverbs.h) that cannot afford the 159 B full
+// form: at --token-budget=800 pasting kRootRelPathsLegend verbatim pushed a real fixture from
+// est_tokens=799 to 811 (+1.4%), red test/fornotesbudgetcheck.sh. Recalibrating the shared ceiling
+// constants (serialize.h kMinBytesPerToken/kBudgetHeadroom/kCeilingFirstEntryTolerance) to absorb 33 B for
+// one verb would move every other budget-pinned gate in the tree — a blast radius wildly out of proportion
+// to a 21-byte gap after shortening, so a smaller spelling was the chosen trade-off, not a floor move.
+// Deliberately still only TWO spellings tool-wide (this one, and kRootRelPathsLegend for the other eighteen
+// legends) rather than a third-per-verb drift: both --for dialects share this exact string, the same way
+// they already share every other opener in this file.
+inline constexpr const char* kForRootRelPathsLegendShort =
+    "<!-- root= is the crawl root; p= below is RELATIVE to it (single-root only; absent => p= is ingest's own path, unchanged). -->";
+
+// M10: the SAME clause, plus an at= mention, for the CLI --for path that also stamps at= (single-root AND
+// a git repo — a single-root run over a non-git directory gets root= alone, kForRootRelPathsLegendShort
+// above, never a false at= claim). Folded into ONE comment rather than a second "<!-- -->" pair: at this
+// verb's measured byte ceiling (fornotesbudgetcheck.sh), the 7-byte wrapper overhead was the difference
+// between fitting and not. Kept maximally terse (24 B over the root=-only form, ~10 tokens) — the full
+// kAtStampLegend sentence every other stamped verb affords is not affordable here; see the comment above
+// kForRootRelPathsLegendShort for the same trade-off's original measurement.
+inline constexpr const char* kForRootRelAtLegendShort =
+    "<!-- root= is the crawl root; p= below is RELATIVE to it (single-root only; absent => p= is ingest's own path, unchanged); at=this commit(+dirty). -->";
+
+// `rootOn` is the emitter's own root=-present condition; `atOn` is its at=-present condition (gitAtAttr
+// non-empty) — never re-derived from each other, since a non-git single-root run has rootOn without atOn.
+// Row 6 (2026-09-12): the sc= and route= readings on a --for bundle, ONE spelling for the CLI lens and the MCP
+// `for` twin. sc= is the short id (the enclosing scope; a row's full id composes as p::sc::n — see
+// serialize.h writeScopeAttr) and route= is a CODE now, not prose: name-exact(X) / subtoken+body[:broad|
+// :declined(word;carriers,defs)], with the anchors: clause riding after it on a name-exact route. On the CLI
+// lens this clause is CEILING-DROPPABLE (verbs_for.h rung zero, with the confidence and tail clauses): the
+// attributes stay on every rung, only the reading goes, and kForLegendDroppedNote names it. No "--" anywhere:
+// it rides inside an XML comment, where a double hyphen is ill-formed (G4).
+// TERSE ON PURPOSE, and measured four times. These clauses ride EVERY default --for answer, so their bytes are
+// bounded by what the same change SAVED on that header: the route= code replaces 84 B of prose on a conceptual
+// route and 32 B on a name-exact one. A 259 B first spelling (2026-09-12) grew a 2.9 KB fixture bundle by 10%
+// and tripped forrankordercheck's 4% ratchet; a 123 B second spelling still left the header 39 B heavier than
+// before on a conceptual route and tipped two rungs that sat at zero slack on main (forrootlegendcheck arm2,
+// est_tokens 798 of 800; fornotesbudgetcheck 1640) — the ladder's first-entry tolerance let a document ship
+// over_ceiling="1" without reaching rung zero, so a droppable clause was no protection at those rungs (fixed
+// in verbs_for.h: rung zero now fires on the EXACT ceiling).
+// SPLIT IN TWO, present-only, 2026-09-13. The sc= rule rides every answer, because every scoped row carries
+// sc=. The route= code rides only the answers whose root carries route=, exactly as the compact dialect's
+// kForCompactLegendRoute does — and it RIDES, rather than living only in the help text, because a code with no
+// reading anywhere in the document is an undefined first-screen attribute: dropping it opened two new
+// legendcoverage_baseline lines (for-auto, for-budgeted | ctx@route) and that file may only be edited DOWNWARD.
+// The fuller reading of each code (what :broad and :declined(word;carriers,defs) weigh, where the anchors are)
+// still lives once in the help text's no-route entry, the next=/help precedent verbs_for.h records.
+// 29 B + 54 B. No "--" in either clause: they ride inside an XML comment, where a double hyphen is ill-formed (G4).
+inline constexpr std::string_view kForIdRouteLegend =
+    "; sc=scope (full id p::sc::n)";
+inline constexpr std::string_view kForRouteCodeLegend =
+    "; route= name-exact(X)|subtoken+body[:broad|:declined]";
+
+// ---- the MCP `for` dialect's fixed clauses, NAMED (lane r2-LO, 2026-09-19) ----------------------------------
+// mcpverbs.h forTaskText used to spell these inline. They are named so the session dictionary (legenddict.h) holds
+// the SAME bytes the header appends: a ref-posture answer takes a clause out of a legend only where it finds these
+// bytes verbatim AND the session was already served them, so a clause spelled twice would silently stop being
+// dropped (the answer stays honest — it just keeps the clause inline). Byte-identical to the inline spellings.
+// No "--" in any of them: they ride inside an XML comment (G4).
+inline constexpr std::string_view kMcpForBuildingBlocksLegend =
+    ": reusable building blocks (cx=complexity, in=reuse-count) — prefer composing/reusing these over reimplementing";
+inline constexpr std::string_view kMcpForBundleSigsLegend =
+    "; bundle=sigs: signatures only in this bundle, no inline bodies — fetch a symbol's full body with the fetch_body verb";
+inline constexpr std::string_view kMcpForLensColumnsLegend =
+    "; lens=\"churn,amp,tested\": the three per-row quality columns the CLI for lens carries and this dialect"
+    " does NOT (they need a git and a quality pass this server does not run per request); an absent column here"
+    " means NOT MEASURED, never measured-and-zero; est_tokens= prices this bundle in tokens";
+// budget_bytes='s reading, spliced before the header's close on a bundle the default ceiling trimmed — both --for
+// dialects (verbs_for.h, mcpverbs.h) spell the same sentence.
+inline constexpr std::string_view kForBudgetBytesNote =
+    " [budget_bytes= is the default BYTE ceiling this ranked payload was shaped against; it bounds that payload, not the whole document est_tokens prices]";
+// The prose of the two root-relative comments above, as the dictionary quotes it. Asserted to sit inside them, so the
+// wrapper constants and these cannot drift apart.
+inline constexpr std::string_view kForRootRelProse =
+    "root= is the crawl root; p= below is RELATIVE to it (single-root only; absent => p= is ingest's own path, unchanged)";
+inline constexpr std::string_view kForAtStampProse = "; at=this commit(+dirty)";
+static_assert( std::string_view( kForRootRelPathsLegendShort ).find( kForRootRelProse ) == 5 && std::string_view( kForRootRelAtLegendShort ).find( kForRootRelProse ) == 5 && std::string_view( kForRootRelAtLegendShort ).find( kForAtStampProse ) == 5 + kForRootRelProse.size(),
+               "the root-relative --for comments and the prose the session dictionary quotes from them drifted apart" );
+
+// ONE decision about what these two readings ARE for a given answer. Two surfaces APPEND them (the CLI lens's
+// forLensHeaderText, the MCP `for` twin) and both must then EXEMPT exactly those bytes from the signature-trim
+// charge — four sites mirroring one rule by hand, which is the shape that ships a ledger 64 B short and
+// underflows a subtraction (verbs_for.h records that exact incident for the confidence clause). The caller asks
+// once and uses `.sc`/`.route` to append and `.bytes()` to exempt, so the two can only ever agree.
+struct ForIdRouteLegendParts
+{
+    std::string_view sc; // "" when no served row carries a scope
+    std::string_view route; // "" when this root carries no route=
+
+    std::size_t bytes() const noexcept { return sc.size() + route.size(); }
+};
+
+inline ForIdRouteLegendParts forIdRouteLegendParts( bool legendOn, bool scPresent, bool routePresent ) noexcept
+{
+    if( !legendOn )
+    {
+        return {}; // rung zero took the readings; the attributes stay and the dropped note names them
+    }
+    return { scPresent ? kForIdRouteLegend : std::string_view(),
+             routePresent ? kForRouteCodeLegend : std::string_view() };
+}
+
+inline const char* forRootRelPathsLegendShort( bool rootOn, bool atOn = false ) noexcept
+{
+    if( !rootOn )
+    {
+        return "";
+    }
+    return atOn ? kForRootRelAtLegendShort : kForRootRelPathsLegendShort;
+}
+
+// ---- the per-verb legend OPENERS that more than one emitter prints -------------------------------------
+// Each of these had TWO byte-identical copies (a CLI one in main.cpp, an MCP one in mcpverbs.h) before this
+// header. They are hoisted verbatim-minus-the-fix so the pair cannot drift; the REST of each verb's legend
+// stays with its own emitter, because the CLI and MCP bodies genuinely differ (the CLI --uses legend
+// documents the file:name selector attributes, which the MCP verb does not emit, and describing them there
+// would be a new false claim).
+
+// §H4 disclosure item 2: the retired absolutism. This opener used to read "every use-site of SYM", which the
+// widening round proved false and which no extractor can make true — the sentence promised exhaustiveness
+// over a name-based, statically-extracted reference index. Restated as what IS true.
+inline constexpr const char* kUsesLegendOpen =
+    "<!-- codecortex uses: STATICALLY RESOLVABLE use-sites of SYM (role=call|macro|read|write|import|extends|type; p=file:line) — a floor, see counts_floor below; that role list is the whole vocabulary. role=\"type\" is a bare TYPE mention (a signature, declaration or template argument) with NO call edge — real but not an invocation, so it never reaches the call graph, PageRank or the ranked map; captured C/C++/ObjC only, and only a plain leaf spelling (a qualified or aliased spelling contributes no row). A base clause is role=\"extends\", never role=\"type\"; a type's own DEFINITION is never a use of itself. role=\"macro\" is the call-shaped invocation of a name uniquely naming an indexed function-like #define — never role=\"call\" (an expansion is not a plain call); a name shared with a non-macro definition stays role=\"call\". Rows are ordered SOURCE first, then test/bench, then docs, by path within a tier. A MEMBER selector (Owner.field) is resolved per site instead of name-matched — that run's legend says how. "
+    // M12: in_id= was emitted (here and on --verify's uses()/unused() <u> rows) with no clause anywhere
+    // defining it — a reader had to guess it was the CALLER's canonical id from shape alone. Written to the
+    // shortest honest form, deliberately: test/graphlegendbudgetcheck.sh's ratchet exists to stop the shared
+    // prose essay re-inflating, and a missing honesty fact is not a licence to spend 370 B stating it.
+    "in_id=canonical id (root-relative path::scope::name) of the symbol the site sits INSIDE; a scope-less enclosing symbol degrades to its bare name; <file-scope> is the file's MODULE SCOPE, owning a top-level or anonymous-callback CALL; absent for other roles there. "; // LB-G, #60
+
+// The member-variable round (card A3): the clause the `Owner.field` answer appends to the opener above — ONLY
+// on that answer, so the name-matched --uses legend keeps its byte budget (test/graphlegendbudgetcheck.sh) and
+// every attribute the member form emits is defined where the reader meets it (test/legendcoveragecheck.sh's
+// rule). Shared by both surfaces through fielduses.h.
+inline constexpr const char* kUsesFieldLegend =
+    "MEMBER FORM: member=Owner.field is the ONE field this selector resolved to and every row is a use of THAT field, resolved per site (never the union of every name-alike): this->f, self.f and a bare f inside the owner's own methods pin to the owner; v.f/v->f pins through v's recorded declared type (a typed local or parameter, or a member of the enclosing class); otherwise EVERY owner declaring f is a candidate and the row carries owner_candidates=K (K candidate owners) — never a silent pin, and no locality tie-break. A chained or unclassifiable receiver (a.b.f, g().f) is always ambiguous. pinned=rows resolved to exactly one owner amb_sites=rows carrying owner_candidates= owners_of_name=fields sharing this name corpus-wide. role=write is an assignment target, compound assignment or an increment/decrement; pass-by-non-const-reference and address-of are NOT claimed as writes. NOT SEEN (each a disclosed miss, never a widened definition): a field reached through a copied pointer or reference (no alias analysis), a C macro whose expansion is a member access, an inherited field named bare in a derived class's method, a field named inside a lambda tree-sitter scopes outside the method, `.c` bodies (the value-use pass is C++/ObjC/Python; C struct fields are symbols but their .c use-sites are not indexed), static data members (not fields). Served for C, C++ and Python fields; a member selector on any other language refuses by name. ";
+
+// --impact's opener, identical on both surfaces before this header.
+inline constexpr const char* kImpactLegendOpen =
+    "<!-- codecortex impact: transitive blast radius — symbols that reach SYM via calls (review before changing SYM). "
+    // P3 (L7): next= defined where the reader meets it (nextverb.h kNextLegendClause is the shared half)
+    "next= is the one pasteable follow-up (the safe-delete read of SYM). ";
+
+// ── LB-H (r10 GitNexus round) — the IMPORT TIER's own definition ─────────────────────────────────────────
+// --impact answered "what breaks if I change this" with CALL reach only. On webpack, --impact=ChunkGraph
+// returned 25 reaching symbols and no trace of the 8 files that require("./ChunkGraph") — not the files
+// and not a count saying they were uncounted, so the omission was invisible at the point of use.
+//
+// The two reaches are reported SIDE BY SIDE AND NEVER SUMMED (CLAUDE.md non-negotiable #3): they are
+// different units (symbols vs files) measured over different evidence (a named call vs a named file), so
+// one merged number would be a quantity nothing in the tool can define. Hence a second count with its own
+// noun-prefixed shown_/capped pair (pageview.h rule 6, the SECONDARY-listing form) and its own row tag,
+// rather than extra rows inside reaches=.
+//
+// legendcoveragecheck's rule: every root attribute a reader meets on the first screen is defined where
+// they meet it — importers=, shown_importers=, importers_capped= and the via=/lazy= row attributes are all
+// here.
+//
+// lazy= (kParserVer 72, fnbody-require lane): a TS/JS `require("./x")` / dynamic `import("./x")` written
+// INSIDE A FUNCTION BODY is still a real dependency — the importer tier must still name the file — but a
+// WEAKER one than a top-level require: it only fires if and when that function actually runs (webpack's
+// own lib/index.js lazy-getter barrel, `get ChunkGraph() { return require("./ChunkGraph"); }`, is the
+// shape that motivated capturing it at all). Ruby joined the lane at parser version 82 (`autoload`, lazy by
+// definition), 83 (a constant receiver inside a method/lambda/block) and 93 (a constant argument likewise; a
+// rescue class always, since Ruby evaluates the exception list only while matching), so the legend names the
+// closure, not a language. lazy="1" on a row means EVERY edge from that importer into SYM's def file(s) is one of
+// these closure-written directives; lazy="0" means at least one is load-time (an ordinary top-level
+// require/import, a class-body or file-level receiver), so the dependency also holds at load.
+inline constexpr const char* kImpactImportTierLegend =
+    "importers= is a SECOND, weaker reach: the files that directly include/import a file defining SYM, as <f via=\"import\" p=\"…\" lazy=\"0|1\"/> rows after the symbol rows — not call reach, never added to reaches= (different units, files vs symbols; an importer may use a different symbol from that file, or none at all). DIRECT (one hop), never the transitive include cone. lazy=\"1\" means every one of that importer's edges into SYM's file is written INSIDE A CLOSURE (a TS/JS require()/import() in a function body, a Ruby constant receiver or argument in a method/lambda/block, a Ruby autoload or rescue class), firing only if and when it runs; lazy=\"0\" means at least one edge is load-time. shown_importers=/importers_capped= disclose that listing's own truncation (importers= stays the full count); limit=/offset= window the symbol rows only. ";
+
+// The columnar form re-serializes the SYMBOL rows as parallel arrays and has no row shape for a second
+// listing, so it carries importers= alone. Said in band rather than left as a shape difference a reader
+// has to notice: a count with no rows beside it otherwise reads as a bug.
+//
+// G4: this string is emitted INSIDE an XML comment, so it may not contain a double hyphen. Naming the
+// sibling dialect as "--json" put one there and xmllint caught it on the first run — the flag spelling is
+// written without its dashes here for that reason, not by oversight.
+inline constexpr const char* kImpactImportTierColumnarLegend =
+    "importers= is a SECOND, weaker reach: the files that directly include/import a file defining SYM. It is not call reach and is never added to reaches=. Under format=columnar the import-tier rows are not emitted in this form (it re-serializes the symbol rows only) — the count is the whole of it here; the default XML form and the json dialect carry the per-file rows. ";
+
+// A6: the same testSymbolForwardReach lens as --safe-delete's radius_tested=/radius_untested= (README:1025),
+// applied here over reaches= instead of safe-delete's impact_reaches= — same measurement, same names, one
+// definition. kTestedRowLegend (above) defines the per-row half; this defines the root partition alone.
+inline constexpr const char* kImpactTestedPartitionLegend =
+    "radius_tested=/radius_untested= partition reaches= by that same lens (transitive, unlike callers/callees). ";
+
+// F-02 (round-4 audit): THE LENS'S OWN BLIND SPOT, said where the partition is read.
+//
+// testSymbolForwardReach walks CALL EDGES out of the symbols isTestSymbol recognises — a doctest TEST_CASE, a
+// Python `def test_*`, and their siblings. A test that drives a BUILT BINARY as a subprocess is not a call
+// edge and never will be, so it contributes nothing to this partition. That is not a defect of the lens; it
+// is a defect of the DOCUMENT that reported radius_untested="48" on this repo's own src/ — tested almost
+// entirely by ~500 test/*.sh gates driving the CLI — with nothing in its legend to say what "untested" meant.
+// The test-gate verb's legend already discloses exactly this split (its script_gates_ counters and the
+// evidence=script_literal join); the three graph verbs that ship the partition did not, and a reader who only
+// ever calls those never meets the caveat. Grepping the pre-fix callers legend for
+// subprocess|shell|CLI-level|process boundary|script_literal returned zero hits.
+//
+// PLACEMENT follows the "0 bytes when inert" rule: this rides beside the partition it qualifies and nowhere
+// else. The surfaces carrying only the per-row tested="1" form (kTestedRowLegend, on the for and pack-task
+// lenses) pay nothing, and neither does uses, which has no tested lens at all.
+//
+// G4: this sits inside an XML comment, so no double hyphen may appear — flag names are written without their
+// dashes here for the same reason kImpactImportTierColumnarLegend states, not by oversight.
+inline constexpr const char* kTestedLensBlindSpotLegend =
+    "BLIND SPOT the test-gate legend also names: only a CALL EDGE from an INDEXED test symbol counts here, so a shell or CLI-level test running a built binary as a SUBPROCESS is invisible to it and a repo tested that way reads all-untested. Read untested= as no in-process test reaches it, not as no test covers it. ";
+
+// A6 (survey card A6, agent-lsp): the tested/untested partition --impact/--callers/--callees rows now carry
+// — ONE definition for the per-row half, shared verbatim across every verb it appears on (a second copy of
+// the identical sentence is exactly the echo-site drift class this file exists to prevent). tested="1" only
+// (never a literal 0) reuses the SAME absence-meaningful convention every other tested= site already follows
+// (serialize.h/verbs_for.h): an untested row costs 0 legend-defined bytes, a tested one costs one attribute.
+inline constexpr const char* kTestedRowLegend =
+    "tested=\"1\" on a row means an indexed test transitively reaches it (never 0, omitted when it does not). ";
+
+// The same lens in the COLUMNAR form (2026-09-12). A parallel array cannot omit a false entry, so --callers/--callees/--impact
+// --format=columnar carry it as a dense <tested> column (columnar.h emitColumnarTestedColumn): 1 where graph.h isTestedByReach
+// holds, 0 on every other row, a test symbol's row included. Those forms printed kTestedRowLegend's "never 0" beside a column of
+// zeros (test/fixture's --callers=distance read <tested>0,0</tested>), so they read the column instead, in the words of
+// compactlegend.h's compact column reading. Gate: test/impactpartitioncheck.sh arm (5).
+inline constexpr const char* kTestedColumnLegend =
+    "tested= is a dense column in this form: fields= names tested, and <tested> holds one value per row: 1 = a non-test row an indexed test transitively reaches; 0 = none found, or a test row. ";
+
+// --callers / --callees shipped NO legend at all (0 bytes on both, which is why every one of their root
+// attributes sits in test/legendcoverage_baseline.txt). ONE legend serves both forms: the two verbs are one
+// code path with the edge direction flipped, and giving them two descriptions is precisely the per-verb
+// vocabulary §3.4 forbids.
+inline constexpr const char* kCallHierarchyLegendOpen =
+    "<!-- codecortex callers/callees: the 1-hop call hierarchy read off the call graph — the callers form lists symbols that CALL of=; the callees form lists symbols of= itself calls. of= is the selector you passed, defs= how many DEFINITIONS it resolved to (rows UNION every def's neighbours), count= the DISTINCT neighbour symbols (a floor, per counts_floor=), windowed by limit= and offset=. A neighbour that is an indexed function-like #define is a macro row (t=\"macro\", role=\"macro\" on the XML row): the edge crosses a macro expansion, not a plain call — rows carry no role= otherwise. Rows are ordered SOURCE first, then test/bench, then docs, by path within a tier. hop_tested=/hop_untested= partition count= by the tested= lens below (1-hop, never transitive). "; // LB-G
+
+// V1 fix (verifier finding 3, 2026-08-15): bodyless_defs= is a CALLEES-only attribute — main.cpp's emitter
+// gates it behind `!wantCallers`, so a --callers document can never carry it. It used to sit inside
+// kCallHierarchyLegendOpen above, which both forms print, so every --callers call paid ~235 B for a clause
+// it could never need. Appended only on the callees form (see the call site in main.cpp), so the clause
+// still appears verbatim wherever the attribute CAN appear — legendcoveragecheck's callees-side coverage is
+// unaffected; only the callers-side dead weight is gone.
+inline constexpr const char* kCallHierarchyLegendCalleesOnly =
+    "callees-only: bodyless_defs= (when present) counts defs= that are bodyless declarations (header-only or forward-declared); zero callees may mean no body to read callees from, not truly no dependencies. ";
+
+// The callers answer's next= reading in its two forms. callHierarchyNextSelector (callhierarchy.h) decides which
+// one the emitter printed, and callHierarchyLegendOpen repeats that decision rather than re-deriving it.
+inline constexpr const char* kCallersNextSelectorLegend = "next= is the one pasteable follow-up (the uses verb on this selector: the call sites). ";
+inline constexpr const char* kCallersNextBareNameLegend = "next= is the one pasteable follow-up (the uses verb on the called name: all same-named definitions' call sites, including sites bound to other definitions, because a declined call names no single definition). ";
+
+// The tested lens's reading for the form a document takes: an XML row omits a false tested=, the columnar array prints 0.
+// ONE choice for --callers/--callees (callHierarchyLegendOpen below) and --impact (verbs_navigate.h runImpact), so the verbs
+// cannot disagree about which form reads which sentence.
+inline constexpr const char* testedLensLegend( bool isColumnar ) noexcept
+{
+    return isColumnar ? kTestedColumnLegend : kTestedRowLegend;
+}
+
+// The composed opener, one call for the caller — keeps the wantCallers/callees branch out of
+// runCallHierarchy (already this file's largest dispatcher) rather than adding a ternary at the call site.
+inline std::string callHierarchyLegendOpen( bool wantCallers, bool nextUsesBareName, bool isColumnar )
+{
+    const char* const callersNextClause = nextUsesBareName ? kCallersNextBareNameLegend : kCallersNextSelectorLegend;
+    const char* const testedClause = testedLensLegend( isColumnar );
+    // F-02: the blind-spot clause rides with hop_tested=/hop_untested=, which both forms always carry.
+    // P3 (L7): next= defined where the reader meets it — callers hand over the SITES (the uses verb on the same
+    // selector, its @FILE:LINE spelling mirrored), callees the BODY whose callees these are (expand).
+    // nextUsesBareName is the emitter's OWN decision, never re-derived here; no double hyphen in comment text.
+    return wantCallers ? std::string( kCallHierarchyLegendOpen ) + testedClause + kTestedLensBlindSpotLegend + callersNextClause
+                       : std::string( kCallHierarchyLegendOpen ) + testedClause + kTestedLensBlindSpotLegend + kCallHierarchyLegendCalleesOnly + "next= is the one pasteable follow-up (expand on this selector: the body). ";
+}
+
+// ── LB-G (r10 GitNexus round) — the DISPLAY-CAP clause the neighbour verbs share ─────────────────────────
+// --callers/--callees/--uses grew a default row cap (pageview.h kCallHierarchyRowCap / kUseSiteRowCap), so
+// their first screen can now carry shown=/capped= — and by legendcoveragecheck's rule an attribute a reader
+// meets on the first screen has to be defined where they meet it. One literal for three verbs, for the same
+// reason kRootRelPathsLegend was hoisted out of eighteen: a second wording is echo-site drift waiting to
+// happen. It supersedes kPageRaiseCapClause for these three (that fragment defines limit= alone; this one
+// defines the whole pair the cap actually emits) — --grep and --impact keep the shorter one, which is what
+// their own baselines and gates are pinned against.
+//
+// EMITTED CONDITIONALLY, by capLegendClause() below. That is not byte-shaving for its own sake: these three
+// verbs shipped for their whole life with no cap, so an answer that drops nothing must stay byte-identical
+// to what it was — and THE TRUNCATION VOCABULARY (pageview.h) names exactly this shape conformant, citing
+// --skill-scan, which emits the shown=/capped= pair only on a capped scan. Same rule the callees-only
+// clause above already follows: a call never pays for vocabulary it cannot emit.
+inline constexpr const char* kNeighbourCapLegend =
+    "shown= is how many rows this answer PRINTED and capped=\"1\" says a default display cap dropped some; count= above stays the true total, never the page's length. A cut answer also carries total=/has_more=/next_offset= so a paging loop can continue from it: raise the default cap with limit=N (offset=M pages); on the root, limit=\"0\" means no explicit limit was given and the verb's own default page size shaped the window — never a zero-row page. ";
+
+// `active` is pageDisclosure()'s own activity decision, passed in rather than re-derived, so the clause and
+// the attributes it defines can never disagree about whether they are present.
+inline const char* capLegendClause( bool active ) noexcept
+{
+    return active ? kNeighbourCapLegend : "";
+}
+
+// ── TIER-3 DECLINES — declined_calls= on the callers, callees and impact answers (test/declinecheck.sh) ────
+// A call whose candidates are two or more same-language definitions, none in the caller's file or directory,
+// and that no qualifier or receiver rule pinned, gets NO edge: the resolver declines to guess. Until this
+// clause the decline was also SILENT, so count="0" read as "no caller exists" about a call the resolver had
+// seen. One sentence for the three answers and their MCP twins, emitted exactly when the attribute is:
+// declinedCallsLegend( bool ) takes the emitter's own attribute-present condition, never a re-derivation. No
+// double hyphen anywhere, because it lands inside an XML comment.
+inline constexpr const char* kDeclinedCallsLegend =
+    "declined_calls=K (absent when 0) counts call SITES the resolver declined to bind: the called name has two or more same-language definitions, none in the caller's file or directory, and no qualifier, receiver type or include chose one, so no edge exists and no count or row here includes them (the map header's declined=). Callers form: declined calls that could have meant this selector's definitions; impact form: that could have reached SYM or a symbol in its radius; callees form: declined calls these definitions make. Each call counts once however many candidates it had; the uses verb on the called name lists the sites. ";
+inline const char* declinedCallsLegend( bool on ) noexcept { return on ? kDeclinedCallsLegend : ""; }
+
+// ONE absent-at-zero count attribute: ` name="N"`, or nothing at all when count is 0. declined_calls= below and
+// --skipped's extent_suspect_files=/macro_blanked_files= (root) and extent_suspect_syms=/macro_blanked= (<h> rows)
+// all spell through it, so the shape has one definition instead of a copy per verb.
+inline std::string countAttrXmlOrEmpty( std::string_view name, std::size_t count )
+{
+    return count > 0 ? " " + std::string( name ) + "=\"" + std::to_string( count ) + "\"" : std::string();
+}
+
+// The attribute and the key, one spelling each, absent at zero like bodyless_defs= and graph_unindexed=.
+inline std::string declinedCallsAttrXml( std::size_t declinedCalls )
+{
+    return countAttrXmlOrEmpty( "declined_calls", declinedCalls );
+}
+inline std::string declinedCallsKeyJson( std::size_t declinedCalls )
+{
+    return declinedCalls > 0 ? ",\"declined_calls\":" + std::to_string( declinedCalls ) : std::string();
+}
+
+// ── THE DECL→DEF RESIDUE — unproven_defs= on the callers/callees answers (test/decltodefcheck.sh arm E2) ──
+// H1's fix (graph.h::declToDefFollowThrough) stopped a `file:name` selector from answering with same-named
+// definitions it could not tie to the file it named. What it DROPS has to be said: without this clause and
+// its attribute a dropped candidate reaches the reader as `count="0"`, which is the silent zero #63 exists to
+// kill — the fix would have traded one honesty defect for another. BOTH directions carry it, unlike
+// bodyless_defs= above: that one is callees-only because a declaration has no callees to read, and the
+// residue has no such asymmetry — a selector whose definitions could not be tied to its file is equally
+// unanswered whichever edge direction was asked.
+//
+// EMITTED EXACTLY WHEN THE ATTRIBUTE IS (unprovenDefsLegend takes the emitter's own condition, never a
+// re-derivation) — this header's own rootRelPathsLegend rule: a legend that defines an attribute the
+// document did not emit is the mirror-image false claim. That is also why graphlegendbudgetcheck's pins did
+// not move: it measures a BARE-NAME selector, which never reaches the widening, so the shared essay is
+// byte-identical there. Same shape graphUnindexedLegend( bool ) already uses, and for the same two reasons.
+//
+// G4: inside an XML comment, so no double hyphen — `file:name` is written without dashes for that reason.
+inline constexpr const char* kUnprovenDefsLegend =
+    "unproven_defs=K (absent when 0) counts same-named DEFINITIONS this file:name selector found and could not tie to the file it named: they are NOT in defs= and no row or count here includes them. A declaration widens to the definitions it stands for only where the definition is IN the named file, or its own file includes the named file, resolved path-precisely; a same-named body anywhere else is not evidence and is never served. Widen the selector to the bare NAME, or to Scope::name, to see them. ";
+inline const char* unprovenDefsLegend( bool on ) noexcept { return on ? kUnprovenDefsLegend : ""; }
+
+// ── issue #60: the module-scope owner's clause, emitted exactly when a t="modscope" ROW is in the answer ──
+// A file-scope call (a top-level statement, or a call inside an anonymous callback body) used to have no
+// caller node, so --callers/--impact answered with a row short. It now has one, and the row's t= is a kind
+// no reader has met before — so the kind needs its reading where the reader meets it, and NOWHERE else:
+// `on` is the emitter's own "this page holds such a row" condition, never a re-derivation, so a corpus
+// with no module-scope call pays 0 bytes and test/graphlegendbudgetcheck.sh's pins (measured on selectors
+// that reach no such row) did not move. Same shape, and the same two reasons, as unprovenDefsLegend above.
+// G4: no double hyphen — this lands inside an XML comment.
+inline constexpr const char* kModScopeLegend =
+    "t=\"modscope\" is a row for a file's MODULE SCOPE, named <file-scope>: the statements outside every named definition, which is where a top-level call and an anonymous callback body's calls live. It is a CALLER, not a function — nothing in the source can name it, so it never appears as a callee, and it has no body, so expanding it returns none. A file that has no such call has no such row. ";
+inline const char* modScopeLegend( bool on ) noexcept { return on ? kModScopeLegend : ""; }
+
+// The same fact in --for's two dialects, which are prose strips joined by ';' and ':' rather than XML comment
+// clauses — one constant each so the wording cannot drift from kModScopeLegend above. Present-only, on that
+// verb's own `modScopePresent` bit (verbs_for.h), like every other clause in those two strips.
+inline constexpr std::string_view kForCompactModScopeClause =
+    "; t=modscope n=<file-scope>: a file's MODULE SCOPE (top-level statements + anonymous callback bodies) — a caller, never a callee, with no body to expand";
+inline constexpr std::string_view kForModScopeClause =
+    " A row or hop named <file-scope> (t=\"modscope\") is a file's MODULE SCOPE — the statements outside every named definition, where a top-level call and an anonymous callback body's calls live. It is a CALLER, never a callee, and has no body to expand.";
+
+// The attribute and the key, one spelling each, absent at zero — through the shared countAttrXmlOrEmpty
+// above, so this cannot become a second spelling of bodyless_defs='s hand-rolled idiom.
+inline std::string unprovenDefsAttrXml( std::size_t unprovenDefs )
+{
+    return countAttrXmlOrEmpty( "unproven_defs", unprovenDefs );
+}
+inline std::string unprovenDefsKeyJson( std::size_t unprovenDefs )
+{
+    return unprovenDefs > 0 ? ",\"unproven_defs\":" + std::to_string( unprovenDefs ) : std::string();
+}
+
+// ── THE SAME RESIDUE ON THE VERBS THAT READ THE SAME RESOLVER — safe-delete, impact, path (decltodefcheck arm E2e) ──
+// resolveAllByNameQualified serves --safe-delete, --impact (and the MCP impact twin) and --path (and path_between)
+// exactly as it serves --callers, so a `file:name` selector whose definitions were dropped reached THOSE readers as
+// callers="0" risk="none-found", reaches="0" and reachable="0": the silent zero E2 closed on the callers form, on the
+// verb whose answer a reader acts on as "safe to delete". The attribute is the one the callers form carries —
+// unprovenDefsAttrXml / unprovenDefsKeyJson above, and compactlegend.h's existing unproven_defs row reads it off any
+// root — so the vocabulary does not grow. What differs per verb is what the dropped definitions are MISSING FROM, and
+// that is the clause: the callers sentence names defs= and rows, while --path has from_defs=/to_defs= and a yes/no,
+// and --safe-delete has a risk= value computed from counts that never walked them.
+//
+// One clause per verb, one shared proof-and-widen tail, emitted exactly when the attribute is (the caller passes its
+// own attribute-present condition, the unprovenDefsLegend( bool ) rule above). kUnprovenDefsLegend states the same
+// proof rule inline and is left byte-for-byte as it is: the callers/callees emitter that selects it is not this
+// change's, and its bytes are pinned there.
+//
+// G4: inside an XML comment, so no double hyphen anywhere. Each clause OPENS with `unproven_defs=` — the house form,
+// and the attribute test/compactlegendcheck.sh (S) reduces a conditionally-selected clause to.
+inline constexpr const char* kUnprovenDefsImpactLegend =
+    "unproven_defs=K (absent when 0) counts same-named DEFINITIONS this file:name selector found and could not tie to the file it named: they are NOT in defs=, the walk never started from them, and so none of their callers or importers is in reaches=, importers=, the radius partition or any row. ";
+inline constexpr const char* kUnprovenDefsPathLegend =
+    "unproven_defs=K (absent when 0) counts same-named DEFINITIONS a file:name endpoint found and could not tie to the file it named, summed over from= and to= (a bare NAME endpoint never adds to it): they are NOT in from_defs= or to_defs=, the search neither started nor ended at them, and so reachable= and hops= say nothing about a path through them. ";
+inline constexpr const char* kUnprovenDefsSafeDeleteLegend =
+    "unproven_defs=K (absent when 0) counts same-named DEFINITIONS this file:name selector found and could not tie to the file it named: they are NOT in defs=, and callers=, impact_reaches=, uses=, the tested partition and dead_code_candidate= were all read without them. So risk= describes defs= alone, and risk=none-found beside unproven_defs= is an INCOMPLETE read, never a sign that the name can go. ";
+// AND ON uses, mentions, verify AND affected (decltodefcheck arms E2i..E2m). The same resolver serves four more readers,
+// and on the same repro each met the drop as a zero with nothing beside it: uses count="0" (a call site is kept only where
+// it resolves to a def in defs=), mentions docs="0" (graph.h stores a doc edge on a body, never on a declaration, so the
+// declaration that stays carries none), verify count="0" or verdict="not-established" with limit= naming the model's
+// floor instead, and affected tests="0" reached="0". Same attribute, same tail, one clause each for what is missing.
+// verify's legend is a closed literal (verify.h kVerifyLegend), so runVerify wraps its clause as its own comment.
+inline constexpr const char* kUnprovenDefsUsesLegend =
+    "unproven_defs=K (absent when 0) counts same-named DEFINITIONS this file:name selector found and could not tie to the file it named: they are NOT in defs=, so a role=\"call\" site whose call resolves to one of them is in neither count= nor the rows (call_sites_of_name= still counts it). ";
+inline constexpr const char* kUnprovenDefsMentionsLegend =
+    "unproven_defs=K (absent when 0) counts same-named DEFINITIONS this file:name selector found and could not tie to the file it named: they are NOT in defs=, and a doc edge is stored on a definition's body, never on a declaration, so a doc whose edge lands only on them is in neither docs=, sections= nor the rows. ";
+inline constexpr const char* kUnprovenDefsVerifyLegend =
+    "unproven_defs=K (absent when 0) counts same-named DEFINITIONS a file:name symbol argument found and could not tie to the file it named, summed over both symbols of calls(): they are NOT in defs=, from_defs=, to_defs= or target_defs=, so no call path, witness or role=\"call\" site that reaches only them was read. verdict=confirmed or refuted still stands on the evidence it prints; verdict=not-established beside unproven_defs= is an INCOMPLETE read that limit= does not name, never a sign the claim is false. ";
+inline constexpr const char* kUnprovenDefsAffectedLegend =
+    "unproven_defs=K (absent when 0) counts same-named DEFINITIONS a file:name item found and could not tie to the file it named, summed item by item (a path item adds 0): they are NOT in seeds=, the caller walk never started from them, and so a test that reaches only them is in neither tests=, reached= nor the rows. A bare NAME item that also matches an indexed path is read as that path. ";
+// AND ON edit-check, lego, connect, around AND slice (decltodefcheck arms E2n..E2t). --lego, --connect and --around resolve
+// through resolveFocus, the lowest-id projection of the same resolver, so a drop left the DECLARATION as their focus;
+// --edit-check and --slice read the whole match set, and a set holding that one declaration is answered about it. On the
+// same repro each read a zero with nothing beside it: edit-check callers="0" incompatible="0" — a false "no broken caller"
+// when the dropped definition is the one whose caller stopped binding — lego implementors="0", connect edges="0" groups="0",
+// around the declaration's own row as the whole neighbourhood, and slice uses="0". Same attribute, same tail, one clause
+// each for what is missing; the edit-check clause addresses incompatible= by name, as the safe-delete clause does risk=.
+inline constexpr const char* kUnprovenDefsEditCheckLegend =
+    "unproven_defs=K (absent when 0) counts same-named DEFINITIONS this file:name selector found and could not tie to the file it named: the contract compared is the declaration p= names, and callers=, incompatible= and the c rows were read from that declaration alone, so a caller of only those definitions is in neither count nor any row. incompatible=\"0\" beside unproven_defs= is an INCOMPLETE read, never a sign that the edit breaks no caller. ";
+inline constexpr const char* kUnprovenDefsLegoLegend =
+    "unproven_defs=K (absent when 0) counts same-named DEFINITIONS this file:name selector found and could not tie to the file it named: the iface row is the declaration the selector named, and implementors= and the impl and m rows were read from it alone, so a type that extends or implements only those definitions is in neither implementors= nor any row. ";
+inline constexpr const char* kUnprovenDefsConnectLegend =
+    "unproven_defs=K (absent when 0) counts same-named DEFINITIONS a file:name terminal found and could not tie to the file it named, summed over the terminals (a bare NAME terminal never adds to it): that terminal's row is the declaration it named, the search never started from those definitions, and so nodes=, edges=, groups= and every unconnected row say nothing about a join through them. ";
+inline constexpr const char* kUnprovenDefsAroundLegend =
+    "unproven_defs=K (absent when 0) counts same-named DEFINITIONS this file:name selector found and could not tie to the file it named: the neighbourhood is centred on the declaration the selector named, the walk never started from those definitions, and so none of their callers or callees is a row here. ";
+inline constexpr const char* kUnprovenDefsSliceLegend =
+    "unproven_defs=K (absent when 0) counts same-named DEFINITIONS this file:name selector found and could not tie to the file it named: the slice read the declaration p= names, so defs=, uses=, vars= and every row describe that declaration's own text and nothing inside those definitions' bodies. ";
+// AND WHERE THE ANSWER IS NARROWER RATHER THAN ZERO (decltodefcheck arms E2u..E2z): expand and outline served the
+// declaration's text alone, and owners covered the declaration's file under defs="1". expand and outline share one <ctx>
+// root, so one clause names both and the count is summed over their items.
+inline constexpr const char* kUnprovenDefsExpandLegend =
+    "unproven_defs=K (absent when 0) counts same-named DEFINITIONS the file:name items of expand and outline found and could not tie to the file each named, summed item by item (a bare NAME item adds 0): they are NOT among the bodies, whole files or outlines served here, so this answer holds the text of the declarations those items named and none of theirs. ";
+inline constexpr const char* kUnprovenDefsOwnersLegend =
+    "unproven_defs=K (absent when 0) counts same-named DEFINITIONS this file:name selector found and could not tie to the file it named: they are NOT in defs=, and this report covers the declaration's file alone, so nothing here says who owns theirs. ";
+inline constexpr const char* kUnprovenDefsProofTail =
+    "A declaration widens to the definitions it stands for only where the definition is IN the named file, or its own file includes the named file, resolved path-precisely; a same-named body anywhere else is not evidence and is never served. Widen the file:name spelling to the bare NAME, or to Scope::name, to include them. ";
+
+// Append-only: unprovenDefsVerbLegend below indexes its clause rows by this order.
+enum class UnprovenDefsVerb : std::uint8_t
+{
+    Impact,
+    Path,
+    SafeDelete,
+    Uses,
+    Mentions,
+    Verify,
+    Affected,
+    EditCheck,
+    Lego,
+    Connect,
+    Around,
+    Slice,
+    Expand,
+    Owners,
+};
+
+// `on` is the emitter's own `unprovenDefs > 0`, never a re-derivation; "" otherwise, so an answer that dropped
+// nothing stays byte-identical on every one of these verbs.
+//
+// ONE ROW PER UnprovenDefsVerb, in enum order. The rows are spelled INSIDE the arm that selects them rather than in a
+// named table: test/compactlegendcheck.sh (S) counts a clause as conditionally emitted when a ?: arm names it, and a
+// table declared elsewhere would take every row out of its population. A ternary chain names them too, at a nesting
+// that grows by one with every verb.
+inline std::string unprovenDefsVerbLegend( UnprovenDefsVerb verb, bool on )
+{
+    const char* const clause = on ? std::array { kUnprovenDefsImpactLegend, kUnprovenDefsPathLegend, kUnprovenDefsSafeDeleteLegend,
+                                                 kUnprovenDefsUsesLegend, kUnprovenDefsMentionsLegend, kUnprovenDefsVerifyLegend,
+                                                 kUnprovenDefsAffectedLegend, kUnprovenDefsEditCheckLegend, kUnprovenDefsLegoLegend,
+                                                 kUnprovenDefsConnectLegend, kUnprovenDefsAroundLegend, kUnprovenDefsSliceLegend,
+                                                 kUnprovenDefsExpandLegend, kUnprovenDefsOwnersLegend }[std::size_t( verb )]
+                                  : nullptr;
+    return clause != nullptr ? std::string( clause ) + kUnprovenDefsProofTail : std::string();
+}
+
+// The same clause as its OWN comment, for a verb whose legend is a closed literal the clause cannot be spliced into
+// (kLegoLegend, kConnectHeader) or a run of comments (the map legend --around extends). `opener` is that verb's
+// `<!-- codecortex VERB: ` spelling, so compactlegend.h strips it as the prose it is and its term table states the compact
+// reading. "" when `on` is false, so an answer that dropped nothing is byte-identical.
+inline std::string unprovenDefsVerbComment( UnprovenDefsVerb verb, bool on, std::string_view opener )
+{
+    return on ? std::string( opener ) + unprovenDefsVerbLegend( verb, true ) + "-->" : std::string();
+}
+
+// M12's writeMultiRootTable/multiRootTableLegend (the multi-root roots-table disclosure --callers/--uses
+// reuse from the default map) live in serialize.h, not here: they need escapeXml, and serialize.h includes
+// THIS header (for rootRelPathsLegend) before its own escapeXml definition — putting them here would be
+// circular. See serialize.h, right after escapeXml.
+
+} // namespace rw

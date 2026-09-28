@@ -1,0 +1,167 @@
+<!-- SPDX-License-Identifier: MIT; Copyright (c) 2026 Saurabh Verma -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>CodeCortex Developer Console</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><img src="/codecortex-logo-header.png" alt="CodeCortex" class="brand-logo" /><span class="sub">Developer Intelligence Console</span></div>
+    <div class="context-bar"><label>Project <select id="projectContext" class="context-select"></select></label><span id="repoContext" class="context-meta">repository —</span><span id="sessionContext" class="context-meta">session —</span><div id="health" class="pill">checking…</div></div>
+  </header>
+  <nav id="nav">
+    <button data-view="overview" class="active">Overview</button>
+    <button data-view="how-it-works">How it works</button>
+    <button data-view="graph">Graph</button>
+    <button data-view="sessions">Sessions</button>
+    <button data-view="memories">Memories</button>
+    <button data-view="lessons">Lessons</button>
+    <button data-view="actions">Actions</button>
+    <button data-view="crystals">Crystals</button>
+    <button data-view="timeline">Timeline</button>
+    <button data-view="audit">Audit</button>
+    <button data-view="activity">Activity</button>
+    <button data-view="profile">Profile</button>
+    <button data-view="replay">Replay</button>
+    <button data-view="health">Health</button>
+  </nav>
+  <main>
+    <section id="overview" class="view active">
+      <div class="hero"><div><div class="eyebrow">CURRENT RUN</div><h1 id="runId">No run telemetry yet</h1></div><button id="refresh">Refresh</button></div>
+      <div class="grid metrics">
+        <article><span>Tokens</span><b id="tokens">—</b><small id="tokensSource" class="metric-source">NOT AVAILABLE</small></article>
+        <article><span>Tool calls</span><b id="toolCalls">—</b><small id="toolCallsSource" class="metric-source">NOT AVAILABLE</small></article>
+        <article><span>Repeated work</span><b id="repeat">—</b><small id="repeatSource" class="metric-source">NOT AVAILABLE</small></article>
+        <article><span>Duration</span><b id="duration">—</b><small id="durationSource" class="metric-source">NOT AVAILABLE</small></article>
+        <article><span>Current tool</span><b id="currentTool">—</b><small id="currentToolSource" class="metric-source">NOT AVAILABLE</small></article>
+        <article><span>Tool failures</span><b id="toolFailures">—</b><small id="toolFailuresSource" class="metric-source">NOT AVAILABLE</small></article>
+        <article><span>Sessions</span><b id="sessionCount">—</b></article>
+        <article><span>Memories</span><b id="memoryCount">—</b></article>
+      </div>
+      <div class="split">
+        <article class="panel"><h2>Run signal</h2><div id="runSignal" class="empty">Telemetry will appear here as coding-agent hooks publish events.</div></article>
+        <article class="panel"><h2>Developer memory</h2><div id="memorySummary" class="empty">CodeCortex Memory-backed memories, lessons, actions and crystals appear when connected.</div></article>
+      </div>
+      <div class="split evidence-split">
+        <article class="panel"><div class="section-head"><div><div class="eyebrow">DEVELOPER PRODUCTIVITY &amp; EVIDENCE</div><h2>Productivity signal</h2></div><span class="truth-label">No savings claim without A/B evidence</span></div><div id="productivitySignal" class="empty">Observed productivity signals will appear when run telemetry is available.</div></article>
+        <article class="panel"><div class="section-head"><div><div class="eyebrow">VERIFICATION</div><h2>Verification status</h2></div></div><div id="verificationStatus" class="empty">Impact, test and proof evidence will appear here.</div></article>
+      </div>
+      <article class="panel command-panel">
+        <h2>Safe command center</h2>
+        <div class="command-row">
+          <select id="commandName"><option value="analyze">Analyze repository</option><option value="impact">Find impact</option><option value="callers">Show callers</option><option value="callees">Show callees</option><option value="around">Open graph neighborhood</option><option value="tests">Test gate</option><option value="quality">Quality panel</option><option value="doctor">Doctor</option></select>
+          <input id="commandTarget" placeholder="symbol target when required" /><button id="runCommand">Run</button>
+        </div><pre id="commandOutput">No command run yet.</pre>
+      </article>
+    </section>
+
+    <section id="how-it-works" class="view how-view">
+      <div class="how-hero">
+        <div>
+          <div class="eyebrow">HOW CODECORTEX WORKS</div>
+          <h1>Your coding agent still codes. CodeCortex gives it the right engineering context.</h1>
+          <p>CodeCortex is a local-first developer intelligence layer that connects through MCP, understands your repository, remembers engineering history, observes supported runtime activity, and helps verify the result.</p>
+        </div>
+        <div class="how-badge">Local-first · MCP-native · Evidence-based</div>
+      </div>
+
+      <div class="how-flow panel">
+        <div class="how-flow-step"><span>1</span><strong>Your coding tool</strong><small>Codex · Claude Code · Gemini · any compatible MCP client</small></div>
+        <div class="how-arrow">→</div>
+        <div class="how-flow-step"><span>2</span><strong>CodeCortex MCP</strong><small>One local intelligence surface for tools, graph, memory and proof</small></div>
+        <div class="how-arrow">→</div>
+        <div class="how-flow-step"><span>3</span><strong>Better engineering outcome</strong><small>More context, less waste, clearer verification</small></div>
+      </div>
+
+      <div class="how-grid">
+        <article class="how-card accent-blue"><div class="how-icon">◎</div><h3>Understand</h3><p>Maps symbols, callers, dependencies, impact radius, tests, architecture and hotspots before the model explores blindly.</p></article>
+        <article class="how-card accent-violet"><div class="how-icon">◈</div><h3>Remember</h3><p>Reuses project-scoped lessons, prior failures, decisions and historical engineering context instead of relearning everything.</p></article>
+        <article class="how-card accent-cyan"><div class="how-icon">↯</div><h3>Observe</h3><p>Captures CodeCortex activity and, where the host exposes it, sessions, tool calls, edits, tests and usage telemetry.</p></article>
+        <article class="how-card accent-green"><div class="how-icon">✓</div><h3>Verify</h3><p>Separates structural evidence from observed execution and keeps “agent finished” distinct from engineering proof.</p></article>
+      </div>
+
+      <div class="how-columns">
+        <article class="panel how-process">
+          <div class="eyebrow">FROM REQUEST TO RESULT</div><h2>What happens during a development task</h2>
+          <div class="process-list">
+            <div><span>01</span><b>You ask for work</b><small>Example: “Fix this retry bug.”</small></div>
+            <div><span>02</span><b>CodeCortex scopes the code</b><small>Relevant symbols, dependencies, impact and likely tests.</small></div>
+            <div><span>03</span><b>Prior knowledge is recalled</b><small>Previous failures, lessons and project memory when available.</small></div>
+            <div><span>04</span><b>Your coding agent executes</b><small>The host remains responsible for reasoning, editing and tool use.</small></div>
+            <div><span>05</span><b>CodeCortex observes</b><small>Only facts actually exposed by the host are marked as observed.</small></div>
+            <div><span>06</span><b>The result is checked</b><small>Impact, tests and proof state remain visible to the developer.</small></div>
+          </div>
+        </article>
+        <article class="panel how-value">
+          <div class="eyebrow">NORTH STAR</div><h2>What CodeCortex is trying to improve</h2>
+          <div class="value-list">
+            <div><span class="value-dot blue"></span><b>Accuracy</b><small>Right code, right impact, right evidence.</small></div>
+            <div><span class="value-dot teal"></span><b>Efficiency</b><small>Less repeated discovery and unnecessary work.</small></div>
+            <div><span class="value-dot violet"></span><b>Speed</b><small>Faster path to useful evidence and verification.</small></div>
+            <div><span class="value-dot amber"></span><b>Clarity</b><small>Understand what happened, why and what remains unresolved.</small></div>
+            <div><span class="value-dot green"></span><b>Guardrails</b><small>Keep project scope, tests, memory and proof honest.</small></div>
+          </div>
+        </article>
+      </div>
+
+      <div class="how-columns">
+        <article class="panel">
+          <div class="eyebrow">EVIDENCE SOURCES</div><h2>Where CodeCortex gets its knowledge</h2>
+          <div class="evidence-grid">
+            <div><b>Structural</b><small>Code graph · callers · dependencies · impact · tests</small></div>
+            <div><b>Historical</b><small>Runs · Git context · lessons · failures · decisions</small></div>
+            <div><b>Observed</b><small>MCP tool activity and host runtime events when exposed</small></div>
+            <div><b>Host-reported</b><small>Session · model · tokens · cost only when the host actually reports them</small></div>
+          </div>
+          <div class="truth-note">CodeCortex never invents telemetry a coding host does not expose.</div>
+        </article>
+        <article class="panel">
+          <div class="eyebrow">LOCAL-FIRST DEPLOYMENT</div><h2>Designed to live beside your code</h2>
+          <div class="local-diagram">
+            <div class="local-box primary">Your laptop</div>
+            <div class="local-stack"><span>Source code</span><span>Git</span><span>CodeCortex graph</span><span>Project memory</span><span>Developer dashboard</span></div>
+            <div class="local-connector">↑ stdio MCP ↓</div>
+            <div class="local-box">Codex · Claude · Gemini · other MCP client</div>
+          </div>
+          <small class="muted">Recommended: local stdio MCP. Localhost HTTP is optional for clients that prefer it.</small>
+        </article>
+      </div>
+
+      <article class="panel graph-guide">
+        <div class="eyebrow">READING THE GRAPH</div><h2>Graph nodes should answer a developer question, not just show topology</h2>
+        <div class="graph-guide-grid">
+          <div><span class="guide-node run">R</span><b>Run</b><small>Observed coding session or work unit</small></div>
+          <div><span class="guide-node symbol">S</span><b>Symbol</b><small>Function, class or code symbol</small></div>
+          <div><span class="guide-node file">F</span><b>File</b><small>Repository file involved in the work</small></div>
+          <div><span class="guide-node test">T</span><b>Test</b><small>Selected or observed verification</small></div>
+          <div><span class="guide-node memory">M</span><b>Memory</b><small>Prior project knowledge reused</small></div>
+          <div><span class="guide-node error">!</span><b>Failure</b><small>Error or failed engineering step</small></div>
+        </div>
+        <div class="edge-guide"><span><i class="edge-solid"></i> observed runtime evidence</span><span><i class="edge-dashed"></i> structural repository relationship</span></div>
+      </article>
+    </section>
+
+    <section id="graph" class="view graph-view">
+      <div class="graph-header"><div><div class="eyebrow">DEVELOPER KNOWLEDGE GRAPH</div><h2>See what the agent did, what the code means, and what changed</h2><small id="graphContext" class="muted">project context loading…</small></div><div class="graph-legend-inline"><span><i class="legend-run"></i>run</span><span><i class="legend-symbol"></i>symbol</span><span><i class="legend-file"></i>file</span><span><i class="legend-test"></i>test</span><span><i class="legend-memory"></i>memory</span><span><i class="legend-error"></i>error</span></div></div>
+      <div class="graph-shell"><div class="graph-canvas-wrap" id="graph-canvas-wrap"><canvas id="graph-canvas"></canvas><div class="graph-tooltip" id="graph-tooltip"></div><div class="graph-controls"><button onclick="CodeCortexGraph.zoom(1)" title="Zoom in">+</button><button onclick="CodeCortexGraph.zoom(-1)" title="Zoom out">−</button><button onclick="CodeCortexGraph.recenter()" title="Recenter">⌖</button></div></div><aside class="graph-sidebar" id="graph-sidebar"><div class="empty">Waiting for graph data…</div></aside></div>
+    </section>
+
+    <section id="sessions" class="view"><div class="split"><div class="panel"><div class="section-head"><div><div class="eyebrow">WORK HISTORY</div><h2>Sessions</h2></div><span id="sessionsMeta" class="muted"></span></div><div id="sessionsList" class="list"></div></div><aside id="sessionDetail" class="panel session-detail"><div class="empty">Select a session to inspect its evidence.</div></aside></div></section>
+    <section id="memories" class="view"><div class="panel"><div class="section-head"><div><div class="eyebrow">DURABLE CONTEXT</div><h2>Memories</h2></div><span id="memoriesMeta" class="muted"></span></div><input id="memoriesSearch" class="surface-search" placeholder="Search memories…" /><div id="memoriesList" class="card-list"></div></div></section>
+    <section id="lessons" class="view"><div class="panel"><div class="section-head"><div><div class="eyebrow">LEARNED ENGINEERING KNOWLEDGE</div><h2>Lessons</h2></div><span id="lessonsMeta" class="muted"></span></div><input id="lessonsSearch" class="surface-search" placeholder="Search lessons…" /><div id="lessonsList" class="card-list"></div></div></section>
+    <section id="actions" class="view"><div class="panel"><div class="section-head"><div><div class="eyebrow">FOLLOW-UPS</div><h2>Actions</h2></div><span id="actionsMeta" class="muted"></span></div><input id="actionsSearch" class="surface-search" placeholder="Search actions…" /><div id="actionsList" class="card-list"></div></div></section>
+    <section id="crystals" class="view"><div class="panel"><div class="section-head"><div><div class="eyebrow">COMPLETED-WORK SNAPSHOTS</div><h2>Crystals / Run Snapshots</h2></div><span id="crystalsMeta" class="muted"></span></div><input id="crystalsSearch" class="surface-search" placeholder="Search snapshots…" /><div id="crystalsList" class="card-list"></div></div></section>
+    <section id="timeline" class="view"><div class="panel"><div class="section-head"><div><div class="eyebrow">ORDERED EVIDENCE</div><h2>Timeline</h2></div><select id="timelineRun" class="compact-select"></select></div><div id="timelineList" class="timeline"></div></div></section>
+    <section id="audit" class="view"><div class="panel"><div class="section-head"><div><div class="eyebrow">GOVERNANCE</div><h2>Audit</h2></div><span id="auditMeta" class="muted"></span></div><div id="auditList" class="list"></div></div></section>
+    <section id="activity" class="view"><div class="panel"><div class="section-head"><div><div class="eyebrow">LIVE FEED</div><h2>Activity</h2></div><span class="live-dot">● live</span></div><div id="activityList" class="activity-feed"></div></div></section>
+    <section id="profile" class="view"><div class="panel"><div class="section-head"><div><div class="eyebrow">PROJECT INTELLIGENCE</div><h2>Profile</h2></div><select id="profileProject" class="compact-select"></select></div><div id="profileContent" class="profile-grid"></div></div></section>
+    <section id="replay" class="view"><div class="panel"><div class="section-head"><div><div class="eyebrow">SESSION REPLAY</div><h2>Replay</h2></div><div class="replay-controls"><select id="replayRun" class="compact-select"></select><button id="replayPrev">◀</button><button id="replayPlay">▶</button><button id="replayNext">▶|</button></div></div><div class="replay-progress"><div id="replayBar"></div></div><div class="replay-layout"><div id="replayList" class="replay-list"></div><div id="replayDetail" class="replay-detail empty">Choose a session.</div></div></div></section>
+    <section id="health" class="view"><div class="health-grid"><article class="panel"><div class="section-head"><div><div class="eyebrow">SERVICE STATUS</div><h2>CodeCortex health</h2></div></div><div id="healthCards" class="status-grid"></div></article><article class="panel"><div class="section-head"><div><div class="eyebrow">END-TO-END</div><h2>Runtime wiring</h2></div></div><div id="wiringFlow" class="wiring-flow"></div></article><article class="panel health-raw"><h2>Raw health</h2><pre id="healthJson"></pre></article></div></section>
+  </main>
+  <script src="/graph.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

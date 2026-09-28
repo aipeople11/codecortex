@@ -1,0 +1,816 @@
+#pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
+
+// scip.h — the SCIP precision overlay (Wave 4 #15): consume a Sourcegraph
+// SCIP index (`--scip=index.scip`) as an OPTIONAL, zero-dependency precision layer over the name-based
+// call graph. Where the index covers a reference site, its resolution REPLACES codecortex's name-based
+// guess and the resulting edge is tagged `prov="scip"` so the honesty gauges (amb= / ambiguous=) report
+// exactly how much of the graph is precise vs guessed.
+//
+// Zero dependencies: we hand-roll the MINIMAL protobuf WIRE reader we need — varint decode, length-
+// delimited fields, and field-skipping — walking only the ~4 message paths that matter:
+//   Index    { documents = 2 }                                            (repeated Document)
+//   Document { relative_path = 1, occurrences = 2, symbols = 3 }
+//   Occurrence { range = 1 (repeated int32, packed, DEPRECATED), symbol = 2, symbol_roles = 3,
+//                single_line_range = 8, multi_line_range = 9 }
+//   SymbolInformation { symbol = 1, display_name = 6 }                     (display only; optional)
+// Field numbers VERIFIED against https://raw.githubusercontent.com/sourcegraph/scip/main/scip.proto
+// (fetched during implementation): Index.documents=2, Document.relative_path=1/occurrences=2/symbols=3,
+// Occurrence.range=1/symbol=2/symbol_roles=3, SymbolInformation.symbol=1/display_name=6,
+// SymbolRole.Definition = 0x1 (bit 0). A SCIP `range` is [startLine, startChar, endChar] (3 ints, same
+// line) or [startLine, startChar, endLine, endChar] (4 ints); all 0-based. codecortex `Symbol::line` is
+// 1-based, so we map scipStartLine + 1 ↔ symbol.line.
+//
+// Degrade, never throw (house style): a missing / unreadable / corrupt / truncated / mismatched-tree
+// index emits ONE DISCLOSE and returns an EMPTY overlay — the pipeline proceeds name-based,
+// byte-identical to a run with no --scip. The wire reader is bounds-checked on every read so a hostile
+// or truncated blob can never over-read (the fuzz gate flips/truncates bytes and asserts no crash).
+
+#include "model.h"
+#include "scipoverlay.h"        // ScipEdge / ScipCover / ScipOverlay — the data struct (also used by graph.h)
+#include "gitmine.h"            // resolveFileSuffix — map a SCIP relative_path to a codecortex fileId
+#include "infra/Diagnostics.h"   // DISCLOSE
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include "infra/os.h"   // os::open + O_NONBLOCK + os::fcntl — scipReadFile's own non-blocking open of the index; os::fstat + S_ISREG —
+                        // it reads a regular file only; os::close — a descriptor stdio never adopted
+
+namespace rw
+{
+
+// ---- minimal protobuf wire reader ------------------------------------------------------------------
+// A bounds-checked cursor over a byte span. Every accessor returns false on under-read (never over-reads
+// past `end`), so a truncated / corrupt blob degrades cleanly rather than reading out of bounds. Wire
+// types we handle: 0 = varint, 2 = length-delimited; 1 (i64) and 5 (i32) are skipped by fixed width.
+namespace scipwire
+{
+    struct Reader
+    {
+        const std::uint8_t* p   = nullptr;
+        const std::uint8_t* end = nullptr;
+
+        bool atEnd()  const noexcept { return p >= end; }
+        bool ok()     const noexcept { return p <= end; }
+
+        // LEB128 varint (≤ 10 bytes). Returns false on truncation / overlong encoding. The 10th byte (shift 63) may carry
+        // ONE payload bit: anything more does not fit a uint64, so it is a malformed field, never a value to keep the low
+        // bit of (the shift that dropped it was also a G1 `integer` abort — test/scipcheck.sh arm 5c).
+        bool varint( std::uint64_t& out ) noexcept
+        {
+            std::uint64_t v = 0;
+            for( int shift = 0; shift < 64; shift += 7 )
+            {
+                if( p >= end )
+                {
+                    return false; // truncated
+                }
+                const std::uint8_t b = *p++;
+                if( shift == 63 && ( b & 0x7F ) > 1 )
+                {
+                    return false; // payload past bit 63 → corrupt
+                }
+                v |= std::uint64_t( b & 0x7F ) << shift;
+                if( ( b & 0x80 ) == 0 ) { out = v; return true; }
+            }
+            return false;                                       // overlong (> 10 bytes) → corrupt
+        }
+
+        // a tag = (fieldNumber << 3) | wireType.
+        bool tag( std::uint32_t& fieldNumber, std::uint32_t& wireType ) noexcept
+        {
+            std::uint64_t t = 0;
+            if( !varint( t ) )
+            {
+                return false;
+            }
+            fieldNumber = std::uint32_t( t >> 3 );
+            wireType    = std::uint32_t( t & 0x7 );
+            return true;
+        }
+
+        // a length-delimited field → a sub-span [q, q+len). Bounds-checked against `end`.
+        bool lenDelim( const std::uint8_t*& q, std::size_t& len ) noexcept
+        {
+            std::uint64_t n = 0;
+            if( !varint( n ) )
+            {
+                return false;
+            }
+            if( n > std::uint64_t( end - p ) )
+            {
+                return false; // length runs past the buffer → corrupt
+            }
+            q   = p;
+            len = std::size_t( n );
+            p  += n;
+            return true;
+        }
+
+        // skip a field of the given wire type (for the fields we don't care about). Returns false on
+        // truncation / an unknown wire type (3/4 = deprecated groups — treat as corrupt, degrade).
+        bool skip( std::uint32_t wireType ) noexcept
+        {
+            switch( wireType )
+            {
+                case 0: { std::uint64_t v; return varint( v ); }                       // varint
+                case 1:
+                {
+                    if( end - p < 8 )
+                    {
+                        return false;
+                    }
+                    p += 8;
+                    return true;
+                } // i64
+                case 5:
+                {
+                    if( end - p < 4 )
+                    {
+                        return false;
+                    }
+                    p += 4;
+                    return true;
+                } // i32
+                case 2: { const std::uint8_t* q; std::size_t n; return lenDelim( q, n ); }   // length-delimited
+                default: return false;                                                 // 3/4 groups → corrupt
+            }
+        }
+    };
+}   // namespace scipwire
+
+// ---- SCIP structural decode (proto → plain records, no codecortex mapping yet) -------------------------
+// One occurrence as the wire yields it: 0-based start line + the SCIP symbol string + the role bitfield.
+struct ScipOccurrence
+{
+    std::int64_t startLine = -1;    // start line from range[0] or typed_range; -1 if absent / malformed
+    std::string  symbol;            // the SCIP symbol string (e.g. "scip-clang … `A::f`().")
+    std::uint32_t roles = 0;        // symbol_roles bitfield; bit 0 (0x1) = Definition
+};
+
+struct ScipDocument
+{
+    std::string                 relativePath;
+    std::vector<ScipOccurrence> occurrences;
+};
+
+// parse a packed-or-unpacked `repeated int32 range` field → its first element (the start line). SCIP
+// emits `range` packed (wire type 2) but we also accept the unpacked form defensively. We only need
+// range[0] (the definition/reference start line) for the (file,line) mapping.
+inline std::int64_t scipDecodeRangeStart( const std::uint8_t* q, std::size_t len ) noexcept
+{
+    scipwire::Reader r{ q, q + len };
+    std::uint64_t    first = 0;
+    if( !r.varint( first ) )
+    {
+        return -1;
+    }
+    return std::int64_t( first );
+}
+
+// parse a SingleLineRange / MultiLineRange sub-message -> its start line. Both messages carry the
+// start line in field 1 (SingleLineRange.line, MultiLineRange.start_line). proto3 omits a zero, so a
+// sub-message that carries no field 1 is line 0, not a malformed range.
+inline std::int64_t scipDecodeTypedRangeStart( const std::uint8_t* q, std::size_t len ) noexcept
+{
+    scipwire::Reader r{ q, q + len };
+    while( !r.atEnd() )
+    {
+        std::uint32_t field = 0, wire = 0;
+        if( !r.tag( field, wire ) )
+        {
+            return -1;
+        }
+        if( field == 1 && wire == 0 )
+        {
+            std::uint64_t v;
+            if( !r.varint( v ) )
+            {
+                return -1;
+            }
+            return std::int64_t( v );
+        }
+        if( !r.skip( wire ) )
+        {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+// decode one Occurrence sub-message.
+inline bool scipDecodeOccurrence( const std::uint8_t* q, std::size_t len, ScipOccurrence& occ ) noexcept
+{
+    scipwire::Reader r{ q, q + len };
+    bool             typed = false;   // a typed_range outranks the deprecated `range`, per scip.proto
+    while( !r.atEnd() )
+    {
+        std::uint32_t field = 0, wire = 0;
+        if( !r.tag( field, wire ) )
+        {
+            return false;
+        }
+        if( field == 1 && wire == 2 )                                   // range (packed int32)
+        {
+            const std::uint8_t* rp; std::size_t rn;
+            if( !r.lenDelim( rp, rn ) )
+            {
+                return false;
+            }
+            if( !typed )
+            {
+                occ.startLine = scipDecodeRangeStart( rp, rn );
+            }
+        }
+        else if( field == 1 && wire == 0 )                              // range (unpacked): first int = start line
+        {
+            std::uint64_t v;
+            if( !r.varint( v ) )
+            {
+                return false;
+            }
+            if( !typed && occ.startLine < 0 )
+            {
+                occ.startLine = std::int64_t( v );
+            }
+        }
+        else if( ( field == 8 || field == 9 ) && wire == 2 )            // typed_range: single_line_range | multi_line_range
+        {
+            const std::uint8_t* rp; std::size_t rn;
+            if( !r.lenDelim( rp, rn ) )
+            {
+                return false;
+            }
+            occ.startLine = scipDecodeTypedRangeStart( rp, rn );
+            typed         = true;
+        }
+        else if( field == 2 && wire == 2 )                              // symbol (string)
+        {
+            const std::uint8_t* sp; std::size_t sn;
+            if( !r.lenDelim( sp, sn ) )
+            {
+                return false;
+            }
+            occ.symbol.assign( reinterpret_cast<const char*>( sp ), sn );
+        }
+        else if( field == 3 && wire == 0 )                              // symbol_roles (int32)
+        {
+            std::uint64_t v;
+            if( !r.varint( v ) )
+            {
+                return false;
+            }
+            occ.roles = std::uint32_t( v );
+        }
+        else if( !r.skip( wire ) )
+        {
+            return false; // any other field → skip
+        }
+    }
+    return true;
+}
+
+// decode one Document sub-message → relativePath + occurrences.
+inline bool scipDecodeDocument( const std::uint8_t* q, std::size_t len, ScipDocument& doc ) noexcept
+{
+    scipwire::Reader r{ q, q + len };
+    while( !r.atEnd() )
+    {
+        std::uint32_t field = 0, wire = 0;
+        if( !r.tag( field, wire ) )
+        {
+            return false;
+        }
+        if( field == 1 && wire == 2 )                                   // relative_path (string)
+        {
+            const std::uint8_t* sp; std::size_t sn;
+            if( !r.lenDelim( sp, sn ) )
+            {
+                return false;
+            }
+            doc.relativePath.assign( reinterpret_cast<const char*>( sp ), sn );
+        }
+        else if( field == 2 && wire == 2 )                              // occurrences (repeated Occurrence)
+        {
+            const std::uint8_t* op; std::size_t on;
+            if( !r.lenDelim( op, on ) )
+            {
+                return false;
+            }
+            ScipOccurrence occ;
+            if( !scipDecodeOccurrence( op, on, occ ) )
+            {
+                return false;
+            }
+            doc.occurrences.push_back( std::move( occ ) );
+        }
+        else if( !r.skip( wire ) )
+        {
+            return false; // relative_path_bytes / symbols / text / … → skip
+        }
+    }
+    return true;
+}
+
+// decode the top-level Index → its Documents. Returns false on any corruption (caller degrades).
+inline bool scipDecodeIndex( const std::uint8_t* data, std::size_t size, std::vector<ScipDocument>& docs ) noexcept
+{
+    scipwire::Reader r{ data, data + size };
+    while( !r.atEnd() )
+    {
+        std::uint32_t field = 0, wire = 0;
+        if( !r.tag( field, wire ) )
+        {
+            return false;
+        }
+        if( field == 2 && wire == 2 )                                   // documents (repeated Document)
+        {
+            const std::uint8_t* dp; std::size_t dn;
+            if( !r.lenDelim( dp, dn ) )
+            {
+                return false;
+            }
+            ScipDocument doc;
+            if( !scipDecodeDocument( dp, dn, doc ) )
+            {
+                return false;
+            }
+            docs.push_back( std::move( doc ) );
+        }
+        else if( !r.skip( wire ) )
+        {
+            return false; // metadata / external_symbols → skip
+        }
+    }
+    return true;
+}
+
+// ---- load the whole file (bounded) -----------------------------------------------------------------
+// Read a .scip file into a byte buffer. Empty on any I/O failure (caller degrades). Bounded at 256 MiB
+// — a SCIP index larger than that on a repo codecortex can parse is almost certainly the wrong file.
+// The open is checked HERE, on its own descriptor: main.cpp's probe closed the descriptor it judged, so by now the path may
+// name something else, and a FIFO put there would block a plain fopen waiting for a writer. So the path is opened O_NONBLOCK
+// (a read-only open of a FIFO returns at once) and fstat on THAT descriptor admits a regular file only; anything else yields
+// no bytes, and loadScipOverlay degrades exactly as for a file emptied after the probe. For a regular file O_NONBLOCK is then
+// cleared (fcntl) before fdopen hands the descriptor to stdio, so everything below is the blocking stdio read the plain
+// fopen gave — the same size bound, the same short-read rule — even on a filesystem that honours O_NONBLOCK for a file.
+inline std::vector<std::uint8_t> scipReadFile( const char* path )
+{
+    std::vector<std::uint8_t> bytes;
+    const int indexFd = os::open( path, O_RDONLY | O_NONBLOCK | O_CLOEXEC );
+    if( indexFd < 0 )
+    {
+        return bytes;
+    }
+    os::stat_t indexStat;
+    const int   statusFlags = ( os::fstat( indexFd, &indexStat ) == 0 && S_ISREG( indexStat.st_mode ) ) ? os::fcntl( indexFd, F_GETFL ) : -1;
+    std::FILE*  f           = ( statusFlags >= 0 && os::fcntl( indexFd, F_SETFL, statusFlags & ~O_NONBLOCK ) == 0 ) ? os::fdopen( indexFd, "rb" ) : nullptr;
+    if( !f )
+    {
+        os::close( indexFd );   // not a regular file, or fcntl/fdopen failed — stdio never adopted the descriptor
+        return bytes;
+    }
+    if( std::fseek( f, 0, SEEK_END ) != 0 ) { std::fclose( f ); return bytes; }
+    const long sz = std::ftell( f );
+    if( sz <= 0 || sz > ( 256L << 20 ) ) { std::fclose( f ); return bytes; }
+    std::rewind( f );
+    bytes.resize( std::size_t( sz ) );
+    const std::size_t got = std::fread( bytes.data(), 1, bytes.size(), f );
+    std::fclose( f );
+    if( got != bytes.size() )
+    {
+        bytes.clear();
+    }
+    return bytes;
+}
+
+// ---- map decoded SCIP → codecortex node ids (the overlay) ---------------------------------------------
+// Strategy (design decision 2):
+//   (a) DEFINITION occurrences (role bit 0x1) build a map scipSymbolString → codecortex NodeId: match the
+//       document's relative_path to a codecortex fileId (suffix match) and scipStartLine+1 to the symbol
+//       DEFINED at that (fileId, line). A def whose file/line does not exist in codecortex's model (the
+//       index covers code codecortex didn't parse) is simply skipped — the overlay stays a subset.
+//   (b) REFERENCE occurrences (NOT definitions) whose scipSymbolString maps (via the def map above) to a
+//       known def produce a precise edge fromSymbol → thatDef. The enclosing `fromSymbol` is taken from
+//       codecortex's OWN parse: the reference codecortex captured at the SAME (fileId, line), whose fromSymbol
+//       is the exact byte-span-attributed enclosing definition. S5 STALENESS GATE: if codecortex parsed NO
+//       reference at (fileId, refLine1), the SCIP ref line does not correspond to a currently-parsed
+//       call site — the index is stale at this line — so the occurrence is DROPPED rather than attached
+//       to whatever current symbol happens to span the stale line. This degrades toward FEWER-but-CORRECT
+//       precise edges (never a wrong one): the prov="scip" edges that remain are trustworthy. The old
+//       "greatest def line ≤ occ line" line-scan silently mis-attributed under staleness; keying on
+//       codecortex's own (file,line)→fromSymbol both fixes that and is strictly more precise than a line-scan.
+// ---- the SCIP symbol's LAST descriptor: what kind of thing an occurrence names, and its bare name ----
+// SCIP symbol grammar: `scheme manager package version descriptor+`, each descriptor one of `ns/`, `Type#`,
+// `term.`, `method().` (or `method(disambiguator).`), `(parameter)`, `meta:`, `macro!`; a file-local is the
+// whole string `local N`. Names may be backtick-quoted. The LAST descriptor is the thing itself. The join
+// needs two facts from it: which descriptor classes can be a codecortex DEFINITION at all (method, type, term
+// — never a parameter, a local or the `__init__:` module meta, which sit on lines that hold OTHER symbols
+// and used to bind them by position), and the bare name, so a definition binds only a SAME-NAMED symbol on
+// its line and a non-definition resolution can be matched to codecortex's own same-named Call reference.
+enum class ScipDescKind : std::uint8_t { Method, Type, Term, Parameter, Local, Other };
+struct ScipDescTail { std::string_view name; ScipDescKind kind; };
+
+inline std::string_view scipDescriptorName( std::string_view head ) noexcept
+{
+    if( !head.empty() && head.back() == '`' )                                       // backtick-quoted name
+    {
+        const std::size_t open = head.rfind( '`', head.size() - 2 );
+        return ( open == std::string_view::npos ) ? head : head.substr( open + 1, head.size() - open - 2 );
+    }
+    std::size_t i = head.size();
+    while( i > 0 )
+    {
+        const char c = head[ i - 1 ];
+        if( c == '/' || c == '#' || c == '.' || c == ':' || c == '!' || c == '(' || c == ')' || c == ' ' )
+        {
+            break;
+        }
+        --i;
+    }
+    return head.substr( i );
+}
+
+inline ScipDescTail scipDescriptorTail( std::string_view sym ) noexcept
+{
+    if( sym.starts_with( "local " ) )
+    {
+        return { sym.substr( 6 ), ScipDescKind::Local };
+    }
+    if( sym.empty() )
+    {
+        return { {}, ScipDescKind::Other };
+    }
+    if( sym.ends_with( ")." ) )                                                       // `method().` / `method(disambig).`
+    {
+        const std::size_t open = sym.rfind( '(' );
+        return { scipDescriptorName( sym.substr( 0, open == std::string_view::npos ? sym.size() - 2 : open ) ), ScipDescKind::Method };
+    }
+    if( sym.ends_with( ")" ) )                                                        // `(parameter)`
+    {
+        const std::size_t open = sym.rfind( '(' );
+        return { ( open == std::string_view::npos ) ? std::string_view{} : sym.substr( open + 1, sym.size() - open - 2 ), ScipDescKind::Parameter };
+    }
+    const char tail = sym.back();
+    const ScipDescKind kind = ( tail == '#' ) ? ScipDescKind::Type : ( tail == '.' ) ? ScipDescKind::Term : ScipDescKind::Other;
+    return { scipDescriptorName( sym.substr( 0, sym.size() - 1 ) ), kind };
+}
+
+// (a) scipSymbolString → the codecortex def NodeId at (relative_path, startLine+1). A relative_path that
+// maps to no codecortex file, or a def line with no codecortex symbol, is skipped (subset semantics).
+//
+// WHICH definitions may bind, and to WHAT (docs/EVALS.md "Phase 3 — the SCIP join diagnosed"): only a
+// method / type / term descriptor, and only to a symbol of the SAME NAME on that line. The old rule —
+// any definition occurrence, first symbol on the line — bound a parameter (its definition sits on the
+// `def` line) to the enclosing function, and a document-scoped `local N` (its definition can share a
+// line with a module-level assignment) to that symbol for every same-numbered local in every other
+// file: on astropy that was 63,989 + 48,705 phantom "internal" occurrences and a phantom precise edge
+// for each cross-file local that landed on a line with any reference. Locals never bind and are never
+// counted; parameters and meta are remembered in `defSeen` (so a reference to them can be told apart
+// from an external symbol) but bind nothing. `defsUnmatched` counts bindable-class definitions whose
+// line holds no same-named symbol (moved, or a term codecortex extracts no symbol for) — diagnostic only.
+struct ScipDefBinding
+{
+    HashMap<std::string, NodeId>       scipDef;   // bound definitions: symbol string → codecortex NodeId
+    HashMap<std::string, std::uint8_t> defSeen;   // every non-local definition symbol in the index (value unused)
+    std::size_t                        defsUnmatched = 0;
+};
+
+inline ScipDefBinding bindScipDefinitions( const IngestResult& ing, const std::vector<ScipDocument>& docs )
+{
+    // per-file (defLine → NodeId) index, sorted so "first same-named def on the line" is deterministic.
+    struct LineDef { std::uint32_t line; NodeId id; };
+    std::vector<std::vector<LineDef>> defLines( ing.files.size() );
+    for( const Symbol& s : ing.symbols )
+    {
+        if( s.fileId < defLines.size() )
+        {
+            defLines[s.fileId].push_back( { s.line, s.id } );
+        }
+    }
+    for( std::vector<LineDef>& v : defLines )
+    {
+        std::sort( v.begin(), v.end(), []( const LineDef& a, const LineDef& b ) noexcept
+                   { return a.line != b.line ? a.line < b.line : a.id < b.id; } );
+    }
+
+    ScipDefBinding out;
+    for( const ScipDocument& doc : docs )
+    {
+        const std::uint32_t fid = resolveFileSuffix( ing, doc.relativePath );
+        if( fid == UINT32_MAX )
+        {
+            continue; // covers a tree codecortex didn't map
+        }
+        for( const ScipOccurrence& occ : doc.occurrences )
+        {
+            if( !( occ.roles & 0x1u ) || occ.startLine < 0 || occ.symbol.empty() )
+            {
+                continue; // definitions only
+            }
+            const ScipDescTail tail = scipDescriptorTail( occ.symbol );
+            if( tail.kind == ScipDescKind::Local )
+            {
+                continue; // document-scoped; the string is not an identity across files
+            }
+            out.defSeen.emplace( occ.symbol, std::uint8_t( 0 ) );
+            if( tail.kind != ScipDescKind::Method && tail.kind != ScipDescKind::Type && tail.kind != ScipDescKind::Term )
+            {
+                continue; // a parameter / meta / other: never a codecortex definition, never "unmatched"
+            }
+            const std::uint32_t defLine1 = std::uint32_t( occ.startLine ) + 1;                  // 0-based → 1-based
+            bool matched = false;
+            for( const LineDef& ld : defLines[ fid ] )
+            {
+                if( ld.line == defLine1 && std::string_view( ing.symbols[ ld.id ].name ) == tail.name )
+                {
+                    out.scipDef.emplace( occ.symbol, ld.id );   // first SAME-NAMED def on the line wins (id order)
+                    matched = true;
+                    break;
+                }
+            }
+            if( !matched )
+            {
+                ++out.defsUnmatched;
+            }
+        }
+    }
+    return out;
+}
+
+// codecortex's own CALL references keyed (fileId, line) → reference index, sorted, so a SCIP resolution that
+// binds no symbol can be matched to the same-named call edge the resolver committed on that line. Call-role,
+// body-enclosed references only (a file-scope call has no caller to disagree about).
+inline std::vector<std::pair<std::uint64_t, std::uint32_t>> indexCallReferencesByLine( const IngestResult& ing )
+{
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> callRefAt;
+    callRefAt.reserve( ing.references.size() );
+    for( std::size_t i = 0; i < ing.references.size(); ++i )
+    {
+        const Reference& rf = ing.references[ i ];
+        if( rf.role == RefRole::Call && rf.fromSymbol != kNoNode && !rf.isInherit && !rf.isDocLink && !rf.isCompose )
+        {
+            callRefAt.emplace_back( ( std::uint64_t( rf.fileId ) << 32 ) | std::uint64_t( rf.line ), std::uint32_t( i ) );
+        }
+    }
+    std::sort( callRefAt.begin(), callRefAt.end() );
+    return callRefAt;
+}
+
+// A reference occurrence whose symbol bound no definition: a builtin / other package (external), or an
+// in-index parameter, local or un-extracted attribute. If codecortex committed a same-named CALL edge on this
+// line, the index has just disagreed with it, and the census must be able to see that — so the site is
+// transcribed with its kind. Never touches the graph; excluded from the S5 ratio exactly as before.
+inline void transcribeNonDefResolution( const IngestResult& ing, const std::vector<std::pair<std::uint64_t, std::uint32_t>>& callRefAt,
+                                        const ScipDefBinding& binding, std::uint32_t fid, const ScipOccurrence& occ, ScipOverlay& ov )
+{
+    const ScipDescTail tail = scipDescriptorTail( occ.symbol );
+    if( tail.name.empty() )
+    {
+        return;
+    }
+    const std::uint64_t key = ( std::uint64_t( fid ) << 32 ) | ( std::uint64_t( occ.startLine ) + 1 );
+    const auto range = std::equal_range( callRefAt.begin(), callRefAt.end(), std::make_pair( key, std::uint32_t( 0 ) ),
+                                         []( const std::pair<std::uint64_t, std::uint32_t>& a, const std::pair<std::uint64_t, std::uint32_t>& b ) noexcept
+                                         { return a.first < b.first; } );
+    const bool inIndex = tail.kind == ScipDescKind::Local || binding.defSeen.find( occ.symbol ) != binding.defSeen.end();
+    for( auto it = range.first; it != range.second; ++it )
+    {
+        const Reference& rf = ing.references[ it->second ];
+        if( std::string_view( rf.calleeName ) == tail.name )
+        {
+            ov.nonDefCovered.push_back( { rf.fromSymbol, rf.calleeName, inIndex ? kScipNonDefInIndex : kScipNonDefExternal } );
+        }
+    }
+}
+
+// Everything is derived from sorted inputs and the result is sorted+deduped, so the overlay — and thus
+// the graph — is byte-deterministic. `calleeName` in coveredFrom is the codecortex def symbol's NAME, so it
+// matches Reference::calleeName at the buildGraph seam.
+// internalOccurrences / matchedOccurrencesPreDedup (A4-F21): the S5 staleness ratio's denominator and
+// numerator, computed HERE (not via ScipOverlay's own refOccurrences/edgesPinned fields, which are the
+// wrong pair for a ratio — see loadScipOverlay's comment) and handed back to the sole caller by reference.
+//   internalOccurrences        — ref occurrences whose SYMBOL resolved into scipDef (i.e. the index thinks
+//                                 it points at a def in THIS tree). Excludes external refs (the majority in
+//                                 real code — std::/library symbols the index also records but that codecortex
+//                                 never could or should match) from the denominator: those aren't a
+//                                 freshness signal at all, just always-absent noise that deflated the old
+//                                 ratio (denominator = ALL occurrences including externals; a fresh index
+//                                 already "fails" most externals by construction, so old pct << true pct).
+//   matchedOccurrencesPreDedup — of those internal occurrences, how many matched a live (non-stale)
+//                                 codecortex ref line PRE-dedup (every occurrence counted once, not collapsed
+//                                 to unique (from,to) edges the way ov.edgesPinned is). Using the deduped
+//                                 edge count as the numerator against a per-occurrence denominator was the
+//                                 other half of the systematic deflation: N call-sites of the same callee
+//                                 from the same enclosing symbol count as 1 edge but N occurrences.
+inline ScipOverlay buildScipOverlay( const IngestResult& ing, const std::vector<ScipDocument>& docs,
+                                      std::size_t& internalOccurrences, std::size_t& matchedOccurrencesPreDedup )
+{
+    ScipOverlay ov;
+    ov.documentsSeen = docs.size();
+    internalOccurrences        = 0;
+    matchedOccurrencesPreDedup = 0;
+
+    // (a) the definition binding (bindScipDefinitions above): symbol string → NodeId, the seen-set, defsUnmatched.
+    const ScipDefBinding binding = bindScipDefinitions( ing, docs );
+    const HashMap<std::string, NodeId>& scipDef = binding.scipDef;
+    ov.defsUnmatched = binding.defsUnmatched;
+
+    // codecortex's OWN reference sites, keyed (fileId, line) → enclosing fromSymbol. This is the ground truth
+    // the S5 gate matches SCIP ref occurrences against: a codecortex Reference's fromSymbol was attributed by
+    // BYTE-SPAN containment at ingest (authoritative), so it is both immune to the old line-scan's
+    // mis-attribution AND the freshness oracle — a SCIP ref line with no codecortex reference is a STALE line.
+    // A line belongs to exactly one function body, so all refs on one (file,line) share one fromSymbol;
+    // if two ever disagree (nested lambda edge case), keep the smallest NodeId for determinism.
+    HashMap<std::uint64_t, NodeId> refEnclosing;
+    refEnclosing.reserve( ing.references.size() );
+    for( const Reference& rf : ing.references )
+    {
+        if( rf.fromSymbol == kNoNode )
+        {
+            continue; // file-scope ref: no enclosing symbol
+        }
+        const std::uint64_t key = ( std::uint64_t( rf.fileId ) << 32 ) | std::uint64_t( rf.line );
+        const auto it = refEnclosing.find( key );
+        if( it == refEnclosing.end() )
+        {
+            refEnclosing.emplace( key, rf.fromSymbol );
+        }
+        else if( rf.fromSymbol < it->second )
+        {
+            it->second = rf.fromSymbol; // deterministic tie-break
+        }
+    }
+
+    const std::vector<std::pair<std::uint64_t, std::uint32_t>> callRefAt = indexCallReferencesByLine( ing );
+
+    // (b) reference occurrences → precise edges. Enclosing symbol comes from codecortex's own parse at the
+    // SAME (fileId, line); a SCIP ref line with no codecortex reference is STALE and DROPPED (S5 gate).
+    for( const ScipDocument& doc : docs )
+    {
+        const std::uint32_t fid = resolveFileSuffix( ing, doc.relativePath );
+        if( fid == UINT32_MAX )
+        {
+            continue;
+        }
+        for( const ScipOccurrence& occ : doc.occurrences )
+        {
+            if( ( occ.roles & 0x1u ) || occ.startLine < 0 || occ.symbol.empty() )
+            {
+                continue; // references only
+            }
+            ++ov.refOccurrences;                                                                 // ALL ref occurrences seen (incl. external std::/library — diagnostic total, not the ratio denominator)
+            const auto dit = scipDef.find( occ.symbol );
+            if( dit == scipDef.end() )
+            {
+                transcribeNonDefResolution( ing, callRefAt, binding, fid, occ, ov );   // census-only; see the helper
+                continue; // not a bound definition — excluded from the S5 denominator, not a staleness signal
+            }
+            const NodeId to = dit->second;
+            ++internalOccurrences;                                                                // S5 denominator: occurrences the index claims point INTO this tree
+
+            // S5 STALENESS GATE: enclosing symbol = codecortex's own reference at (fid, refLine1). If there is
+            // no codecortex reference at that exact line, the SCIP ref line is stale → DROP (do not attach it to
+            // whatever current symbol spans the stale line — that is the silent mis-attribution this fixes).
+            const std::uint32_t refLine1 = std::uint32_t( occ.startLine ) + 1;
+            const std::uint64_t key      = ( std::uint64_t( fid ) << 32 ) | std::uint64_t( refLine1 );
+            const auto encIt = refEnclosing.find( key );
+            if( encIt == refEnclosing.end() )
+            {
+                continue; // stale ref line → drop, never mis-attribute
+            }
+            const NodeId from = encIt->second;
+            if( from == kNoNode || from == to )
+            {
+                continue; // no enclosing / self-loop
+            }
+            ++matchedOccurrencesPreDedup;                                                         // S5 numerator: matched PRE-dedup (one count per occurrence, not per unique edge)
+
+            ov.coveredFrom.push_back( { from, ing.symbols[ to ].name, to } );                    // callee NAME + pinned target
+        }
+    }
+
+    // sort + dedup coveredFrom by (from, calleeName, to) — deterministic and O(log n) to look up.
+    std::sort( ov.coveredFrom.begin(), ov.coveredFrom.end(), []( const ScipCover& a, const ScipCover& b ) noexcept
+               { if( a.from != b.from ) { return a.from < b.from;
+}
+                 if( a.calleeName != b.calleeName ) { return a.calleeName < b.calleeName;
+}
+                 return a.to < b.to; } );
+    ov.coveredFrom.erase( std::unique( ov.coveredFrom.begin(), ov.coveredFrom.end(),
+                          []( const ScipCover& a, const ScipCover& b ) noexcept
+                          { return a.from == b.from && a.calleeName == b.calleeName && a.to == b.to; } ),
+                          ov.coveredFrom.end() );
+
+    // derive the (from,to)-sorted unique preciseEdges set (the provenance stamp source).
+    ov.preciseEdges.reserve( ov.coveredFrom.size() );
+    for( const ScipCover& c : ov.coveredFrom )
+    {
+        ov.preciseEdges.push_back( { c.from, c.to } );
+    }
+    std::sort( ov.preciseEdges.begin(), ov.preciseEdges.end(), []( const ScipEdge& a, const ScipEdge& b ) noexcept
+               { return a.from != b.from ? a.from < b.from : a.to < b.to; } );
+    ov.preciseEdges.erase( std::unique( ov.preciseEdges.begin(), ov.preciseEdges.end(),
+                           []( const ScipEdge& a, const ScipEdge& b ) noexcept { return a.from == b.from && a.to == b.to; } ),
+                           ov.preciseEdges.end() );
+    ov.edgesPinned = ov.preciseEdges.size();
+
+    // sort + dedup the non-definition transcription by (from, calleeName, kind) — census rows are emitted in
+    // this order, so it must be deterministic and free of the per-occurrence repeats the loop above produces.
+    std::sort( ov.nonDefCovered.begin(), ov.nonDefCovered.end(), []( const ScipNonDef& a, const ScipNonDef& b ) noexcept
+               { if( a.from != b.from ) { return a.from < b.from; }
+                 if( a.calleeName != b.calleeName ) { return a.calleeName < b.calleeName; }
+                 return a.kind < b.kind; } );
+    ov.nonDefCovered.erase( std::unique( ov.nonDefCovered.begin(), ov.nonDefCovered.end(),
+                            []( const ScipNonDef& a, const ScipNonDef& b ) noexcept
+                            { return a.from == b.from && a.calleeName == b.calleeName && a.kind == b.kind; } ),
+                            ov.nonDefCovered.end() );
+    return ov;
+}
+
+// ---- top-level entry: path → overlay (degrade to empty on any failure) -----------------------------
+// The ONE seam main.cpp calls, and only after main.cpp has REFUSED (exit 1) every path that cannot be read as an index at
+// all: one that cannot be opened, an empty regular file, and anything that is not a regular file (a directory, a FIFO, a
+// device) (scipIndexUnreadableReason, owner decision 2026-09-12). Only a path that was a regular, non-empty file at that
+// probe reaches this seam. It degrades with exactly one DISCLOSE and an empty overlay, and the pipeline proceeds
+// name-based, byte-identical to a no---scip run, when the read yields no bytes (an index over the 256 MiB bound, a short
+// read, a file emptied after main.cpp's probe, or a path replaced after it by something that is not a regular file, which
+// scipReadFile's own non-blocking open never reads) or the index is corrupt, truncated or built from a mismatched tree.
+// Never throws.
+inline ScipOverlay loadScipOverlay( std::string_view path, const IngestResult& ing )
+{
+    const std::string             p( path );
+    const std::vector<std::uint8_t> bytes = scipReadFile( p.c_str() );
+    if( bytes.empty() )
+    {
+        DISCLOSE( "--scip: index missing or unreadable — proceeding name-based" );
+        rw::emitTo( stderr, "codecortex --scip: cannot read index '{}' — proceeding name-based\n", p.c_str() );
+        return {};
+    }
+
+    std::vector<ScipDocument> docs;
+    if( !scipDecodeIndex( bytes.data(), bytes.size(), docs ) )
+    {
+        DISCLOSE( "--scip: corrupt/truncated index — proceeding name-based" );
+        rw::emitTo( stderr, "codecortex --scip: corrupt or truncated index '{}' — proceeding name-based\n", p.c_str() );
+        return {};
+    }
+
+    std::size_t internalOccurrences = 0, matchedOccurrencesPreDedup = 0;
+    ScipOverlay ov = buildScipOverlay( ing, docs, internalOccurrences, matchedOccurrencesPreDedup );
+
+    // Distinguish WRONG-TREE (the index maps to a totally different repo — no occurrence in any mappable
+    // document) from SAME-TREE-BUT-STALE (occurrences WERE seen, but few/none matched current lines).
+    // refOccurrences / defsUnmatched are 0 in the wrong-tree case (resolveFileSuffix matched nothing, or
+    // the mapped docs had no occurrences); non-zero once we actually looked at occurrences in mapped files.
+    const bool sawOccurrences = ov.refOccurrences > 0 || ov.defsUnmatched > 0 || ov.edgesPinned > 0;
+
+    if( ov.empty() && !sawOccurrences )
+    {
+        // decoded fine, but nothing mapped AND no occurrence was even examined: the index describes a
+        // DIFFERENT tree than the one codecortex parsed (wrong index / wrong root). Say so, proceed name-based.
+        DISCLOSE( "--scip: index covers no parsed file/line — proceeding name-based" );
+        rw::emitTo( stderr, "codecortex --scip: index '{}' matched no parsed (file,line) — proceeding name-based\n", p.c_str() );
+    }
+    else if( sawOccurrences )
+    {
+        // S5 STALENESS SIGNAL: a one-line match RATIO whenever the index shares this tree. A low ratio or a
+        // high defsUnmatched means the index is likely from an OLDER commit — stale ref lines that did not
+        // match a current call site were DROPPED (not mis-attributed), so the prov="scip" edges that DID
+        // land are trustworthy (fewer-but-correct, never a wrong one). Fires even when the overlay ends
+        // EMPTY (def matched, every ref stale) — that is exactly when the operator most needs to know. It is
+        // stderr-only + a deterministic function of (index, tree) at fixed precision, so the map on stdout
+        // stays byte-identical and the det-gate holds.
+        //
+        // A4-F21 fix: the ratio used to be edgesPinned/refOccurrences — a denominator counting ALL ref
+        // occurrences (mostly external std::/library symbols the index also records but codecortex can never
+        // match — not a freshness signal) against a numerator DEDUPED to unique (from,to) edges (N call-
+        // sites of the same callee from one enclosing symbol → 1 edge). Both effects only ever push the pct
+        // DOWN, so a perfectly fresh index still read low. Now: denominator = internalOccurrences (ref
+        // occurrences whose symbol resolved into scipDef — occurrences the index itself claims point INTO
+        // this tree); numerator = matchedOccurrencesPreDedup (matched PRE-dedup, one count per occurrence,
+        // the same unit as the denominator). External occurrences are reported separately, not folded into
+        // either side of the ratio.
+        const std::size_t externalOccurrences = ov.refOccurrences - internalOccurrences;
+        const std::size_t denom = internalOccurrences ? internalOccurrences : 1;   // avoid /0; internalOccurrences==0 ⇒ 0%
+        const int         pct   = internalOccurrences ? int( ( matchedOccurrencesPreDedup * 100 + denom / 2 ) / denom ) : 0;
+        // append the older-commit hint ONLY when a staleness signal is present: refs were dropped (matched <
+        // internal occurrences seen) or defs did not map. At a clean 100%/0-unmatched the hint would be misleading.
+        const bool        stale = matchedOccurrencesPreDedup < internalOccurrences || ov.defsUnmatched > 0;
+        rw::emitTo( stderr,
+            "codecortex: SCIP matched {}% of occurrences ({}/{}), {} defs unmatched, {} external (unmatchable) occurrences skipped{}\n",
+            pct, matchedOccurrencesPreDedup, internalOccurrences, ov.defsUnmatched, externalOccurrences,
+            stale ? " — index may be from an older commit" : "" );
+    }
+    return ov;
+}
+
+}   // namespace rw

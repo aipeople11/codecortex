@@ -1,0 +1,1422 @@
+#pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include "infra/os.h"   // rw::os — the edit lockfile (open/flock/close), the atomic write (open/write/fchmod/fsync/rename/unlink), realpath/getcwd
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
+
+// mcpedit.h — the shared symbol-addressed EDIT engine for CLI and MCP: replace_symbol_body /
+// insert_before_symbol / insert_after_symbol. The mcpedit namespace (resolve → per-file advisory
+// lock → freshness byte-hash gate → in-memory splice → atomic temp-rename write) plus the
+// runEditVerb() driver. The safety contract IS the feature: every refusal leaves the file
+// byte-identical. Extracted from mcp.h (the mcp.h/main.cpp concern-split). Includes mcpindex.h;
+// included by mcp.h (runMcp dispatches here).
+
+#include "mcpindex.h"
+#include "editcheck.h"        // P9: the SAME four computations --edit-check renders as XML — folded into the receipt as JSON
+#include "testmap.h"          // P9: affectedAnswerForFile + testRowEvidence + runFieldJsonDisclosed — the SAME rows --affected=FILE emits
+#include "didyoumean.h"       // M9: boundedEditDistance / nearestIndexedFileClause — ONE near-miss policy for read and edit
+#include "selectorrefuse.h"   // atSeedFaultClause + indexHasFileMatching — the @FILE:LINE at-diagnosis, ONE set of fault sentences on every surface
+#include "infra/hashutil.h"   // sanitizer-clean modulo-2^64 FNV multiplication
+#include "infra/gitblob.h"    // E2: the receipt's blob_sha — the git id of the bytes it wrote
+#include "nextverb.h"         // E2: ONE next= on the receipt (nextFlag / nextFieldJson)
+#include "redact.h"           // R1 (V3): kRedactRules — the marker table the write gate's predicate is derived FROM
+#include "pathguard.h"        // A4-F14: rw::pathguard::isSymlink — THE symlink predicate, shared with the sidecar writers
+
+#include <climits>            // PATH_MAX — the AbsHintFrame realpath/getcwd buffers (A2)
+
+namespace rw
+{
+
+// ─── symbol-addressed EDIT verbs (replace_symbol_body / insert_before_symbol / insert_after_symbol) ─────
+//
+// These are the FIRST write verbs — codecortex is otherwise read-only, so the safety contract IS the feature.
+// Every failure path REFUSES with a JSON-RPC error and leaves the file byte-for-byte unchanged; a partial
+// write is never possible (splice happens in memory, then one atomic temp-file rename). The refusals:
+//   • symbol resolves to 0 defs → error listing the nearest names (agent picks a real one)
+//   • symbol resolves to >1 defs → error listing every candidate as file:line (agent retries with `path`)
+//   • the file changed since the index was built (byte-hash mismatch) → error telling the agent to call any
+//     read verb first (which refreshes the index), so span offsets are never applied to shifted bytes
+//   • the span is insane (a>=b, or b>filesize) → refuse (degrade, never splice out of bounds)
+//   • the file can't be re-read → refuse
+namespace mcpedit
+{
+    enum class Op : std::uint8_t { ReplaceBody, InsertBefore, InsertAfter };
+
+    // A1: the ONE wording for the binary-payload refusal, shared by the CLI arm (which names the flag),
+    // the engine arm (which also covers MCP) and the edit-plan arm — three call sites, one sentence, so a
+    // reader who has seen it once recognizes it everywhere and no copy can drift from the others.
+    //
+    // WHY this is a refusal and not a warning: a payload carrying a NUL byte writes fine and reports
+    // success, but on the NEXT run ingest's own binary sniff (rw::looksBinary) drops the file from the
+    // index entirely. Its whole symbol table vanishes, so every later edit to ANY symbol in that file
+    // refuses with "symbol 'X' not found" — a statement about the tree that is simply false. The gate uses
+    // rw::looksBinary itself rather than a second NUL rule, so the refusal's claim ("would drop it from the
+    // index") is EXACTLY the condition that would cause the drop: same 4096-byte window, same predicate.
+    // A NUL past that window is honestly not refused, because it honestly would not drop the file.
+    // The constant is the PREDICATE TAIL only ("contains a NUL byte; ..."); each site supplies the subject it
+    // wants in front of it ("--edit-payload", "payload", "payload '<path>'"), so no site reads doubled.
+    inline constexpr std::string_view kBinaryPayloadRefusal =
+        "contains a NUL byte; writing it would make the target unparseable and drop it from the index";
+
+    // E1 (terminality round A, 2026-09-05): a body served by --expand / fetch_body with a credential-shaped
+    // literal carries an inline redaction marker in place of the secret. Pasting that body back would write
+    // the marker into source — a silent corruption the receipt would then report as applied. Refused on every
+    // write surface (CLI ladder, engine, edit-plan, the pre-apply preview) with ONE sentence.
+    //
+    // V3 (wave-2 verifier finding R1, same round) — WHAT THE PREDICATE IS, and why it is not a substring scan.
+    //
+    // redact.h's splice is fixed and length-independent: keepPrefix bytes of the matched credential, then
+    // U+2026, then one of kRedactRules' own `marker` strings. So the artefact a redacted serve leaves in a
+    // body is exactly "…[REDACTED:<kind>]" with <kind> drawn from that table — never a bare "[REDACTED:",
+    // never an invented kind. countRedactionMarkers derives the shape FROM the table, the same discipline
+    // the NUL rule above takes from rw::looksBinary: the refusal's claim is exactly the condition that
+    // produced the bytes, and the two cannot drift.
+    //
+    // AND carrying one is not enough. The first spelling of this rule refused any payload containing
+    // "[REDACTED:" anywhere, in a sentence asserting "the body it was copied from was served REDACTED" and
+    // naming --no-redact as the way out. Five files under src/ carry that substring — the legends that
+    // DOCUMENT redaction — so their own symbols became permanently unwritable on every write surface; the
+    // sentence asserted something the tool had not done (those bodies are served scrubbed="1", with no
+    // redacted="1" on the element); and the named next step returns byte-identical bytes and is refused
+    // identically. A closed loop resting on a false claim, which is the shape this round exists to remove.
+    //
+    // The fix is the comparison the substring scan never made — against the bytes ALREADY THERE. A redaction
+    // only ever ADDS markers to what is on disk, so a payload is refused only when it carries MORE of them
+    // than the bytes it would replace already carry. A body whose real source spells the marker round-trips
+    // untouched on every surface; a genuinely redacted body still cannot be written. No new flag, no opt-out
+    // to know about: the provenance question is answered from the target's own current bytes.
+    inline constexpr std::string_view kRedactionMarkerOpen = "[REDACTED:";
+    inline constexpr std::string_view kRedactionEllipsis   = "\xe2\x80\xa6";   // U+2026 — redact.h's splice, byte for byte
+
+    // how many COMPLETE emitted redaction artefacts `text` carries. `firstOut`, when non-null, receives the
+    // first one's full spelling, so the refusal quotes the real bytes rather than a schematic.
+    inline std::size_t countRedactionMarkers( std::string_view text, std::string* firstOut = nullptr )
+    {
+        std::size_t count = 0;
+        for( std::size_t at = text.find( kRedactionMarkerOpen ); at != std::string_view::npos; at = text.find( kRedactionMarkerOpen, at + 1 ) )
+        {
+            if( at < kRedactionEllipsis.size() || text.compare( at - kRedactionEllipsis.size(), kRedactionEllipsis.size(), kRedactionEllipsis ) != 0 )
+            {
+                continue;   // a bare "[REDACTED:" in prose, a legend or a doc comment is not what a serve writes
+            }
+            for( const rw::RedactRule& rule : rw::kRedactRules )
+            {
+                const std::string_view marker( rule.marker );
+                if( text.compare( at, marker.size(), marker ) != 0 )
+                {
+                    continue;
+                }
+                if( count == 0 && firstOut != nullptr )
+                {
+                    *firstOut = std::string( kRedactionEllipsis ) + std::string( marker );
+                }
+                ++count;
+                break;
+            }
+        }
+        return count;
+    }
+
+    // The refusal TAIL for a payload that introduces a marker, or "" when it introduces none. `existing` is
+    // the bytes this edit would replace — the definition span for a replace; for an insert, which replaces
+    // nothing, the target FILE as it is on disk, the only honest denominator an insert has. `existingName`
+    // names that denominator in the sentence, so the number the refusal reports is attributable. Each call
+    // site supplies its own subject in front ("--edit-payload", "payload", "payload '<path>'"), exactly the
+    // way kBinaryPayloadRefusal above is used, so no site reads doubled.
+    //
+    // The sentence states what was MEASURED and asserts nothing about how the payload was served — the write
+    // surface cannot know that, and the previous sentence's claim that it could was finding R1's first half.
+    // It names two next steps and both are real: --no-redact resolves it when the payload did come from a
+    // redacted serve (the re-fetch then carries no marker, and the same call is accepted); and when it did
+    // not, the honest answer is that these verbs will not introduce the marker at all, so the bytes go in
+    // through the caller's own file write. Neither is a guess the agent has to test to find out.
+    inline std::string redactionMarkerRefusal( std::string_view payload, std::string_view existing, const std::string& existingName )
+    {
+        std::string       first;
+        const std::size_t inPayload = countRedactionMarkers( payload, &first );
+        if( inPayload == 0 )
+        {
+            return {};
+        }
+        const std::size_t inExisting = countRedactionMarkers( existing );
+        if( inPayload <= inExisting )
+        {
+            return {};
+        }
+        return "carries " + std::to_string( inPayload ) + " redaction marker(s) of the shape a redacted serve writes (first: '"
+             + first + "') where the " + existingName + " carries " + std::to_string( inExisting ) + " — writing it would put "
+             + std::to_string( inPayload - inExisting ) + " of them into source. That shape is what --expand / fetch_body splices "
+               "in place of a credential, and it says so on the element it serves (redacted=\"1\"): if this payload came from such "
+               "a serve, re-fetch that body with --no-redact (MCP: redact:false) and paste the real bytes. If it did not, the "
+               "markers are the payload's own and these verbs will not introduce them — write those bytes with your own file "
+               "write instead. Nothing was written";
+    }
+
+    // The same gate, keyed by op, so each of the three write surfaces reads as ONE call instead of repeating
+    // the same choice of denominator. `src` is the target file exactly as it is on disk and `span` is the
+    // definition span inside it; a ReplaceBody is measured against that span, the two inserts against the
+    // whole file, because an insert replaces nothing and the file is the only honest denominator it has.
+    inline std::string redactionMarkerRefusalFor( Op op, std::string_view payload, std::string_view src,
+                                                  std::string_view span, const std::string& fileIdentity )
+    {
+        if( op == Op::ReplaceBody )
+        {
+            return redactionMarkerRefusal( payload, span, "definition span it would replace" );
+        }
+        return redactionMarkerRefusal( payload, src, "target file '" + fileIdentity + "'" );
+    }
+
+    // the outcome of an edit attempt: either a success JSON payload, or a JSON-RPC error {code,message}.
+    struct Outcome
+    {
+        bool        ok = false;
+        int         errCode = -32602;
+        std::string message;      // on error
+        std::string resultJson;   // on success (a JSON object: applied span + old index stamp + refresh note)
+
+        // A4: the RESOLVED identity of what was edited, so a caller can print advice that actually runs.
+        // The CLI used to echo the caller's own `sym` argument back into "verify with --edit-check=<sym>",
+        // which is wrong twice: --edit-check does not accept a sym# handle at all (so the printed command
+        // always failed after a handle-addressed edit), and a bare name disambiguated by --edit-target-file
+        // would send --edit-check to a DIFFERENT same-named definition. These two fields are what the engine
+        // actually wrote to; they are already inside resultJson, and are surfaced here so no caller has to
+        // parse its own receipt back out to say something true.
+        std::string symbol;       // on success — the resolved definition name
+        std::string file;         // on success — the indexed identity of the file that was written
+        std::string next;         // on success — the receipt's ONE follow-up, for the stderr line to repeat verbatim (E2)
+    };
+
+    // The K symbol names closest to `name`, for the "0 matches" hint — by the SAME bounded edit distance
+    // every read verb's did-you-mean uses (didyoumean.h::boundedEditDistance), and cut off at the same
+    // bandwidth.
+    //
+    // M9 / lens 6 F8 (capture-audit 2026-09-04). This used to be its own ranker: case-folded shared-prefix
+    // length × 4 minus the length delta, over the WHOLE symbol table, with no cutoff — the exact score
+    // §P12.1 replaced on the read side, plus the missing cutoff. So the edit verbs answered
+    // `--replace-symbol-body=DoesNotExist` with "nearest: do_snake_one, do_snake_two, docDriftText,
+    // dogfood-gaps, download_raw" — five alphabetical neighbours of "Do", none of them related to
+    // anything, in front of an agent about to overwrite a function body. A prefix neighbour of a name with
+    // no near-miss is noise dressed as help; the read verbs have long since decided that no plausible
+    // candidate is an honest answer, and this is the surface where acting on a bad guess WRITES.
+    //
+    // The cutoff is what makes the list empty when nothing is close, so the caller drops the "nearest:"
+    // clause entirely rather than printing a header over five wrong names. Deterministic: distance first,
+    // then longer case-insensitive shared prefix, then lexicographic — the tie-break contract
+    // nearestNameByEditDistance states for the single-candidate case, applied to the whole ordered list.
+    inline std::vector<std::string> nearestNames( const IngestResult& ing, const std::string& name, std::size_t k )
+    {
+        constexpr int     kMaxEditDistance = 3;   // the read verbs' bandwidth (didyoumean.h::didYouMean)
+        struct Cand { int dist; std::size_t prefixLen; std::string n; };
+        std::vector<Cand> cands;
+        for( const Symbol& s : ing.symbols )
+        {
+            if( s.name.empty() || s.kind == SymKind::Section )
+            {
+                continue;   // X9(e): a markdown heading is never the answer to a code-symbol typo
+            }
+            const int dist = boundedEditDistance( s.name, name, kMaxEditDistance );
+            if( dist > kMaxEditDistance )
+            {
+                continue;
+            }
+            std::size_t       pfx = 0;
+            const std::size_t lim = std::min( s.name.size(), name.size() );
+            while( pfx < lim && std::tolower( (unsigned char)s.name[pfx] ) == std::tolower( (unsigned char)name[pfx] ) )
+            {
+                ++pfx;
+            }
+            cands.push_back( { dist, pfx, s.name } );
+        }
+        std::sort( cands.begin(), cands.end(),
+                   []( const Cand& a, const Cand& b )
+                   {
+                       if( a.dist != b.dist ) { return a.dist < b.dist; }
+                       if( a.prefixLen != b.prefixLen ) { return a.prefixLen > b.prefixLen; }
+                       return a.n < b.n;
+                   } );
+        std::vector<std::string> out;
+        for( const Cand& c : cands )
+        {
+            if( out.size() >= k )
+            {
+                break;
+            }
+            if( !out.empty() && out.back() == c.n )
+            {
+                continue; // dedup same name (overloads)
+            }
+            out.push_back( c.n );
+        }
+        return out;
+    }
+
+    // A2: an ABSOLUTE path hint — the spelling an agent pastes back from a receipt, a stack trace or its own
+    // shell, and the most natural thing to type — could never substring-match `ing.files`' root-relative
+    // identities ("corpus/a.py"). So `--edit-target-file=/abs/.../a.py` refused with "symbol 'alpha' not
+    // found under path '/abs/.../a.py'" about a file that DEFINES alpha: a false statement about the tree.
+    // The fix is not a second path vocabulary — it lifts the indexed FILE into the absolute frame the hint
+    // is already in, and runs the same substring rule there. Built once per resolve, and empty (so free) for
+    // the ordinary relative hint, which keeps the existing fast path byte-for-byte.
+    //
+    // realpath() on the hint so a symlinked prefix (/tmp vs /private/tmp on macOS) lands in the same frame
+    // getcwd() reports; a hint naming nothing on disk keeps its literal spelling rather than being dropped.
+    struct AbsHintFrame
+    {
+        std::string hint;   // canonical absolute hint — empty when the hint is relative (nothing to do)
+        std::string cwd;    // getcwd, to absolutize a relative on-disk spelling; empty ⇒ degrade to no match
+
+        explicit AbsHintFrame( const std::string& pathHint )
+        {
+            if( pathHint.empty() || pathHint.front() != '/' )
+            {
+                return;
+            }
+            char buf[ PATH_MAX ];
+            hint = os::realpath( pathHint.c_str(), buf ) != nullptr ? std::string( buf ) : pathHint;
+            cwd  = os::getcwd( buf, sizeof( buf ) ) != nullptr ? std::string( buf ) : std::string();
+        }
+
+        bool matches( const IngestResult& ing, std::uint32_t fileId ) const
+        {
+            if( hint.empty() || cwd.empty() )
+            {
+                return false;
+            }
+            const std::string& disk = diskPath( ing, fileId );   // the on-disk spelling, never the label
+            const std::string  abs  = !disk.empty() && disk.front() == '/' ? disk : cwd + "/" + disk;
+            return abs.find( hint ) != std::string::npos;
+        }
+    };
+
+    // The ONE "does this indexed file satisfy the caller's path hint" predicate, so the symbol scan and the
+    // never-parsed disclosure below cannot disagree about which files a hint names. Relative substring test
+    // first — unchanged, and the only test a relative hint ever runs.
+    inline bool editHintMatches( const IngestResult& ing, std::uint32_t fileId,
+                                 const std::string& pathHint, const AbsHintFrame& frame )
+    {
+        return filePathContainsRootRel( ing, fileId, pathHint ) || frame.matches( ing, fileId );
+    }
+
+    // A1 (secondary): "symbol 'X' not found under path 'F'" is a TRUE statement with a misleading cause when
+    // F is indexed but was never PARSED — the ingest's not-measured sentinel (fileHealth.fileBytes == 0: a
+    // binary sniff, a read failure, or a doc-format file the doc pass extracted instead). Such a file has no
+    // symbol table at all, so EVERY name in it reports as absent and the nearest-names list below is pure
+    // noise. Say which file, and why, instead of letting the agent hunt for a name that is there.
+    // Returns "" when the hint names nothing indexed, or names anything that WAS measured (then the plain
+    // not-found is the honest answer). Names at most 3 files — this is a hint, not a report.
+    inline std::string unmeasuredHintNote( const IngestResult& ing, const std::string& pathHint, const AbsHintFrame& frame )
+    {
+        std::vector<std::string> unmeasured;
+        for( std::size_t f = 0; f < ing.files.size(); ++f )
+        {
+            if( !editHintMatches( ing, std::uint32_t( f ), pathHint, frame ) )
+            {
+                continue;
+            }
+            if( f < ing.fileHealth.size() && ing.fileHealth[f].fileBytes == 0 )
+            {
+                unmeasured.push_back( ing.files[f] );
+                continue;
+            }
+            return std::string();   // a measured file matches the hint — the plain not-found stands
+        }
+        if( unmeasured.empty() )
+        {
+            return std::string();
+        }
+        std::string note = " — that path is indexed but was never parsed (binary content, an unreadable file, "
+                           "or a doc-format extraction), so it contributes NO symbols and no name in it resolves: ";
+        for( std::size_t i = 0; i < unmeasured.size() && i < 3; ++i )
+        {
+            if( i )
+            {
+                note += ", ";
+            }
+            note += unmeasured[i];
+        }
+        if( unmeasured.size() > 3 )
+        {
+            note += " (+" + std::to_string( unmeasured.size() - 3 ) + " more)";
+        }
+        return note;
+    }
+
+    // resolve `symbol` to exactly one def, optionally narrowed by `pathHint` (a substring match on the file
+    // path, mirroring resolveFocus's "file:name" file filter). Returns kNoNode and fills `err` with a ready
+    // JSON-RPC message on any non-unique outcome (0 → nearest-names hint; >1 → candidate file:line list).
+    inline NodeId resolveOneForEdit( const IngestResult& ing, const std::string& symbol,
+                                     const std::string& pathHint, std::string& err )
+    {
+        const AbsHintFrame  frame( pathHint );   // A2: absolute-hint frame; inert for a relative hint
+        std::vector<NodeId> matches;
+        for( const Symbol& s : ing.symbols )
+        {
+            if( s.name != symbol )
+            {
+                continue;
+            }
+            if( !pathHint.empty() && !editHintMatches( ing, s.fileId, pathHint, frame ) )
+            {
+                continue; // `<label>/<rel>`-matching (post-M12; filePathContains' `/./` fallback is legacy), and absolute-spelling-tolerant
+            }
+            matches.push_back( s.id );
+        }
+        std::sort( matches.begin(), matches.end() );
+
+        if( matches.size() == 1 )
+        {
+            // KIND GUARD (edit path only): a doc `Section` — a markdown heading, or a whole-file section for
+            // .html/.csv/.ipynb — is NOT an editable code definition. Its stored span does not delimit a
+            // definition, and for html/csv/ipynb `endByte` is the EXTRACTED-text length, unrelated to raw-file
+            // byte coordinates; splicing it silently corrupts the doc/data file (e.g. deletes an HTML <head>)
+            // while reporting success. The freshness + `a<b && b<=size` gates cannot catch a span that is
+            // spatially in-bounds but semantically meaningless. Refuse — the read verbs may still surface
+            // Section handles, but nothing may WRITE through one.
+            const Symbol& s = ing.symbols[ matches[0] ];
+            if( s.kind == SymKind::Section )
+            {
+                err = "symbol '" + symbol + "' is a document heading/section (" + ing.files[ s.fileId ]
+                    + "), not an editable code definition — refusing to avoid corrupting the doc/data file";
+                return kNoNode;
+            }
+            return matches[0];
+        }
+
+        if( matches.empty() )
+        {
+            // M9 / lens 6 F8: when the PATH half names nothing indexed, the path is the fault and nothing
+            // can honestly be said about the symbol — `--edit-target-file=svectr.h` used to report
+            // "symbol 'size' not found under path 'svectr.h'; nearest: sized, size_of, Side, Site, sink",
+            // sending the reader after a rename in a header that was never indexed under that spelling.
+            // Same verdict, same words as the read verbs' file-half diagnosis (selectorrefuse.h).
+            if( !pathHint.empty() && !indexHasFileMatching( ing, pathHint ) )
+            {
+                err = "no indexed file matches '" + pathHint + "' — the PATH half is the fault, so nothing is claimed about '"
+                    + symbol + "'; drop the file qualifier to search every file, or pass a path the map lists"
+                    + nearestIndexedFileClause( ing, pathHint );
+                return kNoNode;
+            }
+            std::string m = "symbol '" + symbol + "' not found";
+            if( !pathHint.empty() )
+            {
+                m += " under path '" + pathHint + "'";
+                m += unmeasuredHintNote( ing, pathHint, frame );
+            }
+            // A2: ask for one extra and drop any suggestion EQUAL to the name requested. This branch is
+            // reached only when no definition of `symbol` survived the filter, so leading the did-you-mean
+            // list with `symbol` itself ("not found ...; nearest: alpha") reads as a bug in the tool.
+            std::vector<std::string> near = nearestNames( ing, symbol, 6 );
+            near.erase( std::remove( near.begin(), near.end(), symbol ), near.end() );
+            if( near.size() > 5 ) { near.resize( 5 ); }
+            if( !near.empty() )
+            {
+                m += "; nearest: ";
+                for( std::size_t i = 0; i < near.size(); ++i )
+                {
+                    if( i )
+                    {
+                        m += ", ";
+                    }
+                    m += near[i];
+                }
+            }
+            err = m;
+            return kNoNode;
+        }
+
+        // >1 — list every candidate as file:line so the agent can retry with a disambiguating `file`. On a
+        // multi-root index (A11, decided 2026-07-11) the candidate paths carry their ROOT LABEL, so a
+        // same-named symbol in >1 root is disambiguated by passing the label/rel spelling as `file` (e.g.
+        // `file:"svc/"`); the write always lands in the real disk file behind that labeled identity.
+        const bool  isWorkspace = !ing.fileRoot.empty();
+        std::string m = "symbol '" + symbol + "' is ambiguous (" + std::to_string( matches.size() )
+                      + " definitions) — retry with a 'file' substring to disambiguate"
+                      + ( isWorkspace ? " (in a multi-root workspace, pass the root-labeled path form, e.g. file:\"svc/\")" : "" )
+                      + ". candidates: ";
+        for( std::size_t i = 0; i < matches.size(); ++i )
+        {
+            const Symbol& s = ing.symbols[ matches[i] ];
+            if( i )
+            {
+                m += "; ";
+            }
+            m += ing.files[ s.fileId ] + ":" + std::to_string( s.line );
+        }
+        err = m;
+        return kNoNode;
+    }
+
+    // E1 (terminality round A, 2026-09-05): what the SEAM RULES below did to the payload, so the receipt can
+    // say it (test/editroundtripcheck.sh arms C/G/H). Both are disclosures of arithmetic, never a guess.
+    struct SeamInfo
+    {
+        bool        trailingNewlineFolded = false;   // one trailing newline of the payload folded into the seam's own
+        std::size_t separatorPadded       = 0;       // newlines ADDED so the inserted block is separated like its neighbours
+    };
+
+    // the newline run at a seam: how many consecutive line terminators sit immediately BEFORE `pos`
+    // (newlineRunBefore) or FROM `pos` on (newlineRunAfter). Counts '\n' bytes; a '\r' that pairs with one is
+    // skipped, so a CRLF file measures its blank lines the same way an LF file does.
+    inline std::size_t newlineRunBefore( std::string_view src, std::size_t pos ) noexcept
+    {
+        std::size_t n = 0, i = pos;
+        while( i > 0 && src[i - 1] == '\n' )
+        {
+            ++n; --i;
+            if( i > 0 && src[i - 1] == '\r' ) { --i; }
+        }
+        return n;
+    }
+    inline std::size_t newlineRunAfter( std::string_view src, std::size_t pos ) noexcept
+    {
+        std::size_t n = 0, i = pos;
+        while( i < src.size() )
+        {
+            if( src[i] == '\r' && i + 1 < src.size() && src[i + 1] == '\n' ) { ++n; i += 2; }
+            else if( src[i] == '\n' ) { ++n; ++i; }
+            else { break; }
+        }
+        return n;
+    }
+
+    // the terminator this seam spells — "\r\n" when the seam's own run is CRLF, else "\n"
+    inline std::string_view seamEol( std::string_view src, std::size_t pos, bool backward ) noexcept
+    {
+        if( backward ) { return ( pos >= 2 && src[pos - 1] == '\n' && src[pos - 2] == '\r' ) ? "\r\n" : "\n"; }
+        return ( pos + 1 < src.size() && src[pos] == '\r' && src[pos + 1] == '\n' ) ? "\r\n" : "\n";
+    }
+
+    // apply the edit. Pure over (span, op, text, srcBytes) → the new file bytes, plus the applied [a,b) span
+    // and what the seam rules did (`seam`). The rules, documented in --help and the MCP schemas:
+    //   ReplaceBody   — the new bytes are new_body; every byte outside [sigStartByte, endByte) is preserved
+    //                   verbatim. ONE trailing newline on new_body is FOLDED into the newline already at
+    //                   endByte (a heredoc / echo / editor always appends one the span never contained), and the
+    //                   receipt says trailing_newline_folded:true; a second one — a deliberate blank line — stays.
+    //   InsertBefore  — text is inserted at sigStartByte, then PADDED with trailing newlines until it is
+    //                   separated from the existing definition by the same blank-line run the file has right
+    //                   before that definition (at least one newline, so the two never share a line). Padding
+    //                   only ever ADDS; a payload already carrying the separator is left alone. separator_padded=N.
+    //   InsertAfter   — text is inserted at endByte and PADDED with leading newlines to the blank-line run the
+    //                   file has right after the definition (at least one), same disclosure; its trailing
+    //                   newline folds like ReplaceBody's. The byte at endByte and everything after it is kept.
+    // Measured before these rules (bench/agentloop/run_editsuite.py baseline): 12/12 agent runs stopped on the
+    // receipt and 11/12 left wrong bytes — one blank line too many after every heredoc replace, an insert glued
+    // to its neighbour. A byte-exact contract an agent's shell cannot meet is not terminal.
+    inline std::string applyEdit( Op op, const std::string& src, std::size_t a, std::size_t b,
+                                  const std::string& text, std::size_t& outStart, std::size_t& outEnd, SeamInfo& seam )
+    {
+        seam = SeamInfo{};
+        std::string ins = text;
+        // the fold, shared by the two ops whose right seam is the file's own newline
+        const auto foldTrailing = [ & ]( std::size_t seamPos )
+        {
+            const std::string_view eol = seamEol( src, seamPos, false );
+            if( seamPos < src.size() && src.compare( seamPos, eol.size(), eol ) == 0
+                && ins.size() >= eol.size() && std::string_view( ins ).ends_with( eol ) )
+            {
+                ins.erase( ins.size() - eol.size() );
+                seam.trailingNewlineFolded = true;
+            }
+        };
+        std::string out;
+        if( op == Op::ReplaceBody )
+        {
+            foldTrailing( b );
+            out.reserve( src.size() - ( b - a ) + ins.size() );
+            out.append( src, 0, a );
+            outStart = a;
+            out += ins;
+            outEnd = out.size();
+            out.append( src, b, src.size() - b );
+        }
+        else if( op == Op::InsertBefore )
+        {
+            // the run before the anchor: N newlines = its line end + N-1 blank lines; the block gets the same
+            const std::size_t      want = std::max<std::size_t>( 1, newlineRunBefore( src, a ) );
+            const std::size_t      have = newlineRunBefore( ins, ins.size() );   // the payload's own trailing run
+            const std::string_view eol  = seamEol( src, a, true );
+            for( std::size_t i = have; i < want; ++i ) { ins += eol; ++seam.separatorPadded; }
+            out.reserve( src.size() + ins.size() );
+            out.append( src, 0, a );
+            outStart = a;
+            out += ins;
+            outEnd = out.size();
+            out.append( src, a, src.size() - a );
+        }
+        else   // InsertAfter — at endByte, preserving the byte at b exactly
+        {
+            const std::size_t      want = std::max<std::size_t>( 1, newlineRunAfter( src, b ) );
+            const std::size_t      have = newlineRunAfter( ins, 0 );   // the payload's own leading run
+            const std::string_view eol  = seamEol( src, b, false );
+            for( std::size_t i = have; i < want; ++i ) { ins.insert( 0, eol ); ++seam.separatorPadded; }
+            foldTrailing( b );
+            out.reserve( src.size() + ins.size() );
+            out.append( src, 0, b );
+            outStart = b;
+            out += ins;
+            outEnd = out.size();
+            out.append( src, b, src.size() - b );
+        }
+        return out;
+    }
+
+    // the two receipt keys the seam rules owe, spelled ONCE for the single-edit receipt and the plan's per-op object
+    inline std::string seamDisclosureJson( const SeamInfo& seam )
+    {
+        return std::string( ",\"trailing_newline_folded\":" ) + ( seam.trailingNewlineFolded ? "true" : "false" )
+             + ",\"separator_padded\":" + std::to_string( seam.separatorPadded );
+    }
+
+    // F-07: the target file's dominant line ending, so a payload can be harmonized to match it before it is
+    // spliced in. Counts CRLF pairs and BARE LF (a '\n' with no preceding '\r') separately, so a file that
+    // is genuinely mixed already is reported as such rather than forced into one bucket. `None` is a file
+    // with no newline at all (e.g. single statement, or empty) — nothing for a payload to match.
+    enum class EolStyle : std::uint8_t { None, Lf, Crlf, Mixed };
+
+    inline EolStyle detectDominantEol( const std::string& bytes )
+    {
+        std::size_t crlf = 0, bareLf = 0;
+        for( std::size_t i = 0; i < bytes.size(); ++i )
+        {
+            if( bytes[i] != '\n' )
+            {
+                continue;
+            }
+            if( i > 0 && bytes[i - 1] == '\r' ) { ++crlf; }
+            else                                { ++bareLf; }
+        }
+        if( crlf == 0 && bareLf == 0 ) { return EolStyle::None; }
+        if( bareLf == 0 )              { return EolStyle::Crlf; }
+        if( crlf == 0 )                { return EolStyle::Lf; }
+        return EolStyle::Mixed;
+    }
+
+    // Declarative table over a switch/case (CONTRIBUTING.md §3): EolStyle's enumerators are declared
+    // None,Lf,Crlf,Mixed in that order, so the enum value IS the index — no case labels to keep in sync.
+    inline const char* eolStyleName( EolStyle e ) noexcept
+    {
+        static constexpr const char* kNames[] = { "none", "lf", "crlf", "mixed" };
+        const std::size_t             i       = static_cast<std::size_t>( e );
+        return ( i < sizeof( kNames ) / sizeof( kNames[0] ) ) ? kNames[i] : "none";
+    }
+
+    // F-07: rewrite every BARE '\n' in `text` to '\r\n', so a payload written in plain LF (the shape almost
+    // every agent emits) does not leave a CRLF-dominant target file with a mixed-ending tail after the
+    // splice. Idempotent — a '\n' already preceded by '\r' is left alone, never doubled, so a payload that
+    // is already CRLF (or already mixed) is not corrupted by a second pass.
+    inline std::string normalizeToCrlf( const std::string& text )
+    {
+        std::string out;
+        out.reserve( text.size() + text.size() / 16 );
+        for( std::size_t i = 0; i < text.size(); ++i )
+        {
+            if( text[i] == '\n' && ( i == 0 || text[i - 1] != '\r' ) )
+            {
+                out += '\r';
+            }
+            out += text[i];
+        }
+        return out;
+    }
+
+    // A3-F8: the advisory edit lock lives in the per-user CACHE DIR, keyed by an FNV-1a-64 hash of the
+    // absolute target path — NOT as a "<path>.codecortex-lock" sidecar next to the target. The old sidecar was
+    // created and never unlinked, so every MCP edit left permanent litter in the user's repo (git-status
+    // noise). The cache-dir path is a deterministic pure function of the target path, so two codecortex processes
+    // editing the SAME file still open the SAME lock file and flock still serializes them cross-process (the F1
+    // guarantee is preserved) — it just never lands in the repo tree. Locks have their own sharded subtree:
+    // the blob eviction never enters it. Since 2026-09-06 quality.h's sweepStaleEditLocks does, and reclaims a
+    // lock that is older than a day AND not held (flock LOCK_NB succeeding is the liveness test) — one machine
+    // had 45,765 of these before that; a possibly-live (held, or fresh) lock inode is still never removed.
+    inline std::string editLockPath( const std::string& targetPath )
+    {
+        std::uint64_t h = 1469598103934665603ULL;      // FNV-1a-64 of the target path → a stable per-file lock name
+        for( char c : targetPath ) { h ^= static_cast<unsigned char>( c ); h = hashutil::fnv1aMultiply( h ); }
+        char name[ 64 ];
+        rw::formatTo( name, sizeof( name ), "codecortex-edit-{:016x}.lock", (unsigned long long)h );
+        const std::string lockDir = quality::cacheDirLadder() + "/locks";
+        os::mkdir( lockDir.c_str(), 0700 );
+        os::chmod( lockDir.c_str(), 0700 );
+        return quality::resolveCacheBlobPath( lockDir, name );
+    }
+
+    // F1: per-file advisory edit lock — serializes two COOPERATING codecortex MCP edit operations on one file so
+    // they can't race a read→check→splice→rename lost-update. We lock a STABLE lockfile keyed by the target
+    // path (editLockPath, A3-F8: in the per-user cache dir, not a repo-tree sidecar), NOT the target itself:
+    // the atomic rename swaps the target's inode, so a flock on the target fd wouldn't cover the rename
+    // destination. The keyed lockfile's inode never changes, so its lock does span the whole read-modify-write.
+    // HONEST LIMIT: this is ADVISORY — a non-cooperating external writer (an editor/formatter that doesn't take
+    // this lock) is not serialized by it; that residual is handled by the re-check-before-rename in runEditVerb,
+    // which shrinks (but cannot fully close) the external-writer window. Never blocks forever: LOCK_NB with a
+    // short bounded retry. CONTENDED past it (a live cooperating writer holds the lock) refuses the edit —
+    // proceeding would let that writer commit after this edit's rename and silently undo an edit reported as
+    // applied. A lockfile that cannot be opened, or a filesystem without flock, proves no live holder, and a
+    // refusal there would block every edit without serializing anything, so that degrade stays lock-free. RAII: the fd is
+    // closed (releasing the flock) at scope exit, deterministically.
+    struct EditLock
+    {
+        int  fd        = -1;
+        bool locked    = false;
+        bool contended = false;   // every bounded attempt saw EWOULDBLOCK — another holder is live
+
+        explicit EditLock( const std::string& targetPath )
+        {
+            const std::string lockPath = editLockPath( targetPath );
+            fd = os::open( lockPath.c_str(), O_RDWR | O_CREAT, 0644 );
+            if( fd < 0 )
+            {
+                DISCLOSE( Diagnostics::answerUnchanged, "the edit re-checks the file before its rename, which still refuses a stale write",
+                          "edit lockfile open failed; proceeding lock-free (re-check still guards)" );
+                return;
+            }
+
+            // ~200 ms bounded acquire: 20 tries × 10 ms. If a peer holds it longer, refuse rather than hang or
+            // proceed lock-free — the latter can lose a cooperating writer's committed update.
+            for( int attempt = 0; attempt < 20; ++attempt )
+            {
+                if( os::flock( fd, LOCK_EX | LOCK_NB ) == 0 ) { locked = true; break; }
+                if( errno != EWOULDBLOCK )
+                {
+                    break;
+                }
+                contended = attempt == 19;
+                struct timespec ts{ 0, 10 * 1000 * 1000 };   // 10 ms
+                os::nanosleep( &ts, nullptr );
+            }
+            // `contended` is disclosed to the caller in full via runEditVerb's -32603 message below — a real
+            // refusal, not a degrade, so it needs no debug-trace-only DISCLOSE of its own here (Diagnostics.h
+            // §4b: the one-argument form tells the release user nothing; the refusal already tells them
+            // everything). Only the still-degrading case keeps a DISCLOSE — the answerUnchanged form, since the
+            // re-check before the rename is what still guards the answer.
+            if( !contended && !locked )
+            {
+                DISCLOSE( Diagnostics::answerUnchanged, "the edit re-checks the file before its rename, which still refuses a stale write",
+                          "edit lock unsupported on this filesystem; proceeding lock-free (re-check still guards)" );
+            }
+        }
+
+        ~EditLock()
+        {
+            if( fd >= 0 )
+            {
+                if( locked )
+                {
+                    os::flock( fd, LOCK_UN );
+                }
+                os::close( fd );
+            }
+        }
+
+        EditLock( const EditLock& ) = delete;
+        EditLock& operator=( const EditLock& ) = delete;
+    };
+
+    // atomic write: bytes → "<path>.<pid>.tmp" → rename over `path` (the saveCache pattern from ingest.cpp).
+    // rename(2) is atomic, so a reader never sees a torn file and a crash mid-write leaves the original intact.
+    // Returns false on any open/write/rename failure (the temp is cleaned up) — caller keeps the file as-is.
+    //
+    // A3-F7: PRESERVE the original's MODE and DURABLY commit. The pre-fix version created the temp via fopen()
+    // (mode = 0666 & ~umask, typically 0644) and renamed it over the target, so editing an executable script
+    // silently stripped +x. The fix: fstat() the ORIGINAL first, fchmod() the temp to its exact mode bits
+    // before the rename (a new file — original absent — keeps the default umask mode), and fsync() the temp fd
+    // before close/rename so the bytes are durable before the inode swap (a crash can't leave a renamed-but-
+    // unwritten file). Uses POSIX fds (open/write/fsync/fchmod/fstat) because fchmod/fsync need a descriptor.
+    // HONEST LIMIT: hard links to the target and its xattrs are still not carried across the rename — that is
+    // inherent to the temp-then-rename atomicity model (a fresh inode) and is the documented trade for the
+    // torn-write-free guarantee; the mode bits (the load-bearing +x case) ARE preserved.
+    inline bool atomicWrite( const std::string& path, const std::string& bytes )
+    {
+        // capture the original's mode (if it exists) so we can restore it onto the fresh temp inode.
+        os::stat_t orig{};
+        const bool  haveOrig = ( os::stat( path.c_str(), &orig ) == 0 );
+
+        // The temp is created EXCLUSIVELY, without following a link, under an unpredictable name beside the
+        // target (rw::pathguard round 5): the create refuses an existing entry at the temp name, so this
+        // publish's write and fchmod land only on a file it just created. The RAII holder owns the temp — its
+        // destructor removes it on any early return below, so there is no manual unlink to forget — and
+        // commit() renames it into place. Same tmp+rename atomicity as before.
+        rw::pathguard::ExclTempFile temp = rw::pathguard::createExclTempFile( path + ".", ".tmp", 0644 );
+        if( !temp.ok() )
+        {
+            return false;
+        }
+        const int fd = temp.fd();
+
+        // write the full buffer (a short write is a failure); the shared loop handles a signal-truncated write.
+        if( !temp.write( bytes ) )
+        {
+            return false;   // temp removed by the holder's destructor
+        }
+
+        // A3-F7: restore the original mode bits onto the temp before the rename (preserve +x etc.). A new file
+        // (no original) keeps the umask default. fchmod failure is non-fatal — degrade to the default mode.
+        if( haveOrig )
+        {
+            if( os::fchmod( fd, orig.st_mode & 07777 ) != 0 )
+            {
+                DISCLOSE( "atomicWrite: could not restore original file mode; wrote with default mode" );
+            }
+        }
+
+        // A3-F7: fsync the data to disk BEFORE the atomic rename so a crash can't leave a renamed-but-empty file.
+        if( os::fsync( fd ) != 0 )
+        {
+            DISCLOSE( "atomicWrite: fsync failed; proceeding (bytes may not be durable across a crash)" );
+        }
+
+        return temp.commit( path );   // closes the fd and renames; the destructor removes the temp on failure
+    }
+
+    struct EditTarget
+    {
+        NodeId      id = kNoNode;
+        bool        byHandle = false;
+        bool        bySeed   = false;   // target was an @FILE:LINE line-seed (receipt discloses the rebind)
+        std::string error;
+    };
+
+    // @FILE:LINE line-seed target (2026-08-30 decision round): the agent editing from a diff hunk holds
+    // exactly FILE:LINE, so the seed addresses the edit target directly — resolved through the SAME
+    // resolveAtSeed + at-diagnosis every read verb uses; everything downstream of the returned NodeId
+    // (freshness hash, lock, pre-rename recheck, atomic write) is untouched, so the edit-safety contract
+    // is unchanged.
+    inline EditTarget resolveSeedTarget( const McpIndex& ix, const std::string& target, const std::string& pathHint )
+    {
+        EditTarget out;
+        out.bySeed = true;
+        if( !pathHint.empty() )
+        { // mirror the handle arm's posture: the seed already identifies one file (and one line)
+            out.error = "a file hint cannot narrow a line seed: '" + target
+                      + "' already names exactly one file and line — drop the file/--edit-target-file argument";
+            return out;
+        }
+        const AtSeed seed = resolveAtSeed( ix.ing, std::string_view( target ).substr( 1 ) );
+        if( seed.fault != AtFault::None )
+        {
+            out.error = "line seed '" + target + "' does not resolve" + atSeedFaultClause( ix.ing, seed );
+            return out;
+        }
+        const Symbol& s = ix.ing.symbols[ seed.chain.back() ];   // innermost — the SYM-selector pick (atcheck (12))
+        if( s.kind == SymKind::Section )
+        { // the resolveOneForEdit KIND GUARD, replicated verbatim in spirit: a Section's span does not
+          // delimit an editable definition, and for html/csv/ipynb it is extracted-text coordinates —
+          // splicing through one silently corrupts the doc/data file while reporting success.
+            out.error = "line seed '" + target + "' resolves to '" + s.name + "', a document heading/section ("
+                      + ix.ing.files[ s.fileId ] + "), not an editable code definition — refusing to avoid "
+                        "corrupting the doc/data file";
+            return out;
+        }
+        out.id = seed.chain.back();
+        return out;
+    }
+
+    inline EditTarget resolveTarget( const McpIndex& ix, const std::string& target, const std::string& pathHint )
+    {
+        EditTarget out;
+
+        if( !target.empty() && target.front() == '@' )
+        {
+            return resolveSeedTarget( ix, target, pathHint );   // @FILE:LINE line-seed — see its contract above
+        }
+
+        std::uint64_t handleId = 0, handleContent = 0;
+        out.byHandle = mcpdetail::parseHandle( target, handleId, handleContent );
+        if( !out.byHandle )
+        {
+            if( target.rfind( "sym#", 0 ) == 0 )
+            {
+                out.error = "malformed edit handle '" + target + "' (expected sym#<16hex>@<16hex>)";
+                return out;
+            }
+            out.id = resolveOneForEdit( ix.ing, target, pathHint, out.error );
+            return out;
+        }
+        if( !pathHint.empty() )
+        {
+            out.error = "--edit-target-file cannot modify a content handle: the handle already identifies one file";
+            return out;
+        }
+
+        std::vector<NodeId> matches;
+        out.id = resolveHandleAll( ix, handleId, matches );
+        if( out.id == kNoNode )
+        {
+            out.error = "edit handle '" + target + "' no longer resolves; rerun --grep --handles";
+            return out;
+        }
+        if( matches.size() != 1 )
+        {
+            out.id = kNoNode;
+            out.error = "edit handle '" + target + "' is ambiguous across " + std::to_string( matches.size() )
+                      + " definitions; refresh with --grep --handles and target a unique enclosing definition";
+            return out;
+        }
+        const Symbol& s = ix.ing.symbols[out.id];
+        const std::uint64_t builtHash = ( s.fileId < ix.fileByteHash.size() ) ? ix.fileByteHash[s.fileId] : 0;
+        if( handleContent == 0 || handleContent != builtHash )
+        {
+            out.id = kNoNode;
+            out.error = "stale edit handle '" + target + "': file '" + ix.ing.files[s.fileId]
+                      + "' changed after grep minted it; rerun --grep --handles and use the new handle";
+        }
+        return out;
+    }
+
+    // ── P9 (capture-audit 2026-09-04) — THE POST-EDIT VERIFICATION, FOLDED INTO THE RECEIPT ───────────
+    //
+    // The receipt used to end with a stderr line saying "verify with --edit-check=F:S, then --affected=F":
+    // two more calls the tool already knows it wants, on an index it has just invalidated and is about to
+    // rebuild for whoever calls next anyway. Claude Code's own policy makes an agent Read before it edits;
+    // other agents do not, and the receipt is the one document an editing agent is guaranteed to read.
+    //
+    // Both halves are the STANDALONE verbs' own computations, called directly rather than re-derived:
+    // editcheck.h's editCheckOverloadSet / editCheckContractVsHead / editCheckCallers / editCheckVerdict /
+    // editCheckCallSites are exactly what editCheckBundleText renders as XML, and affectedAnswerForFile is what
+    // runAffected walks. That is what lets test/receiptpostcheck.sh assert the receipt EQUALS a separate
+    // --edit-check and a separate --affected: not a promise, a shared call.
+
+    // the post-edit LINE range of the applied text, from the NEW bytes. Every other verb in this tool
+    // speaks FILE:LINE; the receipt spoke only bytes. `end` is the line holding the applied text's LAST
+    // byte — a payload ending in "\n" therefore reports its last CONTENT line, not the empty one after it.
+    struct LineRange { std::uint32_t start; std::uint32_t end; };
+    inline LineRange lineRangeOf( std::string_view bytes, std::size_t startByte, std::size_t endByte )
+    {
+        const auto lineAt = [ & ]( std::size_t upto ) -> std::uint32_t
+        {
+            std::uint32_t line = 1;
+            for( std::size_t i = 0; i < upto && i < bytes.size(); ++i )
+            {
+                if( bytes[i] == '\n' ) { ++line; }
+            }
+            return line;
+        };
+        const std::uint32_t first = lineAt( startByte );
+        const std::size_t   last  = ( endByte > startByte ) ? endByte - 1 : startByte;
+        return { first, std::max( first, lineAt( last ) ) };
+    }
+
+    // E2 (terminality round A, 2026-09-05): the post-edit REGION — the applied lines plus `context` lines each
+    // side, as the bytes are on disk — so the receipt answers the Read an agent would otherwise make to see what
+    // landed (the suite's baseline: agents stopped on the receipt and 11/12 had wrong bytes they never saw).
+    // Budgeted: a region over kReceiptRegionBudgetBytes carries head + tail (whole lines, half the budget each)
+    // and elided_lines, with capped:true — never a silently truncated text.
+    inline constexpr std::uint32_t kReceiptRegionContextLines = 3;
+    inline constexpr std::size_t   kReceiptRegionBudgetBytes  = 2048;
+
+    // the file as lines without terminators; a trailing newline does not make an empty last line
+    inline std::vector<std::string_view> splitLinesView( std::string_view bytes )
+    {
+        std::vector<std::string_view> lines;
+        std::size_t start = 0;
+        for( std::size_t i = 0; i <= bytes.size(); ++i )
+        {
+            if( i == bytes.size() || bytes[i] == '\n' )
+            {
+                if( i < bytes.size() || start < bytes.size() ) { lines.push_back( bytes.substr( start, i - start ) ); }
+                start = i + 1;
+            }
+        }
+        return lines;
+    }
+
+    // lines [from, upto] (1-based, inclusive, clamped) joined with '\n' — no terminator after the last
+    inline std::string joinLines( const std::vector<std::string_view>& lines, std::uint32_t from, std::uint32_t upto )
+    {
+        std::string t;
+        for( std::uint32_t l = std::max<std::uint32_t>( from, 1 ); l <= upto && l <= lines.size(); ++l )
+        {
+            if( l > from ) { t += '\n'; }
+            t.append( lines[ l - 1 ].data(), lines[ l - 1 ].size() );
+        }
+        return t;
+    }
+
+    // the head/tail split of an oversize region: whole lines from `start` while under half the budget, whole lines
+    // back from `end` likewise. Returns (headEnd, tailStart); elided = tailStart - headEnd - 1 lines.
+    inline std::pair<std::uint32_t, std::uint32_t> regionHeadTail( const std::vector<std::string_view>& lines,
+                                                                   std::uint32_t start, std::uint32_t end, std::size_t half )
+    {
+        std::uint32_t headEnd = start - 1;
+        for( std::size_t used = 0; headEnd + 1 <= end; ++headEnd )
+        {
+            const std::size_t next = used + lines[ headEnd ].size() + ( used ? 1 : 0 );
+            if( next > half && headEnd >= start ) { break; }
+            used = next;
+        }
+        std::uint32_t tailStart = end + 1;
+        for( std::size_t used = 0; tailStart - 1 > headEnd; --tailStart )
+        {
+            const std::size_t next = used + lines[ tailStart - 2 ].size() + ( used ? 1 : 0 );
+            if( next > half && tailStart <= end ) { break; }
+            used = next;
+        }
+        return { headEnd, tailStart };
+    }
+
+    inline std::string receiptRegionJson( std::string_view bytes, LineRange applied )
+    {
+        const std::vector<std::string_view> lines = splitLinesView( bytes );
+        const std::uint32_t total = std::uint32_t( lines.size() );
+        const std::uint32_t start = applied.start > kReceiptRegionContextLines ? applied.start - kReceiptRegionContextLines : 1u;
+        const std::uint32_t end   = std::min<std::uint32_t>( total, applied.end + kReceiptRegionContextLines );
+        std::string out = ",\"region\":{\"start\":" + std::to_string( start ) + ",\"end\":" + std::to_string( end )
+                        + ",\"context\":" + std::to_string( kReceiptRegionContextLines );
+        const std::string whole = joinLines( lines, start, end );
+        if( whole.size() <= kReceiptRegionBudgetBytes )
+        {
+            return out + ",\"text\":\"" + mcpdetail::jsonEscape( whole ) + "\",\"capped\":false}";
+        }
+        const auto [ headEnd, tailStart ] = regionHeadTail( lines, start, end, kReceiptRegionBudgetBytes / 2 );
+        return out + ",\"head\":\"" + mcpdetail::jsonEscape( joinLines( lines, start, headEnd ) )
+                   + "\",\"tail\":\"" + mcpdetail::jsonEscape( joinLines( lines, tailStart, end ) )
+                   + "\",\"elided_lines\":" + std::to_string( tailStart > headEnd + 1 ? tailStart - headEnd - 1 : 0 )
+                   + ",\"capped\":true}";
+    }
+
+    // `"edit_check":{...}` for a definition ALREADY RESOLVED in the post-edit tree, or "" when the edit
+    // left nothing of that name in that file to ask about (a replace whose payload defines something else).
+    // The empty case is why the caller emits a `post_check_unavailable` reason rather than a silent gap.
+    inline std::string editCheckReceiptJson( const IngestResult& ing, const Graph& g, const std::string& root,
+                                             NodeId focus, const std::string& pathRel )
+    {
+        const std::vector<NodeId> overloadNodes = editCheckOverloadSet( ing, g, focus );
+        const EditCheckContract   contract      = editCheckContractVsHead( ing, g, root, kDefaultMaxFileBytes, {}, focus, overloadNodes );
+        EditCheckCalleeTest       callee( ing, ing.symbols[ focus ], overloadNodes );
+        const auto [ callerIds, callerIncompatible ] = editCheckCallers( ing, g, overloadNodes, callee );
+        std::size_t incompatibleCount = 0;
+        for( NodeId c : callerIds )
+        {
+            if( callerIncompatible[c] ) { ++incompatibleCount; }
+        }
+        const EditCheckVerdict verdict = editCheckVerdict( contract, incompatibleCount );
+        const std::vector<std::pair<NodeId, std::uint32_t>> callSites =
+            incompatibleCount > 0 ? editCheckCallSites( ing, callee, callerIncompatible )
+                                  : std::vector<std::pair<NodeId, std::uint32_t>>{};
+
+        std::string out = std::string( ",\"edit_check\":{\"status\":\"" ) + verdict.status
+                        + "\",\"callers\":" + std::to_string( callerIds.size() )
+                        + ",\"incompatible\":" + std::to_string( incompatibleCount )
+                        + ",\"sites\":[";
+        bool first = true;
+        for( NodeId c : callerIds )
+        {
+            if( !callerIncompatible[c] )
+            {
+                continue;   // sites is the BROKEN set — the rows an agent must open, not the caller listing
+            }
+            const Symbol& cs = ing.symbols[c];
+            if( !first ) { out += ","; }
+            first = false;
+            out += "{\"n\":\"" + mcpdetail::jsonEscape( cs.name )
+                 + "\",\"p\":\"" + mcpdetail::jsonEscape( std::string( rw::sarif::rootRelativeUri( ing.files[ cs.fileId ], rw::sarif::rootPrefixOf( root ) ) ) )
+                 + ":" + std::to_string( cs.line ) + "\",\"l\":[";
+            bool firstLine = true;
+            for( auto it = std::lower_bound( callSites.begin(), callSites.end(), std::make_pair( c, std::uint32_t( 0 ) ) );
+                 it != callSites.end() && it->first == c; ++it )
+            {
+                if( !firstLine ) { out += ","; }
+                firstLine = false;
+                out += std::to_string( it->second );
+            }
+            out += "]}";
+        }
+        out += "]";
+        // F3 (capture-audit verify-wave2 2026-09-05): the COMPLETENESS KEYS the standalone twin carries.
+        // The fold was measured equal to `--edit-check` field for field on the fields it COPIES, and that was
+        // the gap — the standalone root carries the resolver gauge and the floor marker and the fold did not,
+        // so `"callers":2` read as a total where `<edit-check … callers="2" graph_ambiguous="5923"
+        // graph_unresolved="2952" counts_floor="1">` says it is a floor off a name-based call graph. Same
+        // helper, same JSON spelling every other folded surface uses: a disclosure survives into every
+        // sibling surface or is DECLARED, and this one had been neither.
+        out += graphCountFloorAttrJson( g );
+        out += "}";
+        (void) pathRel;
+        return out;
+    }
+
+    // `"tests_to_run":[{"p":…,<evidence>,"run":…|"run_unknown":true}]` — the SAME rows --affected=<that
+    // file> emits, through the SAME affectedAnswer, the SAME TestRunnerIndex and the SAME not-derivable
+    // disclosure the whole row family shares. <evidence> is testRowEvidence(Json): seed_kind/partner/hops,
+    // spelled as verbs_change.h spells them. The root carries "order" and "partners" beside "tests".
+    inline std::string testsToRunReceiptJson( const IngestResult& ing, const Graph& g, const std::string& root, std::uint32_t fileId )
+    {
+        // The SAME answer --affected=<this file> gives, through the SAME function — see
+        // testmap.h::affectedAnswerForFile for why this used to be a private walk and what that cost.
+        const AffectedAnswer  ans = rw::affectedAnswerForFile( ing, g, fileId );
+        const TestRunnerIndex runners( ing, root );
+        const auto            jesc   = []( std::string_view t ) { return mcpdetail::jsonEscape( std::string( t ) ); };
+        const std::string     prefix = rw::sarif::rootPrefixOf( root );
+        std::string           out    = ",\"tests_to_run\":[";
+        std::vector<rw::TestRowOut> rcRows;
+        rcRows.reserve( ans.rows.size() );
+        for( std::size_t i = 0; i < ans.rows.size(); ++i )
+        {
+            TestRow row = ans.rows[i];   // by value: see below
+            // A matched TEST file's changed= is spelled seed_kind="test" on --affected (verbs_change.h does
+            // exactly this), because "the argument matched it, run it" is a different fact from "you edited
+            // a file this test reaches". The receipt stands in for that verb, so it spells it the same way.
+            const bool seedTest = row.fileId < ans.isSeedTestFile.size() && ans.isSeedTestFile[ row.fileId ] != 0;
+            row.changed         = false;   // the IDENTICAL statement verbs_change.h uses, not a re-derivation
+            // The evidence rides the row, through the ONE builder --affected and --test-gate --json already
+            // use, so a receipt row can never say less than the verb it stands in for. A row that arrived on
+            // partner= or seed_kind= alone is a WEAKER claim than a graph-reached one, and dropping the
+            // attribute would serve it as though it were the same.
+            rcRows.push_back( { row.fileId, std::string( rw::sarif::rootRelativeUri( ing.files[ row.fileId ], prefix ) ),
+                                std::string( seedTest ? ",\"seed_kind\":\"test\"" : "" ) + rw::testRowEvidence( row, rw::EvDialect::Json ) } );
+        }
+        out += rw::testRowsJoined( runners, rcRows, rw::TestRowShape{ rw::RowDialect::Json, "p" }, jesc, "," );   // E1: --affected's <g>, "p" an array
+        out += "]";
+        // the root-level companions --affected carries beside its rows, so the two documents disclose the
+        // same facts about the same list
+        out += ",\"order\":\"evidence\",\"partners\":" + std::to_string( rw::testRowPartnerCount( ans.rows ) );
+        // F3: `"tests_to_run":[]` was an UNLABELLED ZERO. Its twin says "0 modelled tests, N shell gates the
+        // call-graph walk cannot see, counts are floors"; the fold said `[]`, which a reader takes for
+        // "nothing tests this" rather than "nothing that is a CALL EDGE tests this" (a shell harness runs the
+        // compiled binary as a subprocess, which is not an edge). An ARRAY cannot carry attributes, so the
+        // keys ride beside it — the same place --affected puts them relative to its own <test> rows, the same
+        // counter (testmap.h::scriptGatesUnmodelledCount) and the same key names writeTestGateReportJson and
+        // MCP situational_awareness already use. Never a second number.
+        out += ",\"tests\":" + std::to_string( ans.rows.size() );
+        out += ",\"script_gates_unmodelled\":" + std::to_string( scriptGatesUnmodelledCount( ing ) );
+        out += graphCountFloorAttrJson( g );
+        return out;
+    }
+
+    // The whole post-check, for a file that has just been written: rebuild the index (the invalidation the
+    // edit already forced — this pays the cost the NEXT verb call would have paid), find the edited
+    // definition again, and render both halves. Returns "" when the caller opted out; returns a
+    // `post_check_unavailable` reason rather than silence when the target can no longer be resolved.
+    // `withTests=false` is the edit-plan's shape: a plan's ops can touch several files, so the CONTRACT
+    // half is per op while the tests half would be a per-file list repeated N times. The plan receipt
+    // carries the contract per op; --affected stays the caller's own call for the tests.
+    // E2: the receipt's ONE follow-up, read off the fold it has just rendered — a contract-change with broken
+    // callers wants the call SITES (--uses=FILE:SYM); otherwise the first tests_to_run run= recipe (nextverb.h's
+    // "shell line copied from a run= row"); otherwise the test gate on the file. The same rule --edit-check's own
+    // next= states, extended by the tests half the receipt also carries.
+    inline std::string receiptNextFor( const std::string& fileIdentity, const std::string& symbolName,
+                                       const std::string& foldJson, const std::string& firstTestRun )
+    {
+        if( foldJson.find( "\"status\":\"contract-change\"" ) != std::string::npos
+            && foldJson.find( "\"incompatible\":0" ) == std::string::npos )
+        {
+            return nextFlag( "--uses=", fileIdentity + ":" + symbolName );
+        }
+        if( !firstTestRun.empty() )
+        {
+            return firstTestRun;   // a shell line copied from a run= row (nextverb.h's second form)
+        }
+        return nextFlag( "--test-gate=", fileIdentity );
+    }
+
+    // `nextOut` (E2): when given, receives receiptNextFor()'s answer (the --test-gate fallback when the file left
+    // the index).
+    inline std::string postCheckJson( const std::string& root, const std::string& fileIdentity, const std::string& symbolName,
+                                      bool withTests = true, std::string* nextOut = nullptr )
+    {
+        const McpIndex&     ix  = getIndex( root );   // the edit invalidated it; this is the rebuild
+        const IngestResult& ing = ix.ing;
+        const Graph&        g   = ix.g;
+        const std::string   prefix = rw::sarif::rootPrefixOf( root );
+
+        NodeId focus  = kNoNode;
+        std::uint32_t editedFile = std::uint32_t( -1 );
+        for( NodeId i = 0; i < NodeId( ing.symbols.size() ); ++i )
+        {
+            const Symbol& s = ing.symbols[i];
+            const std::string rel = ing.realPaths.empty()
+                                  ? std::string( rw::sarif::rootRelativeUri( ing.files[ s.fileId ], prefix ) )
+                                  : ing.files[ s.fileId ];
+            if( rel != fileIdentity )
+            {
+                continue;
+            }
+            editedFile = s.fileId;
+            if( focus == kNoNode && s.name == symbolName && s.kind != SymKind::Section )
+            {
+                focus = i;
+            }
+        }
+        if( editedFile == std::uint32_t( -1 ) )
+        {
+            if( nextOut != nullptr ) { *nextOut = nextFlag( "--test-gate=", fileIdentity ); }
+            return ",\"post_check_unavailable\":\"the edited file is not in the refreshed index\"";
+        }
+        // Review of #219 (A3): every path this receipt hands back — "file", each tests_to_run[].run recipe and
+        // the stderr "next:" — is spelled RELATIVE to the crawl root, and the receipt named no root at all.
+        // An MCP client runs in its own working directory, so a relative command it cannot anchor is a
+        // command it cannot paste. The receipt's JSON siblings (--test-gate --json, situational_awareness)
+        // have carried "root" all along; this is the surface that least afforded to omit it. Single-root
+        // only, the same condition every other root= keeps. Gate: test/receiptpostcheck.sh (18).
+        std::string out;
+        if( ing.realPaths.empty() && !root.empty() )
+        {
+            out += ",\"root\":\"" + mcpdetail::jsonEscape( root ) + "\"";
+        }
+        if( focus == kNoNode )
+        {
+            // Honest, and it happens: a replace whose payload defines a DIFFERENT name leaves no definition
+            // to ask the contract question about. Say which half is missing rather than omitting both.
+            out += ",\"post_check_unavailable\":\"'" + mcpdetail::jsonEscape( symbolName )
+                 + "' is no longer defined in the edited file — the contract check has no target\"";
+        }
+        else
+        {
+            out += editCheckReceiptJson( ing, g, root, focus, fileIdentity );
+        }
+        if( withTests )
+        {
+            out += testsToRunReceiptJson( ing, g, root, editedFile );
+        }
+        if( nextOut != nullptr )
+        {
+            // evidence order now, so next= suggests the changed/partner test ahead of a deeper graph hop
+            const std::uint32_t firstTest = withTests ? rw::firstTestFileForFile( ing, g, editedFile ) : rw::kNoFile;
+            *nextOut = receiptNextFor( fileIdentity, symbolName, out,
+                                       firstTest == rw::kNoFile ? std::string() : TestRunnerIndex( ing, root ).commandFor( firstTest ) );
+        }
+        return out;
+    }
+
+}   // namespace mcpedit
+
+// perform an edit verb end-to-end (resolve → verify freshness → splice → atomic write → invalidate index).
+// `root` = repo path, `symbol` = the def name, `pathHint` = optional disambiguating file-path substring,
+// `text` = new_body (ReplaceBody) or the inserted text (InsertBefore/After). Never throws for expected
+// failures — returns an Outcome carrying either the success JSON or a JSON-RPC error {code,message}.
+inline mcpedit::Outcome runEditVerb( const std::string& root, mcpedit::Op op, const std::string& symbol,
+                                     const std::string& pathHint, const std::string& text, bool postCheck = true )
+{
+    mcpedit::Outcome oc;
+
+    // A1: the ENGINE-level payload text gate (kBinaryPayloadRefusal above carries the why), before the index
+    // is touched. Here and not only in the CLI arm: an MCP string carries an escaped NUL as easily as a file.
+    if( looksBinary( text ) )
+    {
+        oc.ok = false; oc.errCode = -32602;
+        oc.message = "payload " + std::string( mcpedit::kBinaryPayloadRefusal );
+        return oc;
+    }
+    // R1 (V3): the redaction-marker gate is NOT here beside the NUL rule — it needs the bytes this edit
+    // would replace, so it sits after the span is resolved below. Nothing between here and there writes.
+
+    const McpIndex&     ix  = getIndex( root );
+    const IngestResult& ing = ix.ing;
+
+    // 1. resolve either a plain name or a grep-issued, freshness-pinned handle to exactly one definition.
+    const mcpedit::EditTarget target = mcpedit::resolveTarget( ix, symbol, pathHint );
+    const NodeId f = target.id;
+    if( f == kNoNode || f >= ing.symbols.size() )
+    {
+        oc.ok = false; oc.errCode = -32602;
+        oc.message = target.error.empty() ? ( "symbol '" + symbol + "' not found" ) : target.error;
+        return oc;
+    }
+
+    const Symbol&      s      = ing.symbols[f];
+    const std::uint32_t fileId = s.fileId;
+    // M12 (capture-audit-2026-09-04, lane L9): root-relative, not the raw ingest-stored spelling — before
+    // this fix, every message below and the JSON receipt's "file" field printed "./src/…" on a relative
+    // root, and the CLI's --edit-check=<file>:<sym> stderr hint pasted that same "./"-prefixed spelling
+    // into an argument --edit-check itself never prints that way (src/…, no "./"). Single-root only
+    // (ing.realPaths.empty()); multi-root already carries the correct `<label>/<rel>` identity as-is.
+    const bool         epSingleRoot = ing.realPaths.empty();
+    const std::string  path = epSingleRoot ? std::string( rw::sarif::rootRelativeUri( ing.files[ fileId ], rw::sarif::rootPrefixOf( root ) ) )
+                                           : ing.files[ fileId ];   // LABELED identity — user-facing messages / candidate lists
+    // A11 (decided 2026-07-11): all disk I/O goes to the REAL on-disk path via the
+    // diskPath seam, NEVER the labeled spelling. `disk` is the RAW ingest spelling regardless of `path`'s
+    // own root-relative cosmetic above — the two can differ by a leading "./" on a single-root run without
+    // affecting I/O, which reads/writes `disk` exclusively.
+    // Multi-root writes land in the correct root's file even though the index identity is `<label>/<rel>`.
+    const std::string& disk   = diskPath( ing, fileId );
+
+    const std::uint64_t builtHash = ( fileId < ix.fileByteHash.size() ) ? ix.fileByteHash[ fileId ] : 0;
+    // A4-F14: refuse to edit through a symlink. atomicWrite's temp-then-rename lands the new bytes at
+    // `disk` by swapping the inode the LAST path component names — for a symlink that REPLACES the link
+    // entry with a plain file, leaving the real target file completely untouched (a silent, data-losing
+    // surprise: the agent thinks it edited the target, but it edited nothing it can see).
+    //
+    // The DETECTION is rw::pathguard::isSymlink (lstat, not stat — inspect the link itself rather than
+    // following it); the MESSAGE stays here because this seam fails the OPPOSITE way round — rename replaces
+    // the link and spares the target, a sidecar's truncating open follows the link and destroys it.
+    //
+    // A CHECK IS THE RIGHT SHAPE *HERE*, and only here. The three sidecar writers used to ask this same
+    // question before their own open, which was check-then-open and raceable (CWE-367); their guard is now
+    // the open itself (O_NOFOLLOW, src/pathguard.h). This seam never opens `disk` at all — it refuses into a
+    // JSON-RPC error object and returns — so there is no second resolution for a replacement to land in
+    // front of, and nothing here to make atomic. atomicWrite's own publish then goes to a fresh temp path
+    // and a rename, which cannot follow a link into someone else's file. See src/pathguard.h.
+    if( rw::pathguard::isSymlink( disk ) )
+    {
+        oc.ok = false; oc.errCode = -32602;
+        oc.message = "refusing to edit '" + path + "': it is a symlink, and editing through it would replace "
+                     "the link itself with a regular file rather than modifying the real target — the target "
+                     "would be silently left unchanged. Resolve the symlink and edit the real file directly.";
+        return oc;
+    }
+
+    // F1: hold a per-file advisory lock across the ENTIRE read→check→splice→rename below, so two cooperating
+    //     codecortex MCP edit ops on one file serialize instead of racing (RAII: released at function return).
+    //     Refuses when another holder keeps the lock past the bounded acquire — proceeding could let that
+    //     cooperating writer undo this edit after it reports applied. An unopenable lockfile or a filesystem
+    //     without flock degrades lock-free (no holder is provable); the re-check is the floor for both.
+    //     Keyed by the REAL disk path so cross-process serialization lands on the actual file, not the label.
+    const mcpedit::EditLock editLock( disk );
+    if( editLock.contended )
+    {
+        oc.ok = false; oc.errCode = -32603;
+        oc.message = "edit lock unavailable for '" + path + "'; another edit is in progress — retry after it is released; "
+                     "file left unchanged";
+        return oc;
+    }
+
+    // 2. staleness: re-read the file NOW and verify its bytes still match what the index was built from.
+    //    A mismatch means the span offsets below may address shifted bytes → refuse, tell the agent to
+    //    refresh (any read verb rebuilds the index) before retrying. This is the load-bearing safety check.
+    bool readOk = false;
+    const std::string src = mcpdetail::readFileBytes( disk, readOk );
+    if( !readOk )
+    {
+        oc.ok = false; oc.errCode = -32603;
+        oc.message = "cannot read file '" + path + "' to apply edit";
+        return oc;
+    }
+    const std::uint64_t freshHash = mcpdetail::byteHash( src.data(), src.size() );
+    if( freshHash != builtHash || builtHash == 0 )
+    {
+        oc.ok = false; oc.errCode = -32602;
+        oc.message = "file '" + path + "' changed since index was built; call any read verb to refresh the index, then retry";
+        return oc;
+    }
+    // pin the content hash we spliced against — re-checked immediately before the rename (F1) so a concurrent
+    // committed write in the [read..rename] window is DETECTED and REFUSED, never silently clobbered.
+    const std::uint64_t baseHash = freshHash;
+
+    // 3. span sanity — the FULL def span is [sigStartByte, endByte) (same span --expand slices). Degrade,
+    //    never assert: an out-of-range span refuses rather than splicing out of bounds.
+    const std::size_t a = s.sigStartByte, b = s.endByte;
+    if( !( a < b && b <= src.size() ) )
+    {
+        oc.ok = false; oc.errCode = -32603;
+        oc.message = "definition span for '" + symbol + "' is invalid (a=" + std::to_string( a )
+                   + " b=" + std::to_string( b ) + " size=" + std::to_string( src.size() ) + ")";
+        return oc;
+    }
+
+    // R1 (V3): the redaction-marker gate, here rather than at the top beside the NUL rule, because the honest
+    // predicate needs the bytes this edit would replace (see redactionMarkerRefusal). Measured on `text`, the
+    // payload exactly as handed in — the CRLF harmonisation below can neither add nor remove a marker.
+    const std::string redactionRefusal =
+        mcpedit::redactionMarkerRefusalFor( op, text, src, std::string_view( src ).substr( a, b - a ), path );
+    if( !redactionRefusal.empty() )
+    {
+        oc.ok = false; oc.errCode = -32602;
+        oc.message = "payload " + redactionRefusal;
+        return oc;
+    }
+
+    // F-07: harmonize the payload's line endings to the TARGET's own dominant ending before splicing. A
+    // payload written in plain LF (the common agent shape) spliced verbatim into a CRLF-dominant file used
+    // to leave the file silently MIXED — nothing on the receipt said so. Only the Crlf case is normalized
+    // (Lf targets already match a plain-LF payload; None/Mixed targets have no single convention to match,
+    // so the payload is left exactly as given rather than guessed into one). Disclosed on the receipt below
+    // either way via file_eol=/eol_normalized=, so an agent never has to re-read the file to find out.
+    const mcpedit::EolStyle fileEol       = mcpedit::detectDominantEol( src );
+    const bool              eolNormalized = ( fileEol == mcpedit::EolStyle::Crlf ) && ( text.find( '\n' ) != std::string::npos );
+    const std::string       editText      = eolNormalized ? mcpedit::normalizeToCrlf( text ) : text;
+
+    // 4. splice in memory, then ONE atomic temp-rename write (no partial write is possible).
+    std::size_t        newStart = 0, newEnd = 0;
+    mcpedit::SeamInfo  seam;
+    const std::string  newBytes = mcpedit::applyEdit( op, src, a, b, editText, newStart, newEnd, seam );
+
+    // F1: RE-CHECK FRESHNESS IMMEDIATELY BEFORE THE RENAME. The advisory lock serializes cooperating codecortex
+    //     edits, but a NON-cooperating external writer (editor/formatter on save) won't take the lock. So right
+    //     before we swap the inode, re-read the file and compare its hash to the one we spliced against; if it
+    //     changed, ABORT and refuse as stale — never rename our splice-over-stale-bytes on top of the other
+    //     party's committed write. This collapses the lost-update window to the tiny gap between this re-hash
+    //     and the rename (a residual that advisory locks cannot fully close vs an external writer — documented
+    //     in the verb schema). Same refusal SHAPE as the pre-check freshness gate above.
+    {
+        bool              recheckOk = false;
+        const std::string cur       = mcpdetail::readFileBytes( disk, recheckOk );
+        const std::uint64_t curHash = recheckOk ? mcpdetail::byteHash( cur.data(), cur.size() ) : 0;
+        if( !recheckOk || curHash != baseHash )
+        {
+            oc.ok = false; oc.errCode = -32602;
+            oc.message = "file '" + path + "' changed since index was built; call any read verb to refresh the index, then retry"
+                         " (concurrent write detected just before commit — edit aborted, file left unchanged)";
+            return oc;
+        }
+    }
+
+    if( !mcpedit::atomicWrite( disk, newBytes ) )
+    {
+        oc.ok = false; oc.errCode = -32603;
+        oc.message = "atomic write failed for '" + path + "'; file left unchanged";
+        return oc;
+    }
+
+    // 5. force the cached index stale so the next verb rebuilds (belt-and-braces on top of the mtime watch),
+    //    and report the applied span + the OLD index stamp with a note that it will refresh.
+    char oldStamp[ 96 ];
+    rw::formatTo( oldStamp, sizeof( oldStamp ), "[index: files={} symbols={} hash={:08x}]",
+                   ing.files.size(), ing.symbols.size(), (unsigned)( ix.contentHash & 0xFFFFFFFFu ) );
+    invalidateMcpIndex();
+
+    const char* opName = ( op == mcpedit::Op::ReplaceBody ) ? "replace_symbol_body"
+                       : ( op == mcpedit::Op::InsertBefore ) ? "insert_before_symbol"
+                       : "insert_after_symbol";
+    oc.ok     = true;
+    oc.symbol = s.name;
+    oc.file   = path;
+    // P9: copied out BEFORE the receipt is assembled, because the post-check below rebuilds the ONE cached
+    // McpIndex — every reference into `ing` (and therefore `s`) is dangling from that point on. The three
+    // values the post-check needs are plain strings, taken here while they are still valid.
+    const std::string pcFileIdentity = path;
+    const std::string pcSymbolName   = s.name;
+    const mcpedit::LineRange pcLines = mcpedit::lineRangeOf( newBytes, newStart, newEnd );
+    oc.resultJson = std::string( "{\"applied\":\"" ) + opName
+                  // resolved_from_handle / resolved_from_seed: "symbol" above reports the RESOLVED name, so an
+                  // indirect target (handle or @FILE:LINE seed) survives as typed for the agent to audit the
+                  // resolution — the of=-echo posture, receipt-side. Absent for a plain-name target.
+                  + "\",\"symbol\":\"" + mcpdetail::jsonEscape( s.name )
+                  + ( target.byHandle ? "\",\"resolved_from_handle\":\"" + mcpdetail::jsonEscape( symbol ) : std::string() )
+                  + ( target.bySeed   ? "\",\"resolved_from_seed\":\""   + mcpdetail::jsonEscape( symbol ) : std::string() )
+                  + "\",\"file\":\"" + mcpdetail::jsonEscape( path )
+                  // F-16: span is the POST-EDIT byte range in the NEW file (where the applied text now
+                  // sits), not the region overwritten in the old one — for ReplaceBody those two lengths
+                  // usually differ. replaced_bytes is that separate number: how many OLD bytes this op
+                  // overwrote (b-a for ReplaceBody; 0 for the two insert ops, which overwrite nothing).
+                  + "\",\"span\":{\"start\":" + std::to_string( newStart ) + ",\"end\":" + std::to_string( newEnd ) + "}"
+                  // P9: the same region as FILE:LINE. Free (one scan of the new bytes, no index work), so it
+                  // rides even under --no-post-check — every other verb in this tool speaks lines.
+                  + ",\"lines\":{\"start\":" + std::to_string( pcLines.start ) + ",\"end\":" + std::to_string( pcLines.end ) + "}"
+                  + ",\"replaced_bytes\":" + std::to_string( op == mcpedit::Op::ReplaceBody ? ( b - a ) : 0 )
+                  + ",\"old_file_bytes\":" + std::to_string( src.size() )
+                  + ",\"new_file_bytes\":" + std::to_string( newBytes.size() )
+                  // F-07: the TARGET's own dominant line ending, and whether the payload was rewritten to
+                  // match it (Crlf targets only — see above). A caller that cares whether its LF payload
+                  // just got silently rewritten reads this instead of re-hashing the file.
+                  + ",\"file_eol\":\"" + mcpedit::eolStyleName( fileEol )
+                  + "\",\"eol_normalized\":" + ( eolNormalized ? "true" : "false" )
+                  + mcpedit::seamDisclosureJson( seam )   // E1: what the seam rules did to the payload — never silent
+                  // E2: the post-edit region as it is on disk, and the git id of the written bytes — both free (no
+                  // index), so they ride under --no-post-check too; the agent has no Read left to make
+                  + mcpedit::receiptRegionJson( newBytes, pcLines )
+                  + ",\"blob_sha\":\"" + gitblob::blobOid( newBytes ) + "\""
+                  + ",\"stale_index\":\"" + mcpdetail::jsonEscape( oldStamp )
+                  + "\",\"note\":\"index invalidated; the next verb call rebuilds from disk\"";
+    // P9: the folded verification, LAST — it rebuilds the index, so nothing above may be read after it.
+    // E2: ONE next= (METHODOLOGY §9 #3) — derived from the fold; under --no-post-check it is the one call that
+    // shows the state, --edit-check=FILE:SYM.
+    oc.next = nextFlag( "--edit-check=", pcFileIdentity + ":" + pcSymbolName );
+    if( postCheck )
+    {
+        oc.resultJson += mcpedit::postCheckJson( root, pcFileIdentity, pcSymbolName, true, &oc.next );
+    }
+    oc.resultJson += nextFieldJson( oc.next );
+    oc.resultJson += "}";
+    return oc;
+}
+
+}   // namespace rw

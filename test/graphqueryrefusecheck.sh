@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# graphqueryrefusecheck.sh — §P0.5b gate: --graph-query must refuse an unknown name() like its siblings.
+#
+#   --graph-query='name("DoesNotExist")'  ->  count="0", exit 0, stderr EMPTY      (before)
+#   --callers=DoesNotExist                ->  exit 1 + did-you-mean
+#
+# Eleven of thirteen symbol-taking verbs refuse an unknown name with a suggestion; --graph-query returned a
+# silent zero — and it is where a typo is MOST likely, because the name is buried inside an expression.
+#
+# The line this gate draws: judge the LITERAL, not the result. A name() that resolves to nothing is always a
+# user error. A name() that DOES resolve, inside a composed query that legitimately selects nothing, is a
+# measurement and must still exit 0 with count="0".
+#
+#   CODECORTEX_BIN=build/codecortex      bash test/graphqueryrefusecheck.sh
+#   CODECORTEX_BIN=build_base/codecortex bash test/graphqueryrefusecheck.sh   # must FAIL (pre-fix binary)
+
+set -u
+ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+BIN="${1:-${CODECORTEX_BIN:-$ROOT/build/codecortex}}"
+[ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
+TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
+fail=0
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
+no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
+
+[ -x "$BIN" ] || { echo "no codecortex binary at $BIN — build first"; exit 2; }
+echo "graphqueryrefusecheck: BIN=$BIN  ROOT=$ROOT"
+
+# ── 1. a bare unknown name refuses, names the literal, and prints no <query> element
+# §P12.1: didYouMean() now does true bounded edit distance (not the old shared-prefix*4-lenDelta score that
+# always forced SOME guess, however unrelated), so it only suggests when a real near-miss exists. "mainn" is
+# a genuine 1-edit typo of this repo's own "main" — a real near-miss — so the did-you-mean assertion still
+# tests the actual (fixed) behavior instead of pinning the old bug.
+"$BIN" "$ROOT" --graph-query='name("mainn")' >"$TMP/out" 2>"$TMP/err"; rc=$?
+if [ "$rc" -eq 1 ]; then ok "unknown name(): exit 1"; else no "unknown name(): exit $rc (expected 1)"; fi
+grep -q 'mainn' "$TMP/err" && ok "refusal names the unresolved literal" \
+    || no "refusal does not name the literal: $( head -c 200 "$TMP/err" )"
+grep -q 'count=' "$TMP/out" && no "refusal still printed a <query count=> element" || ok "no count= element on the refusal path"
+grep -qi 'did you mean' "$TMP/err" && ok "refusal carries a did-you-mean suggestion" \
+    || no "refusal has no did-you-mean (siblings all offer one)"
+
+# ── 2. an unknown name BURIED inside a larger expression refuses too — that is the likeliest typo site
+"$BIN" "$ROOT" --graph-query='and(callers(name("parseArgsTypo"),2),kind(all,fn))' >"$TMP/out2" 2>"$TMP/err2"; rc2=$?
+[ "$rc2" -eq 1 ] && ok "unknown name() nested in an expression: exit 1" \
+    || no "unknown name() nested in an expression: exit $rc2 (expected 1)"
+if grep -q 'parseArgsTypo' "$TMP/err2"; then ok "nested refusal names the literal"; else no "nested refusal does not name the literal"; fi
+
+# ── 2b. C3: the SAME typo, with the pushdown-eligible predicate(all,…) arm FIRST and the typo'd name() arm
+#    SECOND — the order check #2 doesn't exercise. and()'s predicate pushdown must not short-circuit the
+#    other arm just because a predicate-on-`all` arm parses first; if it did, this typo would silently vanish
+#    (exit 0) instead of refusing.
+"$BIN" "$ROOT" --graph-query='and(kind(all,fn),callers(name("parseArgsTypo"),2))' >"$TMP/out2b" 2>"$TMP/err2b"; rc2b=$?
+[ "$rc2b" -eq 1 ] && ok "unknown name() nested behind a pushdown-eligible predicate(all,…) arm: exit 1" \
+    || no "unknown name() behind predicate(all,…): exit $rc2b (expected 1) — pushdown short-circuited the other arm"
+grep -q 'parseArgsTypo' "$TMP/err2b" && ok "reordered nested refusal still names the literal" \
+    || no "reordered nested refusal does not name the literal"
+
+# ── 3. a RESOLVING name inside a query that legitimately selects nothing is a MEASUREMENT
+"$BIN" "$ROOT" --graph-query='cx(name("main"),999999)' >"$TMP/zero" 2>/dev/null; rc3=$?
+[ "$rc3" -eq 0 ] && grep -q '<query [^>]*count="0"' "$TMP/zero" \
+    && ok 'name("main") + impossible filter still exits 0 with count="0" (a measurement)' \
+    || no "name(\"main\") + impossible filter: exit $rc3 without count=\"0\""
+
+# ── 4. an ordinary query is untouched
+"$BIN" "$ROOT" --graph-query='name("main")' >"$TMP/ok" 2>/dev/null; rc4=$?
+N="$( grep -oE ' count="[0-9]+"' "$TMP/ok" | head -1 | grep -oE '[0-9]+' )"
+[ "$rc4" -eq 0 ] && [ "${N:-0}" -ge 1 ] && ok "name(\"main\") resolves: exit 0 count=$N" \
+    || no "name(\"main\"): exit $rc4 count=${N:-<none>} (expected exit 0, count >= 1)"
+
+# ── 5. the refusal must agree with the siblings — same string, same verdict
+"$BIN" "$ROOT" --callers=mainn >/dev/null 2>&1; sib=$?
+[ "$sib" -eq 1 ] && ok "--callers=mainn also exits 1 (siblings agree)" \
+    || no "--callers=mainn exits $sib — the sibling contract this gate mirrors has moved"
+
+# ── 6. nesting depth is bounded before evaluation. The evaluator recurses once per `(` level, and a cx(cx(…all…,1),1)
+#    chain 20,000 levels deep overflowed the stack: SIGSEGV, exit 139, no output. On the default 8 MB main-thread stack
+#    that crashed a macOS dev build and a Linux release build. It is refused now at 256 levels, with the reason, before
+#    evaluation; a chain inside the bound still evaluates.
+#    Two platform limits shape this arm. Linux caps ONE argv string at MAX_ARG_STRLEN (128 KiB), so the expression is
+#    120 KB (the cx( form nests the most frames per byte; a 400 KB chain was refused by execve with "Argument list too
+#    long" before codecortex ran). And frame sizes differ between compilers and build flavours, so the run gets a 2 MB
+#    stack: without the bound that depth overflows on every build, and with it the refusal never evaluates at all.
+FIX="$ROOT/test/fixture"
+DEEP="$( python3 -c 'n=20000; print("cx("*n + "all" + ",1)"*n)' )"
+( ulimit -s 2048 2>/dev/null; exec "$BIN" "$FIX" --graph-query="$DEEP" ) >"$TMP/deep.out" 2>"$TMP/deep.err"; rc6=$?
+[ "$rc6" -eq 1 ] && ok "a 20,000-level expression refuses: exit 1" \
+    || no "a 20,000-level expression: exit $rc6 (expected 1; 139 is the stack overflow this arm exists for, 126 an argv the OS refused)"
+grep -q 'nests deeper than 256 levels' "$TMP/deep.err" && ok "the refusal names the nesting bound" \
+    || no "the deep refusal does not name the bound: $( head -c 200 "$TMP/deep.err" )"
+SHALLOW="$( python3 -c 'n=200; print("kind("*n + "all" + ",fn)"*n)' )"
+"$BIN" "$FIX" --graph-query="$SHALLOW" >"$TMP/shallow.out" 2>/dev/null; rc6b=$?
+[ "$rc6b" -eq 0 ] && grep -q '<query [^>]*count="[1-9]' "$TMP/shallow.out" \
+    && ok "a 200-level expression inside the bound still evaluates (exit 0, count >= 1)" \
+    || no "a 200-level expression: exit $rc6b without a non-zero count"
+
+[ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES ABOVE"
+exit $fail

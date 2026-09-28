@@ -1,0 +1,572 @@
+#pragma once
+
+// notes.h — L3 repo field notes: a committed, human-reviewable write-side
+// MEMORY keyed to symbols/files, surfaced at retrieval. `--recall` reads docs; this is the missing write
+// path keyed to a symbol. The most expensive thing an agent rebuilds across sessions is gotchas (this
+// round pinned four), not structure — a note pins one to the symbol it belongs to.
+//
+// STORE: `.codecortex_notes` at the repo root — a committed, sorted, merge-friendly text file (the B10 sorted-
+// acks precedent: two sessions each appending a DIFFERENT note produce two pure, non-overlapping insertions
+// a 3-way text merge resolves cleanly). One line per note, in ONE of two shapes:
+//     <canonical-id or path>\t<ISO-date>\t<text, no tabs/newlines>                              (legacy, 3 fields)
+//     <canonical-id or path>\t<ISO-date>\t<text, no tabs/newlines>\t<HEAD sha>\t<branch>          (provenance-stamped, 5 fields)
+// `target` is either a canonical id (path::scope::name, exactly as serialization emits `id=`) or a file path.
+//
+// PROVENANCE STAMP (the day's costliest lesson: a "done" claim with nothing anchoring it to a commit is
+// worthless the moment the tree moves on). --note-add now stamps the writing repo's HEAD sha + branch onto
+// every NEW note (main.cpp's --note-add handler resolves them via quality::gitHeadSha / `rev-parse
+// --abbrev-ref HEAD` and hands them to addNote). BACKWARD COMPATIBILITY is load-bearing — `.codecortex_notes`
+// is a COMMITTED file in real repos, so the format must extend, never break:
+//   - `text` itself can never contain a tab (sanitizeField strips them on write), so any tab appearing AFTER
+//     the third field is unambiguously the start of the sha/branch suffix — a 3-field legacy line (no such
+//     tab) and a 5-field stamped line (two more) coexist in the SAME file and both parse correctly.
+//   - a line is only ever WRITTEN with 5 fields when a real sha was resolved; a non-git root or an
+//     unresolvable HEAD writes the plain 3-field legacy shape — "no sha shown rather than a wrong one".
+//   - `sha`/`branch` default-construct empty, so every existing call site that builds a Note with 3
+//     initializers still compiles (aggregate init zero-fills the trailing fields).
+//
+// PORTABILITY (D5 fix): the path component of `target` is stored ROOT-RELATIVE, never absolute — a note
+// committed alongside the repo must resolve on any other checkout, whose crawl root lands somewhere else on
+// disk. normalizeNoteTarget() is the ONE seam that enforces this: it canonicalizes an absolute in-root target
+// to root-relative on WRITE (see runNotes' --note-add handler in main.cpp) and refuses an outside-root target
+// loudly rather than silently writing an entry that can never match anywhere. readNotesRelative() is the READ
+// half — it re-normalizes on load so a LEGACY .codecortex_notes written before this fix (absolute targets) keeps
+// surfacing correctly without a rewrite. A bare-name SYM target (no scope, e.g. a free function — canonicalId
+// degrades to just `name`) has no path component at all and passes through both untouched.
+//
+// INERTNESS CONTRACT: an absent OR empty notes file yields an empty NoteIndex → surfacing emits ZERO bytes,
+// so every verb's output is byte-identical to the pre-feature output (gated by cmp). Notes are DATA, never
+// instructions — the retrieval-time emitter (serialize.h::renderNoteChildren) escapes them and never
+// interprets them.
+//
+// Deterministic + degrade-don't-throw: readNotes tolerates anything a sorted-write does not itself guarantee
+// (out-of-order lines from a hand edit or an older-revision merge, CRLF from a Windows checkout, blank/comment
+// lines) and self-heals to canonical order on the next write; a malformed line degrades+skips, never throws.
+
+#include "model.h"              // HashMap<> — the flat, cache-friendly lookup index (never std::unordered_map)
+#include "infra/Diagnostics.h"  // DISCLOSE — the degrade path for a malformed line / unwritable file
+#include "arch.h"               // D5: relForHash — the SAME lexical, no-I/O root-relative strip the baseline sidecars use
+#include "pathguard.h"          // CWE-59/367: rw::pathguard::openNoFollowTruncate — writeNotes truncates, so its open must refuse a link atomically
+#include "infra/blanktext.h"    // §S3: rw::hasVisibleContent — the ONE "present but carries nothing" predicate
+
+#include <algorithm>
+#include <array>
+#include <cerrno>    // ELOOP — the one errno writeNotes re-words into its own symlink alert
+#include <cstdint>
+#include <fstream>
+#include <sstream>   // the note lines are assembled in memory, then handed to the no-follow descriptor
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace rw::notes
+{
+
+// the committed store, at the repo root — mirrors quality.h's kAcksFile convention.
+inline const char* kNotesFile = ".codecortex_notes";
+
+// one field note. POD-ish; owns its strings (a note file is small, so simplicity beats SoA here).
+struct Note
+{
+    std::string target;   // a canonical id (path::scope::name) or a file path — matched verbatim at surfacing
+    std::string date;     // ISO short date (YYYY-MM-DD): git's committer clock at add time, NOT wall time
+    std::string text;     // the note body — no tabs / newlines (stripped on add); may hold XML metachars
+    std::string sha;      // provenance: the writing repo's HEAD sha at add time, full 40/64-hex ("" = legacy/unstamped — never a WRONG sha, only an absent one)
+    std::string branch;   // provenance: `rev-parse --abbrev-ref HEAD` at add time ("HEAD" on a detached checkout; "" alongside an empty sha)
+};
+
+// canonical total order: (target, date, text, sha, branch) ascending — a sort has no tolerance band, so it
+// must be a TOTAL order for byte-stable output (the det-gate discipline). Matches the acks file's
+// merge-friendly write. sha/branch are the LAST tie-breakers so a legacy (unstamped) and a provenance-stamped
+// note that otherwise share (target,date,text) sort deterministically regardless of read/insertion order —
+// empty sha/branch sort first (a legacy entry precedes a stamped duplicate of the same content).
+inline bool noteLess( const Note& a, const Note& b ) noexcept
+{
+    if( a.target != b.target )
+    {
+        return a.target < b.target;
+    }
+    if( a.date != b.date )
+    {
+        return a.date < b.date;
+    }
+    if( a.text != b.text )
+    {
+        return a.text < b.text;
+    }
+    if( a.sha != b.sha )
+    {
+        return a.sha < b.sha;
+    }
+    return a.branch < b.branch;
+}
+
+inline void sortNotes( std::vector<Note>& notes )
+{
+    std::stable_sort( notes.begin(), notes.end(), noteLess );
+}
+
+// root + "/" + kNotesFile — the notes file lives ALONGSIDE the analyzed tree (its targets are root-relative
+// canonical ids), so it is keyed off the ingest root exactly as invoked.
+inline std::string notesPath( const std::string& root )
+{
+    std::string p = root;
+    if( !p.empty() && p.back() != '/' )
+    {
+        p += '/';
+    }
+    p += kNotesFile;
+    return p;
+}
+
+// collapse a raw field to a single tab/newline-free, edge-trimmed line — enforces the format invariant at the
+// write seam so a pasted multi-line note can never corrupt the tab-delimited file.
+//
+// This function is about the FILE FORMAT (no tabs, no newlines, no edge spaces) and nothing else. It is NOT
+// the "does this field carry anything" predicate — see sanitizeNoteField below for why the two were confused
+// and what it cost.
+inline std::string sanitizeField( std::string_view s )
+{
+    std::string out;
+    out.reserve( s.size() );
+    for( char c : s )
+    {
+        out += ( c == '\t' || c == '\n' || c == '\r' ) ? ' ' : c;
+    }
+    const std::size_t a = out.find_first_not_of( ' ' );
+    if( a == std::string::npos )
+    {
+        return {};
+    }
+    const std::size_t b = out.find_last_not_of( ' ' );
+    return out.substr( a, b - a + 1 );
+}
+
+// ── §S3 (capture-audit-4, 2026-07-30) — sanitize AND decide, in one call ──────────────────────────────────
+//
+// `--note-add` used to sanitize a field and then ask `.empty()` about the result. That pair is a THIRD
+// spelling of "present but carries nothing", and it is the weakest of the three: sanitizeField maps only
+// \t \n \r to a space and trims ASCII spaces, so an ASCII-blank note was refused while **6 of 6** other
+// blank classes were accepted and COMMITTED into `.codecortex_notes` — NBSP, ZWSP, BOM, U+2800 BRAILLE PATTERN
+// BLANK, a bidi RLO, and a raw VT (0x0B) written verbatim into a text file this tool tells users to commit
+// and merge. Same equivalence class the MCP edit verbs' §H2/ITEM A ruling already closed, one file over.
+//
+// So the verdict comes from `rw::hasVisibleContent` — the ONE derived predicate (src/infra/blanktext.h), which
+// mcp.h's edit payloads read too — and it is returned TOGETHER with the sanitized text rather than left for
+// the caller to ask separately. A caller cannot sanitize a note field without being handed the answer to
+// "is there anything in it", which is exactly the step the old two-call shape let a call site skip.
+//
+// Deliberately NOT applied to the branch name (main.cpp sanitizes that with the plain sanitizeField): a
+// branch is provenance the tool resolved itself, never user payload, and an empty one already means "no
+// stamp" by design.
+struct NoteField
+{
+    std::string text;                 // the sanitized, single-line, tab-free, edge-trimmed field
+    bool        hasContent = false;   // rw::hasVisibleContent( text ) — false ⇒ nothing a reader could see
+};
+
+inline NoteField sanitizeNoteField( std::string_view raw )
+{
+    NoteField field{ sanitizeField( raw ), false };
+    field.hasContent = rw::hasVisibleContent( field.text );
+    return field;
+}
+
+// ── R6: decision-shaped note heuristic (write-side, interactive nudge only) ────────────────────────────
+//
+// A note that names WHAT was decided and WHY retrieves better than plain description — "chose refcount
+// over raw pointer because the arena outlives the handle" tells a future reader what to do differently;
+// "watch the lifetime here" does not. This table is a NUDGE trigger, never a gate: --note-add always
+// writes whatever text it's given, unconditionally. isDecisionShaped() only decides whether runNotes'
+// --note-add handler (main.cpp) prints a one-line stderr tip alongside the write — pure substring match,
+// no locale/case-folding, so the same text always yields the same verdict on any machine (determinism
+// contract). This function has no I/O and never touches stdout, so it cannot contaminate --note-add's
+// printed line or any later --for/--expand/default-map XML emission.
+inline constexpr std::array<std::string_view, 8> kDecisionMarkers = {
+    "because", "chose", "over", "instead", "broke", "->", "vs", "due to"
+};
+
+inline bool isDecisionShaped( std::string_view text )
+{
+    for( std::string_view marker : kDecisionMarkers )
+    {
+        if( text.find( marker ) != std::string_view::npos )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// ── H1 (capture-audit 2026-09-04): IS THIS TARGET A PATH, OR A SYMBOL SELECTOR THAT MISSED? ────────────
+//
+// The write side now resolves a target through the SAME resolver the read verbs use, and has to decide what
+// a target that resolved to NOTHING is: a file the caller has not created yet (legal — the "leave this for
+// the file I am about to add" note, which stays dangling until that path exists), or a symbol selector with
+// a typo in it (a dead note, refused with a did-you-mean). Only the SHAPE of the string can say, and the
+// three shapes that are unambiguously NOT a path come first — every one of them is a spelling the resolver
+// itself defines:
+//
+//   "::"          a canonical id or a Scope::name — no crawled path carries a literal "::" (the same fact
+//                 normalizeNoteTarget's split below rests on), so a mistyped canonical id is a mistyped
+//                 SYMBOL and must not slip through as "a file that does not exist yet" merely because it
+//                 holds a '/'.
+//   a leading '@' the @FILE:LINE line seed (graph.h::resolveAtSeed).
+//   ':'           the file:name / file:line:name qualified selector (splitQualifiedSpec). A POSIX path may
+//                 legally contain a colon; one that does is indistinguishable from that selector here, and
+//                 the honest degrade is the refusal (which names the near-miss) rather than a silent guess.
+//
+// What is left is a path iff it looks like one: it has a directory separator, or its last segment carries an
+// extension. A bare, extension-less, colon-free word is a NAME — that is the spelling the whole finding is
+// about, and treating it as a path is exactly the silent-dead-note behaviour being removed. Pure and
+// lexical; the caller ORs this with an on-disk existence test, which is I/O and does not belong here.
+inline bool noteTargetIsPathShaped( std::string_view target ) noexcept
+{
+    if( target.empty() || target.front() == '@' || target.find( ':' ) != std::string_view::npos )
+    {
+        return false;
+    }
+    if( target.find( '/' ) != std::string_view::npos )
+    {
+        return true;
+    }
+    return target.find( '.' ) != std::string_view::npos;   // no directory part — an extension is the only path tell left
+}
+
+// ── D5: root-relative target normalization (the portable-notes seam) ───────────────────────────────────
+//
+// A target is either a bare file path (no "::") or a canonical id `path::scope::name`. A file path never
+// contains a literal "::" (only '/' separators), so splitting on the FIRST "::" cleanly isolates the path
+// prefix from the scope::name suffix regardless of how many "::"-joined scope segments follow (nested
+// namespaces/classes). A bare-name SYM target (canonicalId degrades to just `name` when scope is empty) has
+// no "::" and no leading '/' either, so it round-trips through relForHash unchanged.
+//
+// Sets `outsideRoot` when an ABSOLUTE path target does not resolve under `root` — the write-time caller
+// refuses the add loudly rather than silently committing an entry no checkout could ever match. A relative
+// target that lexically climbs above the root (`../…`) is refused the same way. Pure, no I/O — mirrors
+// relForHash's determinism contract exactly (arch.h §S2).
+inline std::string normalizeNoteTarget( std::string_view target, std::string_view root, bool& outsideRoot )
+{
+    outsideRoot = false;
+    const std::size_t      sep      = target.find( "::" );
+    const std::string_view pathPart = ( sep == std::string_view::npos ) ? target : target.substr( 0, sep );
+    const std::string_view rest     = ( sep == std::string_view::npos ) ? std::string_view{} : target.substr( sep );   // includes the leading "::"
+
+    if( pathPart.empty() )
+    {
+        return std::string( target ); // degenerate target — pass through untouched, never throw
+    }
+
+    if( pathPart.front() == '/' )
+    {
+        // absolute — must land UNDER root (same root-trim + whole-component compare as relForHash) or refuse.
+        std::string_view rootTrim = root;
+        while( rootTrim.size() > 1 && rootTrim.back() == '/' )
+        {
+            rootTrim.remove_suffix( 1 );
+        }
+        const bool underRoot = !rootTrim.empty() && rootTrim != "." && rootTrim.front() == '/'
+            && pathPart.size() >= rootTrim.size() && pathPart.compare( 0, rootTrim.size(), rootTrim ) == 0
+            && ( pathPart.size() == rootTrim.size() || pathPart[ rootTrim.size() ] == '/' );
+        if( !underRoot ) { outsideRoot = true; return std::string( target ); }
+    }
+
+    // (copy-init, not `Type rel( expr );` — the latter's a single-call-expression "parameter" that tree-sitter's
+    // C++ grammar mis-shapes as a function declarator, spuriously indexing a symbol named `rel`.)
+    std::string rel = std::string( relForHash( pathPart, root ) );
+    // a RELATIVE target that lexically escapes upward past the root is also "outside" — refuse rather than
+    // store a path a different checkout can't resolve (relForHash never touches ".." — only a prefix strip).
+    if( rel == ".." || ( rel.size() >= 3 && rel.compare( 0, 3, "../" ) == 0 ) ) { outsideRoot = true; return std::string( target ); }
+
+    rel.append( rest );
+    return rel;
+}
+
+// abbreviate a stored sha for TERSE display at surfacing sites (--notes, <note sha="…">, the MCP notes
+// array) — the file always stores the FULL sha (unambiguous, `git show`-able); only the presentation layer
+// shortens it. 7 hex chars matches git's own default --abbrev; shorter input passes through unchanged.
+inline std::string shortSha( std::string_view sha )
+{
+    return std::string( sha.size() > 7 ? sha.substr( 0, 7 ) : sha );
+}
+
+// split the tab-delimited remainder AFTER a line's (target,date) prefix into (text,sha,branch) — the ONE
+// decision behind both shapes readNotes accepts. `rest` is never tab-free by accident: sanitizeField strips
+// every tab from `text` on write, so a tab found HERE is unambiguously the start of the provenance suffix a
+// stamped write appended — never mistaken text. No third tab ⇒ the legacy 3-field shape (sha/branch stay
+// empty); a third but no fourth ⇒ a hand-edited 4-field oddity (sha only, degrade rather than reject).
+inline void splitNoteTail( std::string_view rest, std::string& text, std::string& sha, std::string& branch )
+{
+    ASSUME_NO_ALIAS3( text, sha, branch );
+    const std::size_t t3 = rest.find( '\t' );
+    if( t3 == std::string_view::npos ) { text = std::string( rest ); return; }
+    text = std::string( rest.substr( 0, t3 ) );
+    const std::string_view tail = rest.substr( t3 + 1 );
+    const std::size_t t4 = tail.find( '\t' );
+    if( t4 == std::string_view::npos ) { sha = std::string( tail ); return; }
+    sha    = std::string( tail.substr( 0, t4 ) );
+    branch = std::string( tail.substr( t4 + 1 ) );
+}
+
+// THE ONE PLACE THE NOTES SIDECAR IS READ — openNotesSidecar's other half, with the same answer to a link.
+//
+// A link at `.codecortex_notes` used to be followed on the way in, so the link chose what was read as notes. The
+// read now refuses a link with
+// the same O_NOFOLLOW the write uses, one syscall with nothing in front of it to race; why an in-tree link is
+// refused too, rather than followed the way the crawl follows one, is round 3 of src/pathguard.h. Refused or
+// absent, the caller reads no notes, and only the refusal says anything.
+//
+// What one read found BESIDE the notes: the two ways it comes back short. It is the DISCLOSE sink for this file's read
+// degrades — --notes prints both on <notes> (lines_skipped=, refused=), and addNote refuses to rewrite a sidecar holding
+// lines it could not parse, because the sorted rewrite would delete them. Every OTHER reader used to pass a local one
+// and drop it on the floor (readNotesRelative's channel-less overload, removed below) — degraded() now rides the
+// NoteIndex it built (loadNoteIndex), so --for/--expand/pack-task/edit-check/handoff/lanes/the MCP verbs all see it too,
+// as the one terse kNotesDegradedAttr marker rather than the detailed counts (CodeRabbit 4053600616 follow-up).
+struct NotesReadStats
+{
+    enum class DisclosureWhy : std::uint8_t
+    {
+        MalformedLine,    // a line missing the target/date tabs: on disk, absent from the answer
+        EmptyTarget,      // a line whose target is empty: on disk, absent from the answer
+        SymlinkRefused,   // a link at the name: refused unopened, so no note at all was read
+    };
+    std::uint32_t linesSkipped   = 0;
+    bool          symlinkRefused = false;
+    void disclose( DisclosureWhy why ) noexcept
+    {
+        switch( why )
+        {
+            case DisclosureWhy::MalformedLine:
+            case DisclosureWhy::EmptyTarget:    ++linesSkipped; break;
+            case DisclosureWhy::SymlinkRefused: symlinkRefused = true; break;
+        }
+    }
+    // true iff THIS read left something out (a skipped line, or the whole sidecar refused) — the one fact
+    // every notes-surfacing emitter besides --notes now carries (CodeRabbit 4053600616 follow-up). --notes
+    // still prints the detail (lines_skipped=/refused=); every other surface prints only this terse marker.
+    bool degraded() const noexcept { return linesSkipped != 0 || symlinkRefused; }
+};
+
+// THE ONE SPELLING OF THE L3 DEGRADE MARKER — identical on every notes-surfacing emitter: the map, --expand,
+// --for (XML and --json), pack-task (XML and --json), edit-check, handoff, lanes/landing-plan, and the MCP
+// verbs that surface notes (for, pack_task, from_trace, fetch_body). Present ONLY when NotesReadStats::degraded()
+// is true for the read that built the answer; absent on a clean read (no sidecar, or every line parsed) keeps
+// the INERTNESS CONTRACT above — zero added bytes. --notes alone keeps the detailed reading (lines_skipped=/
+// refused=); every other surface points back at it rather than repeating the counts.
+// const char* (not string_view): several call sites hand these straight to rw::emitRaw, whose std::fputs
+// backend needs a NUL-terminated pointer — the same reason every other legend constant in this tree is spelled
+// this way (kAtStampLegend, kIgnoredLegend, …).
+inline constexpr const char* kNotesDegradedAttr    = " notes_degraded=\"1\"";
+inline constexpr const char* kNotesDegradedJsonKey = ",\"notes_degraded\":true";
+// The plain-text reading, for a surface (packtask.h's `report` ledger) that splices into an EXISTING
+// `<!-- codecortex …` comment rather than opening a standalone one. No "--" anywhere in either spelling below —
+// a literal double hyphen is ill-formed inside an XML comment (G4), and "--notes" spelled that way once did
+// exactly that (measured: xmllint rejected the map, --for and pack-task roots alike).
+inline constexpr const char* kNotesDegradedReading =
+    "notes_degraded=\"1\": the .codecortex_notes sidecar had unreadable lines or was refused this run (the notes verb's own listing names which, lines_skipped=/refused=)";
+// The standalone-comment spelling, for a surface that appends its own `<!-- … -->` (same reading as above).
+inline constexpr const char* kNotesDegradedComment =
+    "<!-- notes_degraded=\"1\": the .codecortex_notes sidecar had unreadable lines or was refused this run (the notes verb's own listing names which, lines_skipped=/refused=) -->";
+
+inline rw::pathguard::NoFollowRead readNotesSidecar( const std::string& path, NotesReadStats& stats )
+{
+    rw::pathguard::NoFollowRead sidecar = rw::pathguard::openNoFollowRead( "the field-notes sidecar", path );
+    if( sidecar.refused ) { DISCLOSE( stats, NotesReadStats::DisclosureWhy::SymlinkRefused, "notes: refusing to read the notes sidecar through a symlink" ); }
+    return sidecar;
+}
+
+// tolerant read (readAckRecords precedent): skip blank/'#'/CRLF; a line missing either of the first two tabs
+// degrades+skips. splitNoteTail (above) owns the legacy-vs-stamped decision for everything after them.
+inline std::vector<Note> readNotes( const std::string& path, NotesReadStats& stats )
+{
+    std::vector<Note>           notes;
+    rw::pathguard::NoFollowRead sidecar = readNotesSidecar( path, stats );
+    if( !sidecar.opened )
+    {
+        return notes;
+    }
+    std::string line;
+    while( sidecar.readLine( line ) )
+    {
+        while( !line.empty() && ( line.back() == '\r' || line.back() == '\n' ) )
+        {
+            line.pop_back(); // CRLF tolerance
+        }
+        if( line.empty() || line[0] == '#' )
+        {
+            continue;
+        }
+        const std::size_t t1 = line.find( '\t' );
+        const std::size_t t2 = ( t1 == std::string::npos ) ? std::string::npos : line.find( '\t', t1 + 1 );
+        if( t1 == std::string::npos || t2 == std::string::npos )
+        { DISCLOSE( stats, NotesReadStats::DisclosureWhy::MalformedLine, "notes: malformed line skipped (want <target>\\t<date>\\t<text>)" ); continue; }
+        Note n;
+        n.target = line.substr( 0, t1 );
+        n.date   = line.substr( t1 + 1, t2 - t1 - 1 );
+        splitNoteTail( std::string_view( line ).substr( t2 + 1 ), n.text, n.sha, n.branch );
+        if( n.target.empty() ) { DISCLOSE( stats, NotesReadStats::DisclosureWhy::EmptyTarget, "notes: empty-target line skipped" ); continue; }
+        notes.push_back( std::move( n ) );
+    }
+    return notes;
+}
+
+
+// D5 read-side normalization: re-relativize every target against `root` on load. This is what keeps a
+// LEGACY .codecortex_notes (absolute targets, written before this fix or hand-edited) surfacing correctly on
+// the current checkout without a rewrite. Best-effort like the rest of this file: an out-of-root absolute
+// target degrades to itself unchanged (normalizeNoteTarget's outsideRoot signal is ignored here — a read
+// never fails; the entry simply stays dangling, which --notes already reports).
+inline std::vector<Note> readNotesRelative( const std::string& path, const std::string& root, NotesReadStats& stats )
+{
+    std::vector<Note> notes = readNotes( path, stats );
+    for( Note& n : notes )
+    {
+        bool outsideRoot = false;
+        n.target = normalizeNoteTarget( n.target, root, outsideRoot );
+    }
+    return notes;
+}
+
+// the exact data line writeNotes emits for one Note — shared by writeNotes (per-line) and addNote (the
+// printed confirmation), so the two can never drift apart. A note with an empty sha writes the plain
+// LEGACY 3-field shape (never a hollow "\t\t" suffix); a stamped one (sha non-empty) always writes both
+// trailing fields, even when branch itself is empty (a resolvable HEAD with an unresolvable branch name
+// — rare, but the sha alone is still honest provenance worth keeping).
+inline std::string noteLine( const Note& n )
+{
+    std::string line = n.target + "\t" + n.date + "\t" + n.text;
+    if( !n.sha.empty() )
+    {
+        line += "\t" + n.sha + "\t" + n.branch;
+    }
+    return line;
+}
+
+// THE ONE PLACE THE NOTES SIDECAR IS OPENED, and the whole of its CWE-59/CWE-367 story.
+//
+// `.codecortex_notes` is a fixed name at the root of a crawled repository and the write TRUNCATES, so a link
+// committed at that name turned --note-add into an arbitrary-file overwrite. The refusal is the OPEN itself
+// — O_NOFOLLOW, one syscall, nothing between deciding and creating for a replacement to land in. The first
+// fix asked lstat and then opened anyway, which is check-then-open; see
+// src/pathguard.h. The two alerts are this site's two failure kinds, unchanged, and they stay macros HERE so
+// each keeps its own file/line.
+inline int openNotesSidecar( const std::string& path )
+{
+    auto [ fd, openErr ] = rw::pathguard::openNoFollowTruncate( "the field-notes sidecar", path );
+    if( fd < 0 )
+    {
+        if( openErr == ELOOP ) { DISCLOSE( Diagnostics::answerRefused, "--note-add exits 1: pathguard names the refused link on stderr and the verb says it could not write",
+                                           "notes: refusing to write the notes sidecar through a symlink" ); }
+        else                   { DISCLOSE( Diagnostics::answerRefused, "--note-add exits 1: pathguard names the OS reason on stderr and the verb says it could not write",
+                                           "notes: cannot write notes file" ); }
+    }
+    return fd;
+}
+
+// write SORTED (self-healing: canonical order regardless of the on-disk shape read). The leading '#' header is
+// constant across every version (identical in a merge → never a conflict) and is skipped by readNotes.
+inline bool writeNotes( const std::string& path, std::vector<Note> notes )
+{
+    sortNotes( notes );
+    const int fd = openNotesSidecar( path );
+    if( fd < 0 )
+    {
+        return false;
+    }
+    std::ostringstream f;
+    f << "# codecortex field notes v1 — one per line: <canonical-id or path> <TAB> <ISO-date> <TAB> <text> [<TAB> <HEAD sha> <TAB> <branch>]. Kept SORTED (merge-friendly union); dates are git committer-clock, not wall time; the trailing sha/branch pair is present only on provenance-stamped notes.\n";
+    for( const Note& n : notes )
+    {
+        f << noteLine( n ) << '\n';
+    }
+    return rw::pathguard::writeAllAndClose( fd, f.str() );
+}
+
+// append (target,date,text[,sha,branch]), re-sort, write; return the EXACT written data line so --note-add
+// can print precisely what it wrote, or "" on a write failure. Idempotent: an identical (target,date,text,
+// sha,branch) is not duplicated (re-running the same add is a no-op line, still printed) — sha/branch are
+// part of the identity so a legacy unstamped entry and a later re-add of the SAME text from a real commit
+// are both kept (they are genuinely different provenance claims, not a duplicate).
+//
+// A sidecar holding lines readNotes could not parse is NOT rewritten: the sorted rewrite keeps only what was read, so it
+// would delete committed text nobody asked to delete. `stats` comes back with linesSkipped > 0 and "" is returned; the
+// caller names the refusal.
+inline std::string addNote( const std::string& path, NotesReadStats& stats, std::string_view target, std::string_view date, std::string_view text,
+                            std::string_view sha = {}, std::string_view branch = {} )
+{
+    std::vector<Note> notes = readNotes( path, stats );
+    if( stats.linesSkipped != 0 )
+    {
+        return {};
+    }
+    Note n{ std::string( target ), std::string( date ), std::string( text ), std::string( sha ), std::string( branch ) };
+    bool dup = false;
+    for( const Note& e : notes )
+    {
+        if( e.target == n.target && e.date == n.date && e.text == n.text && e.sha == n.sha && e.branch == n.branch )
+        {
+            dup = true;
+            break;
+        }
+    }
+    if( !dup )
+    {
+        notes.push_back( n );
+    }
+    if( !writeNotes( path, std::move( notes ) ) )
+    {
+        return {};
+    }
+    return noteLine( n );
+}
+
+// ── retrieval-time surfacing index ───────────────────────────────────────────────────────────────────────
+// target-string → the notes on it (in sorted/file order). Built once per run from the notes file; looked up
+// by canonical id (a symbol) and by path (a file) as the emitter walks each surfaced element. `notes` here
+// are ALREADY root-relative (readNotesRelative, called by loadNoteIndex) — `root` is carried alongside so a
+// surfacing site holding a CRAWL-ROOT-PREFIXED path (ing.files[...], spelled `<root>/<relative>` verbatim —
+// see arch.h §S2) can relativize it the same way (relForHash(rawPath, ni->root)) before calling find().
+struct NoteIndex
+{
+    std::string                                      root;       // D5: the ingest root this index was loaded for
+    std::vector<Note>                                notes;      // owns storage, sorted (byte-stable emit order)
+    HashMap<std::string, std::vector<std::uint32_t>> byTarget;   // target → indices into `notes`
+    // the read that built `notes` left something out (NotesReadStats::degraded()) — carried alongside empty()
+    // rather than folded into it: a fully-degraded read (every line malformed, or the sidecar refused) leaves
+    // `notes` empty too, and the marker must still reach the caller, which is exactly the byte this lane adds.
+    bool                                              degraded = false;
+
+    bool empty() const noexcept { return notes.empty(); }
+
+    // nullptr ⇒ no notes on this target (the INERT common case) → the emitter writes zero bytes.
+    const std::vector<std::uint32_t>* find( const std::string& target ) const
+    {
+        const auto it = byTarget.find( target );
+        return it == byTarget.end() ? nullptr : &it->second;
+    }
+};
+
+inline NoteIndex buildNoteIndex( std::vector<Note> notes, std::string root = {}, bool degraded = false )
+{
+    sortNotes( notes );
+    NoteIndex idx;
+    idx.root     = std::move( root );
+    idx.notes    = std::move( notes );
+    idx.degraded = degraded;
+    idx.byTarget.reserve( idx.notes.size() );   // reserve to expected size — skip the ankerl rehash cascade
+    for( std::uint32_t i = 0; i < idx.notes.size(); ++i )
+    {
+        idx.byTarget[idx.notes[i].target].push_back( i );
+    }
+    return idx;
+}
+
+inline NoteIndex loadNoteIndex( const std::string& root )
+{
+    NotesReadStats     stats;   // the channel every caller now has (the removed channel-less overload's gap)
+    std::vector<Note>  notes   = readNotesRelative( notesPath( root ), root, stats );
+    return buildNoteIndex( std::move( notes ), root, stats.degraded() );
+}
+
+}   // namespace rw::notes

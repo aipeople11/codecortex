@@ -1,0 +1,60 @@
+# codecortex clang-tidy — ADVISORY, never a gate.
+#
+# Nothing here is wired to fail a build: `WarningsAsErrors` is empty, and the CI step that runs it is
+# `continue-on-error: true`. The reason is not timidity, it is scope. clang-tidy's default catalogue
+# argues for a different C++ than the one CONTRIBUTING.md §3 asks for — bounds-checked containers,
+# no C arrays, no `(int)x` casts, RAII everywhere — and this codebase is deliberately data-oriented:
+# POD structs, SoA arrays, 32-bit handles, arena allocation, `ASSUME` instead of exceptions. A gate
+# built from those checks would spend its life being suppressed. So the selection below is curated
+# down to the classes that find real defects in code shaped like this one, and even those only report.
+#
+# The `bugprone-*` family earns its place on evidence: the snprintf-truncation class it covers is a
+# HIGH this repo actually shipped and had to fix. `bugprone-integer-division` and
+# `bugprone-sizeof-expression` are called out for the same reason — both are silent-wrong-answer bugs
+# in exactly the arithmetic (rank normalisation, CSR row sizing) this code is made of.
+#
+# Run it locally against the dev build's compile database:
+#   cmake -S . -B build -DCMAKE_EXPORT_COMPILE_COMMANDS=ON && cmake --build build -j
+#   clang-tidy -p build --quiet src/main.cpp src/ingest.cpp src/pagerank.cpp
+# Use clang-tidy 22 to match the pinned clang-format major; older majors carry different check sets.
+
+Checks: >
+  -*,
+  bugprone-*,
+  bugprone-integer-division,
+  bugprone-sizeof-expression,
+  clang-analyzer-*,
+  performance-*,
+  misc-dangling-*,
+  -readability-*,
+  -modernize-avoid-c-arrays,
+  -cppcoreguidelines-pro-bounds-*
+
+# Only our own headers. third_party/ is vendored verbatim (THIRD_PARTY.md) and is not ours to relint;
+# system and tree-sitter headers would drown the report.
+HeaderFilterRegex: '(^|/)src/.*\.(h|inl)$'
+ExcludeHeaderFilterRegex: '(^|/)third_party/'
+
+# Advisory posture. Do not populate WarningsAsErrors without also budgeting the suppression work —
+# see the header note above, and re-read it before deciding a check "should obviously be a gate".
+WarningsAsErrors: ''
+
+# No automatic fixes. `-fix` on a data-oriented tree rewrites layout decisions that were made on purpose.
+FormatStyle: none
+
+# bugprone-easily-swappable-parameters is set to REVEAL, because the rows are real. Measured 2026-09-10 on e63e2d43
+# with the style job's toolchain and version.h stamped: every one of the 209 rows the upstream defaults report was
+# read and labeled. 208 are role pairs where a swap compiles and silently changes the answer — (root, path),
+# (fileId, line), (topN, budgetBytes), out-parameter pairs — and 1 is noise. So every option that shrinks the table
+# silences real rows. Counted per option: ModelImplicitConversions=false 31, MinimumLength=3 192, ignoring the
+# string_view suffix 54, the name lists a;b;x;y / from;to;lo;hi;start;stop;open;close / second;lo;hi 4 / 9 / 1, and a
+# name-affix threshold of 3 8. None of those is set. The two options below only ADD rows, and every added row is real:
+#   NamePrefixSuffixSilenceDissimilarityThreshold 0 (upstream 1): +3. Names one character apart were silenced as
+#     "similar", which hid archViolates(la, lb), findStringValue(vs, ve) and parseCappedCsvPair(capA, capB).
+#   QualifiersMix true (upstream false): +15. A const T& input beside a T& output, e.g. readFile(path, out): a swap
+#     compiles whenever the caller's input is a mutable lvalue, the common case here. These rows are also debt against
+#     CONTRIBUTING.md §3 "Interfaces" (structured-binding returns over out-params).
+# SuppressParametersUsedTogether stays true: false adds 440 rows, most of them (a, b) / (i, n) noise.
+CheckOptions:
+  bugprone-easily-swappable-parameters.NamePrefixSuffixSilenceDissimilarityThreshold: 0
+  bugprone-easily-swappable-parameters.QualifiersMix: true

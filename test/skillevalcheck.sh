@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+# skillevalcheck.sh — gate for --eval-skills, the labelled skill-ROUTING eval (src/skilleval.h).
+# Two jobs:
+#
+#   (a) pin that the harness WORKS: runs clean on the committed corpus (test/skillevalfix/prompts.tsv),
+#       deterministic, counts agree with the corpus, the TRIVIAL keyword-overlap baseline is MEASURED
+#       (printed, never asserted away), and the headline arm (bm25-desc) clears an absolute floor —
+#       a description edit that tanks routing fails here, loudly.
+#   (b) prove the metric CAN FAIL — the --eval-stray lesson (3 of 4 plausible statistics were INVERTED
+#       until labelled data exposed them): feed deliberately WRONG labels and prove hit@1 collapses;
+#       SWAP the positive/negative labels and prove sep-auc inverts to exactly 1-auc (and lands < 0.5).
+#       A metric that cannot drop under sabotage measures nothing.
+#
+#   test/skillevalcheck.sh   |   CODECORTEX_BIN=asan/codecortex test/skillevalcheck.sh
+#
+# Exit 0 = ALL PASS, non-zero = SOME FAILED.
+
+set -u
+ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+BIN="${1:-${CODECORTEX_BIN:-$ROOT/build/codecortex}}"
+[ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
+CORPUS="$ROOT/test/skillevalfix/prompts.tsv"
+SKILLS="$ROOT/skills"
+TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
+fail=0
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
+no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
+
+[ -x "$BIN" ] || { echo "no codecortex binary at $BIN — build first (cmake --build build -j)"; exit 2; }
+[ -f "$CORPUS" ] || { echo "no corpus at $CORPUS"; exit 2; }
+
+echo "skillevalcheck: BIN=$BIN  CORPUS=$CORPUS"
+
+# ── 1) the harness runs clean and is deterministic ────────────────────────────────────────────────────
+"$BIN" "$SKILLS" --eval-skills="$CORPUS" --no-cache >"$TMP/a" 2>"$TMP/aerr"; rc_a=$?
+"$BIN" "$SKILLS" --eval-skills="$CORPUS" --no-cache >"$TMP/b" 2>/dev/null
+{ [ $rc_a -eq 0 ] && cmp -s "$TMP/a" "$TMP/b"; } \
+    && ok "runs clean (rc=0) and two runs are byte-identical" \
+    || { no "harness failed (rc=$rc_a) or is non-deterministic"; head -4 "$TMP/aerr"; }
+
+# ── 2) row counts in the header agree with the corpus (no silently dropped rows) ─────────────────────
+posWant=$( awk -F'\t' '!/^#/ && NF>=3 && $2!="none"{n++} END{print n+0}' "$CORPUS" )
+negWant=$( awk -F'\t' '!/^#/ && NF>=3 && $2=="none"{n++} END{print n+0}' "$CORPUS" )
+grep -q "${posWant} positive + ${negWant} negative prompts" "$TMP/a" \
+    && ok "header counts match the corpus (${posWant} pos + ${negWant} neg — nothing silently skipped)" \
+    || { no "header counts disagree with the corpus (want ${posWant}+${negWant})"; head -1 "$TMP/a"; }
+
+# ── 3) the JUDGED split stays past the resolution floor (2026-07-25 growth pass) ────────────────────
+# n=16 judged rows resolves +-6pp per row, coarse enough to hide real movement — grown to 43. Pin the
+# corpus size itself, not just the harness's own row count, so a future edit cannot silently shrink the
+# hard (paraphrase) set back toward noise without this gate objecting. Scoped to split=test ONLY (a 4th
+# column of "test", or absent, back-compat default): the 2026-08-08 dev split also carries judged-
+# provenance rows, and counting them in here would let a shrink of the FROZEN test set hide behind an
+# unrelated dev-row addition — the two pools must be protected independently.
+judgedWant=$( awk -F'\t' '!/^#/ && NF>=3 && $3=="judged" && ( NF<4 || $4=="test" ){n++} END{print n+0}' "$CORPUS" )
+awk -v j="$judgedWant" 'BEGIN{exit !(j+0 >= 80)}' \
+    && ok "judged split (split=test) = ${judgedWant} rows (floor 80 — the resolution of the 2026-08-11 S1 growth pass)" \
+    || no "judged split (split=test) = ${judgedWant} rows fell under the 80-row floor — the grown hard set shrank"
+
+# ── 4) the TRIVIAL baseline is measured (printed as a row), never just asserted ──────────────────────
+awk '$1=="overlap"{found=1} END{exit !found}' "$TMP/a" \
+    && ok "trivial keyword-overlap baseline is measured and printed" \
+    || no "no overlap baseline row in the report"
+
+# ── 5) headline-arm floors: a description edit that tanks routing must fail HERE ─────────────────────
+# (floors sit ~8-9pp / 0.06-0.07 under the 2026-07-25 measured values on the grown n=43-judged corpus —
+# bm25-desc hit@1 77.3%, sep-auc 0.970; drift room, not free fall. Superseded the pre-growth 78.7%/0.969
+# floor pair, which was pinned against the n=16 corpus and is no longer the corpus this binary scores.
+# 2026-08-11 (S1 growth pass): recalibrated again — the test split grew 128→183 rows (test-judged 43→85);
+# on the grown corpus the unchanged skills measure bm25-desc split=test hit@1 68.5%, sep-auc 0.953, so
+# the 2026-07-25 pair above is likewise superseded; full recalibration record in docs/EVALS.md.
+# 2026-08-08: scoped to the split=test row, NOT the whole-corpus arm line — since the dev split gained
+# rows this round, the whole-corpus number is now a mix of the frozen benchmark and free-to-iterate
+# tuning rows, and this floor exists to protect the FROZEN half specifically.
+# 2026-09-02 (lane/n2-d recalibration): the header rule is "floors ~9-10pp below measured", and the
+# 60.0 floor above had drifted 13pp under the actual measured value with unchanged skills (bm25-desc
+# split=test hit@1 73.1%, sep-auc 0.957 — a description edit could tank routing by ~13pp and still pass
+# here). Re-derived at 10pp under measured: floor 63.0. sep-auc floor left at 0.89 (0.957 measured is
+# 0.067 above it, inside the file's own historical 0.06-0.07 band; not moved by this round). Full record
+# in docs/EVALS.md §4.
+h1=$(  awk '$1=="split=test" && $2=="bm25-desc"{gsub("%","",$3); print $3}' "$TMP/a" )
+auc=$( awk '$1=="split=test" && $2=="bm25-desc"{print $6}' "$TMP/a" )
+# 2026-09-07 (description-budget round, docs/EVALS.md "Skill descriptions under a client budget", landed on the
+# owner's decision): the descriptions shrank 18,455 → 5,127 chars and the efficient skill folded into orient; the
+# lexical arm measures 62.3% / 0.898 on the landed set (three blind LLM raters: 82.3–84.3 / 85 for the rewrite,
+# identical to the full text — the bm25 arm tracks vocabulary, not the reader). Floors re-derived per the header
+# rule from the landed measurement: hit@1 52.0 (10pp under), sep-auc 0.83 (~0.07 under). What Codex users read
+# before this round (the same descriptions cut at 350) measured 60.0% / 0.910 and would have failed the old floor.
+awk -v v="$h1"  'BEGIN{exit !(v+0 >= 52.0)}' \
+    && ok "bm25-desc hit@1 (split=test) = ${h1}% (floor 52.0%)" \
+    || no "bm25-desc hit@1 (split=test) = ${h1}% fell under the 52.0% floor — a skill description likely broke routing"
+awk -v v="$auc" 'BEGIN{exit !(v+0 >= 0.83)}' \
+    && ok "bm25-desc sep-auc (split=test) = ${auc} (floor 0.83 — negatives stay quiet)" \
+    || no "bm25-desc sep-auc (split=test) = ${auc} fell under 0.83 — positives/negatives no longer separate"
+
+# ── 6) the actionable diagnostics exist: per-skill table + per-provenance split ──────────────────────
+{ grep -q 'per-skill (bm25-desc)' "$TMP/a" && grep -q 'provenance hit@1' "$TMP/a" && grep -q 'router-magnet' "$TMP/a"; } \
+    && ok "per-skill / provenance / router-magnet diagnostics present" \
+    || no "diagnostic sections missing from the report"
+
+# ── 7) metric-can-fail A: deliberately WRONG labels ⇒ hit@1 collapses ─────────────────────────────────
+# every positive row is relabelled to one fixed wrong skill (rows that permit it get a different one).
+awk -F'\t' 'BEGIN{OFS="\t"} /^#/||$0==""{print;next} $2=="none"{print;next} \
+    {print $1, ($2 ~ /codecortex-mcp/ ? "codecortex-handoff" : "codecortex-mcp"), $3}' "$CORPUS" >"$TMP/wrong.tsv"
+"$BIN" "$SKILLS" --eval-skills="$TMP/wrong.tsv" --no-cache >"$TMP/w" 2>/dev/null
+h1w=$( awk '$1=="bm25-desc"{gsub("%","",$2); print $2}' "$TMP/w" )
+awk -v t="$h1" -v w="$h1w" 'BEGIN{exit !(w+0 < (t+0)/2.0)}' \
+    && ok "wrong labels drop bm25-desc hit@1 to ${h1w}% (< half of ${h1}%) — the metric CAN fail" \
+    || no "wrong labels left hit@1 at ${h1w}% (true ${h1}%) — the metric does not respond to labels"
+
+# ── 8) metric-can-fail B: SWAPPED pos/neg labels ⇒ sep-auc inverts to exactly 1-auc, lands < 0.5 ──────
+awk -F'\t' 'BEGIN{OFS="\t"} /^#/||$0==""{print;next} \
+    $2=="none"{print $1,"codecortex-orient","judged";next} {print $1,"none","neg"}' "$CORPUS" >"$TMP/swap.tsv"
+"$BIN" "$SKILLS" --eval-skills="$TMP/swap.tsv" --no-cache >"$TMP/s" 2>/dev/null
+aucS=$( awk '$1=="bm25-desc"{print $5}' "$TMP/s" )
+# 2026-08-11 (S1 growth pass): band 0.01→0.02 — AUC inversion is exact only up to the score-TIE mass,
+# and ties grew with the corpus (d=0.012 measured on unchanged skills at 266 rows); still must be < 0.5.
+awk -v t="$auc" -v s="$aucS" 'BEGIN{ d=s+0-(1.0-(t+0)); if(d<0)d=-d; exit !(d <= 0.02 && s+0 < 0.5) }' \
+    && ok "swapped labels invert sep-auc to ${aucS} (= 1 - ${auc} within 0.02, and < 0.5) — inversion is DETECTED" \
+    || no "swapped labels gave sep-auc ${aucS} (true ${auc}) — the separation statistic is not label-driven"
+
+# ── 9) corpus integrity is enforced, not degraded around: unknown label ⇒ hard refusal ────────────────
+printf 'Some prompt\tcodecortex-no-such-skill\tjudged\n' >"$TMP/bad.tsv"
+"$BIN" "$SKILLS" --eval-skills="$TMP/bad.tsv" --no-cache >/dev/null 2>"$TMP/baderr"; rc_bad=$?
+{ [ $rc_bad -ne 0 ] && grep -q 'unknown skill label' "$TMP/baderr"; } \
+    && ok "unknown skill label refuses (rc=$rc_bad) — no silently fabricated sample" \
+    || no "unknown label did not refuse (rc=$rc_bad)"
+printf 'Some prompt\tcodecortex-router\tjudged\n' >"$TMP/bad2.tsv"
+"$BIN" "$SKILLS" --eval-skills="$TMP/bad2.tsv" --no-cache >/dev/null 2>/dev/null; rc_r=$?
+[ $rc_r -ne 0 ] \
+    && ok "codecortex-router as a label refuses (it is the map, not a destination)" \
+    || no "codecortex-router accepted as a label"
+
+# ── 10) a root that is not a skills directory refuses with a pointer, not a crash ────────────────────
+mkdir -p "$TMP/notskills"; printf 'int main(){return 0;}\n' >"$TMP/notskills/m.cpp"
+"$BIN" "$TMP/notskills" --eval-skills="$CORPUS" --no-cache >/dev/null 2>"$TMP/nserr"; rc_ns=$?
+{ [ $rc_ns -ne 0 ] && grep -q 'ROOT must be a skills directory' "$TMP/nserr"; } \
+    && ok "non-skills root refuses with guidance (rc=$rc_ns)" \
+    || no "non-skills root did not refuse cleanly (rc=$rc_ns)"
+
+# ── 11) every skill directory has >= 1 permitted row in the corpus. A skill with zero permitted rows
+#     can never win, lose, or be measured for routing accuracy — it silently free-rides forever, and it
+#     can still steal top-1 away from a permitted skill without this gate ever noticing (2026-08-08 audit
+#     H1: codecortex-opt-remarks, added 08-05, shipped with 0 permitted rows and stole top-1 on several
+#     for-routed prompts + a bm25-desc negative fire before anyone had a row to prove it wrong). codecortex-
+#     router is exempt: it is the fallback map, never a legal label (see gate 9 above).
+# A SKILL is a directory that CONTAINS a SKILL.md — not merely a directory under skills/. Namespaced
+# agent formats live in their own subtree (skills/hermes/<skill>/SKILL.md), so a bare -maxdepth 1 -type d
+# sweep counted the NAMESPACE "hermes" as a skill, found it had zero labelled rows in the routing corpus,
+# and failed. Third of three enumeration sites; the other two were updated when the namespace landed.
+skillDirs=$( for _d in "$SKILLS"/*/; do [ -f "$_d/SKILL.md" ] && basename "$_d"; done | sort )
+missingSkills=""
+for sd in $skillDirs; do
+    [ "$sd" = "codecortex-router" ] && continue
+    awk -F'\t' -v s="$sd" '!/^#/ && NF>=3 && $2!="none" { n=split($2,a,","); for(i=1;i<=n;i++) if(a[i]==s) f=1 } END{exit !f}' "$CORPUS" \
+        || missingSkills="$missingSkills $sd"
+done
+[ -z "$missingSkills" ] \
+    && ok "every skill directory (except codecortex-router) has >=1 permitted row in the corpus" \
+    || no "skill(s) with ZERO permitted rows in the corpus, unmeasurable for routing:$missingSkills"
+
+# ── 12) dev-split floor: bm25-desc must not fall below a measured-with-margin floor on the TUNING rows
+#     (test/skillevalfix/prompts.tsv split=dev, added 2026-08-08 for the Aug 5-8 routing findings — nest-
+#     profile/essential-complexity trust, cache-lint pack, --skipped-vs---doctor, opt-remarks triage +
+#     its hard negatives). MEASURED on this commit: hit@1=62.5% (10/16), sep-auc=0.969, N=20 (16 positive
+#     + 4 negative). RECALIBRATED 2026-08-11 (S1 growth pass): dev grew 20→83 rows (68 positive + 15
+#     negative); measured on the grown corpus with unchanged skills: hit@1=61.8%, sep-auc=0.896. The dev
+#     pool keeps its WIDE margin — 15pp under hit@1, 0.15 under sep-auc (61.8−15→floor 46.0;
+#     0.896−0.15→floor 0.75) — deliberately looser than test's 8-9pp/0.06-0.07.
+#     Recalibrate only on a deliberate dev-split edit (new rows, a description iteration you mean to
+#     measure), never silently.
+#     2026-09-02 (lane/n2-d recalibration): the dev pool's own dedicated 15pp-margin policy above had
+#     drifted to 23pp under the actual measured value (69.1% hit@1 with unchanged skills — a routing
+#     drop of nearly a quarter of the corpus could pass here unnoticed). This round applies the file's
+#     own general header rule ("floors ~9-10pp below measured") uniformly instead of keeping dev on its
+#     own looser 15pp policy: re-derived at 10pp under 69.1% → floor 59.0. sep-auc floor left at 0.75
+#     (0.887 measured is 0.137 above it — wide, but sep-auc was not the number that had drifted; not
+#     moved by this round). Full record in docs/EVALS.md §4.
+h1d=$(  awk '$1=="split=dev" && $2=="bm25-desc"{gsub("%","",$3); print $3}' "$TMP/a" )
+aucd=$( awk '$1=="split=dev" && $2=="bm25-desc"{print $6}' "$TMP/a" )
+awk -v v="$h1d"  'BEGIN{exit !(v+0 >= 59.0)}' \
+    && ok "dev-split bm25-desc hit@1 = ${h1d}% (floor 59.0%)" \
+    || no "dev-split bm25-desc hit@1 = ${h1d}% fell under the 59.0% floor"
+awk -v v="$aucd" 'BEGIN{exit !(v+0 >= 0.75)}' \
+    && ok "dev-split bm25-desc sep-auc = ${aucd} (floor 0.75)" \
+    || no "dev-split bm25-desc sep-auc = ${aucd} fell under 0.75"
+
+# ── 13) the four frontmatter STOP RULES are PRESENT and LOAD-BEARING ─────────────────────────────────
+# 2026-09-10 audit F-R1-03: #112 restored four stop rules to the skill descriptions, and NO row in this
+# corpus could see them. Deleting all four left split=test bm25-desc hit@1 byte-identical (63.8%) and
+# split=dev 1.4pp BETTER, with all 15 arms above green — the same failure #112 itself repaired, still
+# open, because the fix restored the TEXT without adding a measurement.
+#
+# Two assertions, because a stop rule can fail in two different ways:
+#   (a) PRESENCE, exact. Each sentence is pinned here verbatim. The strip below must actually remove
+#       something from each of the four descriptions; a rewrite that drops or REWORDS a rule makes its
+#       strip a no-op, and this arm says which one and stops. This is the half that catches the defect
+#       directly, and it cannot be fooled by a corpus that happens to score the same either way.
+#   (b) LOAD-BEARING, differential. The same 16 stop-rule rows are scored twice — against skills/ and
+#       against a mechanically stripped copy — and the real tree must win by a margin. This is what
+#       proves (a) is guarding something that matters rather than a decorative sentence.
+# Measured on this commit: 75.0% with the rules, 50.0% without (n=16). Floors: 65.0% absolute (10pp
+# under measured, the file's own header rule) and a >= 12.5pp gap (half the measured 25.0pp).
+# HONEST LIMIT, stated because the number would otherwise read as more than it is: 8 of the 16 rows echo
+# the rules' own wording and carry all of the discrimination; the 8 written to AVOID that wording score
+# 50.0% with the rules and 50.0% without — measured, not assumed. A lexical ranker can only detect a
+# sentence's removal through rows that share its words, so "phrase it without quoting the rule" is not
+# available to this instrument. See the marker block in prompts.tsv.
+STOPTSV="$TMP/stoprules.tsv"
+awk -F'\t' 'BEGIN{p=0} /STOP-RULE ROWS \(2026-09-10/{p=1;next} /STOP-RULE ROWS . END/{p=0} p && !/^#/ && NF>=3' "$CORPUS" >"$STOPTSV"
+stopRows=$( wc -l <"$STOPTSV" | tr -d ' ' )
+stopSkills=$( awk -F'\t' '{print $2}' "$STOPTSV" | sort -u | wc -l | tr -d ' ' )
+{ [ "$stopRows" = 16 ] && [ "$stopSkills" = 4 ]; } \
+    && ok "stop-rule rows sliced from the corpus: ${stopRows} rows over ${stopSkills} skills" \
+    || no "stop-rule slice found ${stopRows} rows / ${stopSkills} skills (want 16 / 4) — the marker block moved or shrank"
+NOSTOP="$TMP/skills_nostop"
+rm -rf "$NOSTOP"; cp -R "$SKILLS" "$NOSTOP"
+strip_rule(){   # $1 = skill dir, $2 = the sentence, verbatim
+    local f="$NOSTOP/$1/SKILL.md"
+    [ -f "$f" ] || { no "stop-rule arm: no SKILL.md for $1"; return; }
+    python3 - "$f" "$2" <<'PY'
+import re, sys
+# The frontmatter FOLDS: a description is a wrapped YAML block, so a stop rule can straddle a newline +
+# indent ("Stop at the first rung\n  that answers."). Match the sentence word-for-word with any run of
+# whitespace between words — exact on the WORDS, tolerant of where the wrap happens to fall, which is a
+# formatting fact and not the thing this arm measures.
+path, sentence = sys.argv[1], sys.argv[2]
+text = open(path, encoding="utf-8").read()
+pattern = re.compile(r"\s+".join(re.escape(w) for w in sentence.split()))
+found = pattern.search(text)
+if not found:
+    sys.exit(3)
+open(path, "w", encoding="utf-8").write(text[:found.start()] + text[found.end():])
+PY
+    case $? in
+        0) ok "stop rule PRESENT in $1: \"${2:0:44}...\"";;
+        3) no "stop rule MISSING from $1 — the sentence this arm measures is no longer in the description: \"$2\"";;
+        *) no "stop-rule strip failed for $1";;
+    esac
+}
+strip_rule codecortex-before-you-build 'A small feature with an obvious home needs none of this.'
+strip_rule codecortex-fresh-eyes       'A single-lens question is a single call.'
+strip_rule codecortex-orient           'Stop at the first rung that answers.'
+strip_rule codecortex-write-tests      'For one target one --seams or --callers pass suffices.'
+"$BIN" "$SKILLS" --eval-skills="$STOPTSV" --no-cache >"$TMP/stop.on"  2>/dev/null
+"$BIN" "$NOSTOP" --eval-skills="$STOPTSV" --no-cache >"$TMP/stop.off" 2>/dev/null
+stopOn=$(  awk '$1=="bm25-desc"{gsub("%","",$2); print $2}' "$TMP/stop.on" )
+stopOff=$( awk '$1=="bm25-desc"{gsub("%","",$2); print $2}' "$TMP/stop.off" )
+awk -v v="$stopOn" 'BEGIN{exit !(v+0 >= 65.0)}' \
+    && ok "stop-rule rows route with the rules present: bm25-desc hit@1 = ${stopOn}% (floor 65.0%)" \
+    || no "stop-rule rows fell to ${stopOn}% (floor 65.0%) — a stop rule stopped doing its job"
+awk -v on="$stopOn" -v off="$stopOff" 'BEGIN{exit !((on+0)-(off+0) >= 12.5)}' \
+    && ok "the rules are LOAD-BEARING: ${stopOn}% with them vs ${stopOff}% without (gap floor 12.5pp)" \
+    || no "stripping all four stop rules moved hit@1 only ${stopOn}% -> ${stopOff}% — this arm measures nothing"
+
+# ── a skills directory the harness cannot fully read never takes the process down ───────────────────
+# Every entry below used to raise an uncaught std::filesystem_error from a throwing overload (the range-for's
+# operator++, directory_entry::is_directory(), filesystem::exists()): SIGABRT, exit 134, before any output.
+# Each is now skipped with a stderr line naming it, and the readable skills still rank exactly as before.
+HOSTILE="$TMP/hostile_skills"; cp -R "$SKILLS" "$HOSTILE"
+mkdir -p "$HOSTILE/zz-looped-skillmd";  ln -s SKILL.md "$HOSTILE/zz-looped-skillmd/SKILL.md"   # SKILL.md -> itself (ELOOP)
+ln -s zz-loop-b "$HOSTILE/zz-loop-a"; ln -s zz-loop-a "$HOSTILE/zz-loop-b"                     # a directory link loop
+mkdir -p "$HOSTILE/zz-sealed"; printf -- '---\nname: sealed\ndescription: x\n---\n' > "$HOSTILE/zz-sealed/SKILL.md"; chmod 000 "$HOSTILE/zz-sealed"
+mkdir -p "$HOSTILE/zz-fifo"; mkfifo "$HOSTILE/zz-fifo/SKILL.md"                                  # would block a read for ever
+bounded(){ if command -v timeout >/dev/null 2>&1; then timeout 60 "$@"; else perl -e 'alarm 60; exec @ARGV' "$@"; fi; }
+bounded "$BIN" "$HOSTILE" --eval-skills="$CORPUS" --no-cache >"$TMP/hostile.out" 2>"$TMP/hostile.err"; rc_h=$?
+chmod 755 "$HOSTILE/zz-sealed"
+[ "$rc_h" -eq "$rc_a" ] && cmp -s "$TMP/a" "$TMP/hostile.out" \
+    && ok "unreadable entries (SKILL.md link loop, directory link loop, mode-000 skill, FIFO SKILL.md): exit $rc_h, ranking byte-identical to the clean run" \
+    || { no "unreadable entries: exit $rc_h (clean run $rc_a; 134 is the uncaught filesystem_error, 124/142 a hang), or the ranking changed"; head -3 "$TMP/hostile.err"; }
+grep -q "skipping '.*zz-looped-skillmd/SKILL.md'" "$TMP/hostile.err" \
+    && ok "the looped SKILL.md is named on stderr as skipped" \
+    || no "the looped SKILL.md was skipped silently: $( head -c 300 "$TMP/hostile.err" )"
+grep -q "skipping '.*zz-loop-a'" "$TMP/hostile.err" && grep -q "skipping '.*zz-loop-b'" "$TMP/hostile.err" \
+    && ok "both ends of the directory link loop are named on stderr as skipped" \
+    || no "the directory link loop was skipped silently: $( head -c 300 "$TMP/hostile.err" )"
+
+[ $fail -eq 0 ] && echo "skillevalcheck: ALL PASS" || echo "skillevalcheck: FAILURES"
+exit $fail

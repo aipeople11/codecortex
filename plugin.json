@@ -1,0 +1,19 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "codecortex",
+  "version": "0.6.2",
+  "description": "Local developer intelligence for coding agents: code graph, impact, memory, telemetry and proof.",
+  "mcp": "./mcp.json",
+  "skills": "./skills/",
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "CodeCortex",
+        "shortDescription": "Local developer intelligence for coding agents",
+        "developerName": "Saurabh Verma",
+        "category": "Developer Tools",
+        "capabilities": ["Read", "Write"]
+      }
+    }
+  }
+}

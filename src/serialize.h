@@ -1,0 +1,8576 @@
+#pragma once
+
+// serialize.h — minified, escaped XML serialization. Streamed through a 64 KB
+// buffer (no whole-document string), terse schema, every name/path XML-escaped.
+
+#include "infra/emit.h"  // rw::formatTo — snprintf's shape kept (stack buffer, snprintf's return)
+#include "infra/os.h"   // rw::os::open_memstream — the est_tokens charge buffers
+#include <format>          // std::format_to_n — the appendf lambdas append through it directly
+#include "model.h"
+#include "extentsuspect.h"   // extent honesty: extent_suspect= reason spellings (extent::extentSuspectReasons)
+#include "nextverb.h"   // P3 (L7): next= on the top-ranked <d> row
+#include "arch.h"        // P3: builtinLayer() — the file-node layer= tag
+#include "graph.h"     // H6/F2: definitionCountOfName — the ONE resolver behind --lego's defs= single-pick disclosure
+#include "graphlegend.h"   // R-E fix (2026-08-19): rw::rootRelPathsLegend — the ONE root= definition
+#include "lintrules.h"   // §P9.4: langOfPath / dependencyCapable — packDeps' dep_files= denominator
+#include "resolve.h"     // S6-C: canonicalId() — the `id=` canonical symbol string (shared with the resolver)
+#include "redact.h"      // deterministic secret redaction of emitted body content (opt-out --no-redact)
+#include "infra/sortutil.h"    // numeric-key radix helpers for rank/file score order
+#include "infra/jsonesc.h"     // F9: jsonesc::utf8SeqLen — the canonical UTF-8-sequence-length core (was duplicated here)
+#include "infra/strkern.h"     // S5: appendCleanRun — the run-copy skip that replaces escapeXml's per-byte switch
+#include "notes.h"       // L3: field-notes NoteIndex — the retrieval-time surfacing lookup (INERT when null)
+#include "pageview.h"    // §P8: pageWindow / pageDisclosure — the shared --limit/--offset contract (packDeps)
+#include "sarif.h"       // R-E (2026-08-17): rootRelativeUri/rootPrefixOf — the same root= single-root-only
+                          // strip --grep's emitGrepReport uses, reused here so the two verbs cannot diverge
+#include "prconverge.h" // W2-F: RankDisclosure + the pr_iters= / pr_converged= spellings (CLI and MCP share them)
+#include "gitmine.h"    // F3 (H2H-Graft): RecentFile — the map's <recent> rows are the churn-decay miner's own product
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>    // §H7 degrade seam: std::getenv for the non-release fault switch
+#include <cstring>
+#include <optional>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace rw
+{
+
+// XML 1.0 forbids the C0 control set even ESCAPED (0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F — only \t \n \r
+// are legal Chars): a stray form-feed in an otherwise-legal source file would break the G4 xmllint
+// gate. Substitute a space — deterministic, applied identically in escapeXml and the CDATA copies.
+inline char xmlSafeByte( char c ) noexcept
+{
+    return ( static_cast<unsigned char>( c ) < 0x20 && c != '\t' && c != '\n' && c != '\r' ) ? ' ' : c;
+}
+
+// ── §B12.7 + CA4 verifier F-MED-1 — THE C0 DIALECT DIVERGENCE, AND ITS TELL ─────────────────────────────
+// The XML and JSON dialects do not agree about C0 controls and invalid UTF-8, and they CANNOT: XML 1.0
+// forbids the C0 set even escaped (only \t \n \r are legal Chars) so xmlSafeByte must substitute a space,
+// and an invalid sequence must become '?', while JSON has \u00XX for every control byte. jsonesc.h's own
+// header records the decision from the other side: the JSON escaper is the FAITHFUL one and stays faithful,
+// because normalizing there would make the two dialects agree by making BOTH lossy.
+//
+// What was wrong was not the divergence — it was that the lossy side said nothing. `<ctx task=…>`, whose
+// entire §B1.7 point is being the VERBATIM copy of the user's task, silently was not; and `EmittedBody::text`
+// is recorded at packBodies' push_back BEFORE appendCdataSafe, so a def holding ESC + Latin-1 reached XML at
+// 140 B scrubbed and JSON at 148 B raw with nothing anywhere saying so.
+//
+// So the lossy side now DISCLOSES: `scrubbed="1"` on the XML surface that lost bytes, and its JSON twin
+// beside the same field — the JSON is byte-faithful and does not need the warning for itself, but a consumer
+// diffing the two dialects is owed the fact from either one. THE MARKERS ARE A CLOSED SET, and each XML one
+// has exactly one JSON counterpart: `task_scrubbed=`/`route_scrubbed=` on the root (ctxRootOpen) twin
+// `"task_xml_scrubbed"`/`"route_xml_scrubbed"` (ctxRootJsonScrubKeys, right below it — one function, so a
+// call site cannot emit the field and skip the question), and `<b scrubbed="1">` twins `"xml_scrubbed"` on
+// the JSON body object. test/bodydialectcheck.sh arm (H) sweeps that table in BOTH directions rather than
+// the one marker that already worked. This predicate is the single decision behind all six: true iff
+// escapeXml/appendCdataSafe would CHANGE bytes (a C0 other than \t\n\r, or an invalid UTF-8 sequence).
+// Entity-escaping (& < > " ') is NOT lossy — it round-trips exactly — and must not set the flag, or every
+// document on earth would wear it.
+inline bool xmlScrubIsLossy( std::string_view s ) noexcept
+{
+    const char*       d = s.data();
+    const std::size_t n = s.size();
+    for( std::size_t i = 0; i < n; )
+    {
+        const unsigned char c = static_cast<unsigned char>( d[i] );
+        if( c < 0x20 && c != '\t' && c != '\n' && c != '\r' )
+        {
+            return true; // xmlSafeByte -> ' '
+        }
+        if( c < 0x80 ) { ++i; continue; }
+        const int len = jsonesc::utf8SeqLen( d, i, n );
+        if( len == 0 )
+        {
+            return true; // escapeXml -> '?', appendCdataSafe -> '?'
+        }
+        i += std::size_t( len );
+    }
+    return false;
+}
+
+// W3FIX M2 — the three LEGAL control chars (\t \n \r) still cannot be written LITERALLY by escapeXml, for two
+// independent reasons that both bite the §B1.7 verbatim task attribute:
+//   (a) G4 forbids a '\n' anywhere outside CDATA, and `--for=$'a\nb'` put one straight into `<ctx task="a?b">`
+//       — a two-line document out of a serializer whose contract is one line;
+//   (b) XML ATTRIBUTE-VALUE NORMALIZATION (XML 1.0 §3.3.3) replaces a literal \t/\n/\r in an attribute with a
+//       SPACE at parse time, so even where the raw byte was tolerated the parser handed back a DIFFERENT
+//       string than the user typed — §B1.7's whole point is that the attribute is the verbatim copy.
+// A numeric character reference survives normalization exactly (the parser un-escapes it AFTER normalizing),
+// so `&#10;` round-trips to '\n' while emitting no literal newline. Emitted for element text too: there a
+// char reference parses back to the identical character, so one rule serves both seams and no call site has
+// to know which kind of node it is writing into. Near-golden-neutral, not fully: a plain --whereis over a
+// .tsv file (bench/recalleval labels) legitimately carries real tabs into t= attributes, where the old code
+// emitted a literal tab an XML parser silently normalized to a space — the reference there is a FIX, not a
+// hostile-input path (seam-verifier NIT, 2026-07-29). Everywhere else on this repo the references appear
+// only on hostile input.
+inline const char* xmlControlCharRef( char c ) noexcept
+{
+    switch( c )
+    {
+        case '\t': return "&#9;";
+        case '\n': return "&#10;";
+        case '\r': return "&#13;";
+        default:   return nullptr;
+    }
+}
+
+// F9: utf8SeqLen used to be duplicated here (byte-identical logic to jsonesc.h's copy, just re-commented) —
+// now forwards to the one canonical core in jsonesc.h (zero project includes, so pulling it in here adds no
+// cycle risk). Kept as a `using` so every call site below (escapeXml, appendCdataSafe) is unchanged.
+using jsonesc::utf8SeqLen;
+
+// escape & < > " ' (ampersand FIRST) into `out`; returns a view into it. Reused per call. Byte < 0x20 is
+// scrubbed to a space (xmlSafeByte) or, for the three legal control chars, written as a numeric character
+// reference (xmlControlCharRef — see M2 above: G4 + attribute-value normalization); an invalid UTF-8 sequence
+// (A4-F20) is scrubbed to '?' so the emitted name/path/doc-comment/sig text is always well-formed XML AND
+// valid UTF-8 regardless of source bytes.
+// S5 — THE BYTE SET IS THE CONTRACT. Everything below that is NOT in this set is copied through
+// unchanged by the switch's `default:` arm, so the run loop may memcpy it in bulk without looking at it;
+// everything that IS in the set still goes through the SAME switch, one byte at a time, unchanged. The
+// set is therefore derivable from the switch and must be re-derived with it: the five entity bytes, the
+// whole C0 range (\t \n \r become character references, every other C0 is scrubbed to a space by
+// xmlSafeByte), and every byte >= 0x80 (utf8SeqLen decides whether the sequence is copied or scrubbed
+// to '?'). 0x7F is deliberately absent — xmlSafeByte passes DEL through, so it is a clean-run byte.
+// test/emitescapecheck.sh's MUT arm exists because a set one member short is otherwise silent.
+inline constexpr strkern::Byteset256 kXmlEscapeByteset = []
+{
+    strkern::Byteset256 set;
+    set.addRange( 0x00, 0x1F );
+    set.add( '&' );  set.add( '<' );  set.add( '>' );  set.add( '"' );  set.add( '\'' );
+    set.addRange( 0x80, 0xFF );
+    return set;
+}();
+
+inline std::string_view escapeXml( std::string_view s, std::vector<char>& out )
+{
+    out.clear();
+    out.reserve( s.size() + 16 );
+
+    const auto put  = [ & ]( const char* lit ) { while( *lit ) { out.push_back( *lit++ ); } };
+    const char*       d = s.data();
+    const std::size_t n = s.size();
+    // Init and increment skip to the next byte the switch actually has an opinion about, copying
+    // everything before it in one insert. On ordinary source text — names, paths, signatures,
+    // doc-comments — that run is the whole string: one scan and one memcpy for the whole call.
+    for( std::size_t i = strkern::appendCleanRun( d, 0, n, kXmlEscapeByteset, out ); i < n;
+         i = strkern::appendCleanRun( d, i, n, kXmlEscapeByteset, out ) )
+    {
+        const char c = d[i];
+        switch( c )
+        {
+            case '&':  put( "&amp;" );  ++i; break;
+            case '<':  put( "&lt;" );   ++i; break;
+            case '>':  put( "&gt;" );   ++i; break;
+            case '"':  put( "&quot;" ); ++i; break;
+            case '\'': put( "&apos;" ); ++i; break;
+            case '\t':
+            case '\n':
+            case '\r': put( xmlControlCharRef( c ) );  ++i; break;   // M2: verbatim round-trip, no literal control byte
+            default:
+                if( static_cast<unsigned char>( c ) < 0x80 ) { out.push_back( xmlSafeByte( c ) ); ++i; }
+                else if( const int len = utf8SeqLen( d, i, n ); len == 0 ) { out.push_back( '?' ); ++i; }   // scrub invalid UTF-8
+                else
+                {
+                    for( int k = 0; k < len; ++k )
+                    {
+                        out.push_back( d[i + k] );
+                    }
+                    i += std::size_t( len );
+                }
+        }
+    }
+    return std::string_view( out.data(), out.size() );
+}
+
+// M12 (capture-audit-2026-09-04, lane L9): under multi-root, every one of the graph-count verbs
+// (--callers/--callees/--uses) drops root= (correctly — there IS no single root=) but discloses NOTHING in
+// its place, so a reader of `codecortex src test --callers=SYM` has no way to learn what the `<label>/` prefix
+// on every p=/id= MEANS. The default map's own prologue already prints exactly this table for exactly this
+// reason (below, in serialize()); this is that same shape, factored out so the read verbs can reuse it
+// instead of re-deriving it. Lives here (not graphlegend.h, which is included from ABOVE this point in this
+// very file) because it needs escapeXml, and emits nothing at all under single-root (rootLabels.size() < 2)
+// — this must never move a single byte of single-root output.
+inline void writeMultiRootTable( std::FILE* out, const IngestResult& ing )
+{
+    if( ing.rootLabels.size() < 2 )
+    {
+        return;
+    }
+    std::vector<char> esc;
+    for( std::size_t r = 0; r < ing.rootLabels.size(); ++r )
+    {
+        rw::emitTo( out, "<root label=\"{}\" p=\"{}\"/>",
+                      std::string( escapeXml( ing.rootLabels[r], esc ) ).c_str(),
+                      std::string( escapeXml( r < ing.rootPaths.size() ? ing.rootPaths[r] : std::string(), esc ) ).c_str() );
+    }
+}
+
+// The legend clause defining the table above — appended ONLY when it actually rides (multiRoot), the same
+// presence-matches-emission discipline every other conditional clause in this file follows (and the same
+// SEPARATE-comment shape kRootRelPathsLegend uses — graphlegend.h — so a caller just concatenates it).
+inline constexpr const char* kMultiRootTableLegend =
+    "<!-- root rows: label=this workspace root's short identity, the prefix every p=/id= below carries; "
+    "p=the root's own path as passed. -->";
+
+inline const char* multiRootTableLegend( bool multiRoot ) noexcept
+{
+    return multiRoot ? kMultiRootTableLegend : "";
+}
+
+// ── THE FIXED-BUFFER RULE (CA4 §B14) — the one place it is written down ───────────────────────────────────
+// **Never `snprintf` ALREADY-ESCAPED or already-markup text into a fixed `char[]`.** Compose it on
+// `std::string`.
+//
+// The test that separates a breaching site from a safe one is WHICH SIDE OF THE BUFFER THE ESCAPER SITS ON:
+//   escape-then-snprintf  → the cut lands in the ESCAPED form: mid-entity (`&am`), mid-attribute-name,
+//                           mid-UTF-8 sequence, or before the element's own `/>`. The document is broken and
+//                           the process still exits 0 — a G4 breach a caller cannot detect.
+//   snprintf-then-escape  → the cut only shortens PROSE, and the escaper then runs over the shortened text.
+//                           Ugly, never malformed. `lanes.h:698`/`:723` are safe for exactly this reason.
+// The escaping is what makes truncation dangerous, not the length: a 512-byte buffer breaks at 228 RAW bytes
+// once `&` expands 5:1 and `'` 6:1 before the buffer is written.
+//
+// A CLAMP IS THE WRONG REMEDY (§H1's recorded reason): it trades a visible breach for a silently wrong path.
+// Truncation that must happen belongs to the budget layer, which emits a marker; a buffer must never decide it.
+//
+// Three occurrences before the rule was swept — `tracelocus.h`'s `char row[640]` (gated, tracelocus only),
+// `gitmine.h`'s input-side twin (gated, gitmine only), then §B14's six emitters. `test/fixedbufsweep.sh` is
+// the sweep: it re-derives EVERY `snprintf` call in `src/` that interpolates a `%s`, classifies each against
+// a committed table, and FAILS on any call the table does not know about — so the next one is a red gate on
+// the commit that introduces it, not a finding three rounds later.
+//
+// W3FIX M3 — THE ONE COMMENT-ECHO SCRUB. Every task-shaped verb echoes the user's own query inside an XML
+// COMMENT, and each site hand-rolled the SAME '--'-collapse (main.cpp --for, packtask.h, mcpverbs.h, exemplar,
+// tracelocus.h) while none of them scrubbed the bytes an XML comment cannot carry. So `--for=$'a\001b'` and
+// `--pack-task=$'a\377b'` both made xmllint reject the whole document (G4), and `$'a\nb'` put a raw newline
+// outside CDATA — the ATTRIBUTE half of §B1.7 was hardened by escapeXml and the comment half was not.
+//
+// The comment is the READABLE echo (the attribute beside it is the verbatim one), so the scrub is lossy on
+// purpose and states its three rules in one place:
+//   1. '--' runs collapse to a single '-'   — "--" is ill-formed inside a comment and "-->" would close it;
+//   2. every control byte becomes a space   — C0 is illegal XML even escaped (xmlSafeByte), and \t\n\r are
+//      legal XML but forbidden outside CDATA by G4; a character reference is NOT expanded inside a comment,
+//      so `&#10;` there would be literal text pretending to be an escape — a space is the honest scrub;
+//   3. an invalid UTF-8 sequence becomes '?' — same rule appendCdataSafe applies to bodies.
+// Byte-identical to the hand-rolled std::unique collapse for every input that carried no control byte and no
+// invalid sequence, which is what makes it a drop-in everywhere the old collapse stood. A trailing '-' is
+// deliberately KEPT: no site ends its comment with user text (fixed legend prose always follows), so "a-"
+// cannot become "--->" and dropping it would silently lose a character the reader typed. Pure text in, pure
+// text out.
+//
+// CA4 §B4 — THE ENUMERATION, RE-DERIVED FROM SOURCE (this header used to claim "a drop-in at all six echo
+// sites", and that count had rotted: `main.cpp`'s queryRouteNote was never converted, so the true figure was
+// never six, and a reader auditing from the comment alone would have stopped one site short — trap #5/#12).
+// The honest form is a LIST, not a number, and it is machine-checked: `test/fixedbufsweep.sh` re-derives
+// `git grep -c 'xmlCommentText(' -- src/` (excluding this definition) and FAILS if it disagrees with the
+// count on the CALL-SITES line below, so the next divergence is a red gate rather than a stale sentence.
+//
+//   CALL-SITES: 15
+//     main.cpp     --for task echo · --exemplar request note · --query route note
+//                  · --run-trace command echo (runTraceLegendComment)                   (4)
+//     packtask.h   task · mention · co-change-boost · doc-mention notes                 (4)
+//                  · siblift · expand lift notes (2026-09-10 lift disclosure)             (2)
+//                  · W2-K restated body-omission marker name echo                       (1)
+//     mcpverbs.h   for/pack-task task · exemplar request note                           (2)
+//     tracelocus.h --from-trace src note                                                (1)
+//     serialize.h  the <b>/<o> per-symbol name echo inside a comment                    (1)
+// 2026-08-08 (final-sweep): 14 -> 11. L1 (density audit) dropped the comment-echoed `route note` from THREE
+// of the fourteen sites — main.cpp's --for route note, packtask.h's route note, and mcpverbs.h's route
+// reason — because the route= attribute (ctxRootOpen, attribute-escaped) is now the ONE copy of that text
+// (test/routeoncecheck.sh pins the single-copy contract); the comment echo was a duplicated ~230-260 B per
+// routed call that a scrub still had to run over. The 14th (`main.cpp`'s queryRouteNote, --query) landed in
+// the wave-3 merge, and the mechanism worked as designed: this line still read 13, (S4) went red naming the
+// true figure, and the fix was one line. That is the whole point — the count is now load-bearing rather
+// than decorative.
+inline std::string xmlCommentText( std::string_view raw )
+{
+    std::string out;
+    out.reserve( raw.size() );
+
+    const char*       d = raw.data();
+    const std::size_t n = raw.size();
+    for( std::size_t i = 0; i < n; )
+    {
+        const unsigned char c = static_cast<unsigned char>( d[i] );
+        if( c < 0x20 )                                                          // rule 2 — every control byte, \t\n\r included
+        { out += ' ';  ++i;  continue; }
+        if( c == '-' && !out.empty() && out.back() == '-' )                      // rule 1 — collapse the run, don't drop content
+        { ++i;  continue; }
+        if( c < 0x80 ) { out += d[i];  ++i;  continue; }
+        if( const int len = utf8SeqLen( d, i, n ); len == 0 ) { out += '?';  ++i; }   // rule 3
+        else { out.append( d + i, std::size_t( len ) );  i += std::size_t( len ); }
+    }
+    return out;
+}
+
+// §B1.7 — THE VERBATIM TASK ECHO. Every task-shaped verb prints its header prose inside an XML COMMENT,
+// where "--" is ill-formed and "-->" would close the comment early, so the echo of the user's own query is
+// dash-COLLAPSED before it goes in ("--for's default" → "-for's default"). That scrub is correct and stays;
+// what was wrong is that the collapsed text was the ONLY copy in XML, so the two dialects disagreed about
+// the string the user typed (--json echoes it raw). An ATTRIBUTE has no such restriction — this renders the
+// root element's opening tag carrying the VERBATIM task and route note, beside the comment's readable
+// scrubbed echo. Empty task AND empty route ⇒ a bare "<ctx>", so every other verb's bytes are untouched.
+//
+// W3FIX M2 — the LIMIT of "verbatim", stated because a caller comparing the two dialects will find it: \t \n \r
+// round-trip EXACTLY (escapeXml writes them as character references, which survive attribute-value
+// normalization), but the rest of the C0 set becomes a space, because XML 1.0 forbids those bytes in a document
+// even as a character reference — there is no encoding of them for this format to choose. The --json dialect,
+// which has no such rule, stays byte-verbatim for all of them. XML scrubs one class of byte; it no longer
+// silently rewrites the whitespace a user actually typed.
+inline std::string ctxRootOpen( std::string_view task, std::string_view routeNote, std::string_view rootArg = {} )
+{
+    std::vector<char> esc;
+    std::string       out = "<ctx";
+    if( !task.empty() )      { out += " task=\"";   out += escapeXml( task, esc );       out += "\""; }
+    if( !routeNote.empty() ) { out += " route=\"";  out += escapeXml( routeNote, esc );  out += "\""; }
+    // R-E (2026-08-17 harvest): the same root= every other verb's document root carries — single-root runs
+    // only. Shared by --for/--pack-task/--from-trace (every ctxRootOpen caller), so the three cannot diverge.
+    if( !rootArg.empty() )   { out += " root=\"";   out += escapeXml( rootArg, esc );    out += "\""; }
+    // §B12.7's TELL. Emitted ONLY when the scrub actually lost bytes, so it is absent on every ordinary
+    // document (same silence-means-nothing-happened convention route=/over_ceiling use) and the goldens do
+    // not move. Present, it says: this attribute is NOT the verbatim copy its contract promises, and the
+    // --json dialect of the same field is. Named per-field because a task can be lossy while its route note
+    // is not — a single root-level bit would make the reader guess which one.
+    if( !task.empty() && xmlScrubIsLossy( task ) )
+    {
+        out += " task_scrubbed=\"1\"";
+    }
+    if( !routeNote.empty() && xmlScrubIsLossy( routeNote ) )
+    {
+        out += " route_scrubbed=\"1\"";
+    }
+    out += ">";
+    return out;
+}
+
+// ── ctxRootOpen's JSON TWIN, and the reason it is one function rather than a rule ─────────────────────────
+// The header above promises the scrub fact is legible "from either one" of the two dialects. It was not: the
+// tree had ONE emitter of the JSON twin (the body writer's "xml_scrubbed") against THREE XML markers, so for
+// the task echo — the header's own headline example — VT/FF/ESC/invalid-UTF-8 all produced task_scrubbed="1"
+// in XML and nothing whatsoever in JSON, on --for and --pack-task alike. The machinery was right and the
+// coverage was one call site short, which is what a promise phrased as a RULE gets you.
+//
+// So the JSON side is a function, taking the same two strings ctxRootOpen takes and reading the same single
+// predicate. A call site that emits the "task" key emits this beside it and cannot answer the question
+// differently, because it does not answer it at all. The keys are absent on clean input (the
+// silence-means-nothing-happened convention route=/over_ceiling use), so no ordinary document moves a byte.
+// Named with the xml_ prefix like the body twin: JSON is the FAITHFUL dialect, and what it is disclosing is
+// something the OTHER dialect lost.
+inline std::string ctxRootJsonScrubKeys( std::string_view task, std::string_view routeNote )
+{
+    std::string keys;
+    if( !task.empty() && xmlScrubIsLossy( task ) )
+    {
+        keys += ",\"task_xml_scrubbed\":true";
+    }
+    if( !routeNote.empty() && xmlScrubIsLossy( routeNote ) )
+    {
+        keys += ",\"route_xml_scrubbed\":true";
+    }
+    return keys;
+}
+
+// CDATA-body scrub shared by packSource / packBodies / packOutline: split any "]]>" so the CDATA section
+// stays valid, scrub forbidden C0 control bytes (xmlSafeByte, G4), AND replace invalid UTF-8 sequences with
+// '?' (A4-F20 — a stray Latin-1 byte in a source body otherwise makes xmllint reject the whole document).
+// Single pass, appends into caller-owned `safe`; deterministic + locale-independent. On all-valid input the
+// output is byte-identical to the prior inline loops (golden-neutral).
+inline void appendCdataSafe( std::string_view body, std::string& safe )
+{
+    const char*       d = body.data();
+    const std::size_t n = body.size();
+    for( std::size_t i = 0; i < n; )
+    {
+        if( i + 2 < n && d[i] == ']' && d[i + 1] == ']' && d[i + 2] == '>' )
+        { safe += "]]]]><![CDATA[>";  i += 3;  continue; }
+        const unsigned char c = static_cast<unsigned char>( d[i] );
+        if( c < 0x80 ) { safe += xmlSafeByte( d[i] ); ++i; }
+        else if( const int len = utf8SeqLen( d, i, n ); len == 0 ) { safe += '?'; ++i; }   // scrub invalid UTF-8
+        else { safe.append( d + i, std::size_t( len ) ); i += std::size_t( len ); }
+    }
+}
+
+// streamed writer: fwrite on fill + on flush; one syscall per 64 KB, never per token.
+class XmlWriter
+{
+public:
+    explicit XmlWriter( std::FILE* out ) noexcept : m_out( out ) {}
+    ~XmlWriter() { flush(); }
+    XmlWriter( const XmlWriter& )            = delete;
+    XmlWriter& operator=( const XmlWriter& ) = delete;
+
+    void write( std::string_view s ) noexcept
+    {
+        const char* p = s.data();
+        std::size_t  n = s.size();
+        while( n )
+        {
+            const std::size_t room = kCap - m_used;
+            const std::size_t take = n < room ? n : room;
+            std::memcpy( m_buf + m_used, p, take );
+            m_used += take;  p += take;  n -= take;
+            if( m_used == kCap )
+            {
+                flush();
+            }
+        }
+    }
+
+    void flush() noexcept
+    {
+        if( m_used )
+        {
+            // A4-F18: a short fwrite (disk full, broken pipe, quota) previously went UNNOTICED — the map was
+            // silently truncated and codecortex still exited 0. Latch the failure so the caller can turn it into a
+            // nonzero exit + one stderr line (the failed fwrite also sets ferror(m_out), the seam main reads).
+            const std::size_t wrote = std::fwrite( m_buf, 1, m_used, m_out );
+            if( wrote != m_used )
+            {
+                m_writeError = true;
+            }
+            m_used = 0;
+        }
+    }
+
+    // A4-F18: true once any fwrite in this writer's lifetime failed to write every byte. main can also observe
+    // the same condition via ferror(stdout) after the final flush (the failing fwrite sets the stream's error
+    // indicator), which is how the exit-code wiring reaches it without threading a bool through every emitter.
+    bool hadWriteError() const noexcept { return m_writeError; }
+
+private:
+    static constexpr std::size_t kCap = 65536;
+    std::FILE*  m_out;
+    std::size_t m_used = 0;
+    bool        m_writeError = false;
+    char        m_buf[ kCap ];
+};
+
+// L3 field-notes surfacing: attach `<note d="ISO-date"><![CDATA[text]]></note>` children for a symbol or file
+// `target` (a canonical id, or a path). INERT when `ni == nullptr` (no/empty notes file) → it writes ZERO
+// bytes, so the whole pipeline stays byte-identical to the pre-feature output on every verb (the L3 inertness
+// contract, gated by cmp). Notes are DATA, never instructions: the date rides an XML-escaped attribute, the
+// text a CDATA section that the shared appendCdataSafe splits on any "]]>" — so hostile note text (XML
+// metachars, an embedded CDATA-close) can never break the G4 well-formedness gate. `esc` is the caller's
+// reusable escape scratch. Emits in the note file's sorted order (deterministic). Additive: it only ever
+// appends new child elements, never touches the element it decorates.
+// Emit ONE `<note>` element, shared by renderNoteChildren (the retrieval-time surfacing below) and the CLI's
+// --notes listing handler (main.cpp) — one place spells the sha/branch attribute shape, so the two can never
+// drift apart. `d=` is always present; `sha=`/`branch=` are OMITTED entirely on a legacy (unstamped) note
+// rather than emitted empty — an absent attribute is unambiguously "no provenance recorded", never confused
+// with a resolvable-but-empty one. The sha is shown ABBREVIATED (notes::shortSha, 7 hex — terse, matching
+// git's own --abbrev default); the full sha lives only in .codecortex_notes on disk.
+// P7 (terminality round A, lane R, 2026-09-05): `onPath` names the note's TARGET FILE when the note rides a
+// <d> row rather than an <f> wrapper — the lens serving is flat now (rank order, no wrapper), so a file
+// note sits on the file's best-ranked live row and p= is what keeps it from reading as that symbol's own
+// note. Empty (every symbol note, every non-lens caller) ⇒ absent, byte-identical.
+inline void appendOneNote( std::string& out, const notes::Note& n, std::vector<char>& esc, std::string_view onPath = {} )
+{
+    out += "<note d=\"";  out += escapeXml( n.date, esc );  out += "\"";
+    if( !n.sha.empty() )
+    {
+        out += " sha=\"";  out += escapeXml( notes::shortSha( n.sha ), esc );  out += "\"";
+        if( !n.branch.empty() ) { out += " branch=\"";  out += escapeXml( n.branch, esc );  out += "\""; }
+    }
+    if( !onPath.empty() )
+    {
+        out += " p=\"";  out += escapeXml( onPath, esc );  out += "\"";
+    }
+    out += ">";
+    std::string safe;  safe.reserve( n.text.size() );
+    appendCdataSafe( n.text, safe );
+    out += "<![CDATA[";  out += safe;  out += "]]></note>";
+}
+
+// The writer-sink form: one wrapper over the string form, so the element's shape is spelled exactly once.
+inline void appendOneNote( XmlWriter& w, const notes::Note& n, std::vector<char>& esc )
+{
+    std::string out;  appendOneNote( out, n, esc );  w.write( out );
+}
+
+// W3-N2: RENDER the auto-surfaced note children instead of streaming them straight out, so a BUDGETED
+// emitter can charge their exact emitted size. The JSON sibling has done this since §B1.3 (the notes are
+// pre-rendered and jsonSigEntryCost adds `e.notes.size()`); the XML side emitted them for free, which put
+// a note-heavy tree measurably over a tight --token-budget while JSON honored the same ceiling. Returns ""
+// for a null index / no hits, so the wrapper below stays byte-identical on a tree with no notes.
+inline std::string renderNoteChildren( const notes::NoteIndex* ni, const std::string& target, std::vector<char>& esc,
+                                       std::string_view onPath = {} )   // P7: the file-note target, see appendOneNote
+{
+    std::string out;
+    if( !ni )
+    {
+        return out;
+    }
+    const std::vector<std::uint32_t>* hits = ni->find( target );
+    if( !hits )
+    {
+        return out;
+    }
+    for( std::uint32_t i : *hits )
+    {
+        appendOneNote( out, ni->notes[i], esc, onPath );
+    }
+    return out;
+}
+
+
+// D5 — THE TWO NOTE LOOKUP KEYS. A raw CRAWL-ROOT-PREFIXED path (ing.files[...], spelled `<root>/<relative>`
+// verbatim, arch.h §S2) is root-relativized against the NoteIndex's OWN root so it matches the ROOT-RELATIVE
+// keys notes are stored under (notes.h::normalizeNoteTarget); `rawPath` itself is never mutated, only the
+// lookup key (never anything emitted as `p=`). The symbol key adds canonicalId, which degrades to the bare
+// name when scope is empty, so a free function's SYM target is unaffected.
+//
+// §B1.3: these are the ONLY spellings of both rules — the JSON note emitter needs byte-identical keys, and a
+// second spelling down there is exactly how two serializations of one note set drift apart. Both are
+// NULL-SAFE and return "" for a null index, which is what lets every caller (XML or JSON) hand the result
+// straight to an emitter that already no-ops on a target with no hits: no `if( ni )` guard per call site,
+// and no pair of two-line wrappers whose bodies differ only in which key they build.
+inline std::string fileNoteTarget( const notes::NoteIndex* ni, const std::string& rawPath )
+{
+    return ni ? std::string( relForHash( rawPath, ni->root ) ) : std::string{};
+}
+
+inline std::string symbolNoteTarget( const notes::NoteIndex* ni, const IngestResult& ing, const Symbol& s )
+{
+    return ni ? canonicalIdRelTo( ing, s, ni->root ) : std::string{};
+}
+
+// ── T1: per-language token calibration ──────────────────────────────────────────────────────────────
+// est_tokens is ONE number over a heterogeneous XML map. A single chars/N divisor is ±20-35% wrong
+// because (a) the map is majority terse MARKUP, not raw code, and (b) the per-language BPE spread
+// still moves the content bytes. We DELIBERATELY do NOT vendor a BPE table — Claude's tokenizer is
+// not public (§2f: a vendored blob buys exactness for the WRONG tokenizer). Instead a declarative
+// constexpr table of MEASURED bytes/token, calibrated against tiktoken o200k_base over per-language
+// codecortex map outputs (test/tokenbudgetcheck.sh records the corpus + MAPE). o200k↔cl100k spread on
+// our minified output is ≤4% (measured), well inside the headroom margin, so one family suffices.
+//
+// The estimate = (accurate envelope + content byte model) / (symbol-language-weighted bytes/token).
+// Bytes are attributed to the MARKUP ENVELOPE (near-constant density) vs per-symbol CONTENT (names/
+// paths, whose language sets the divisor), then divided by the weighted rate — never a flat /4.
+struct TokenCalib
+{
+    Lang        lang;
+    double      bytesPerToken;   // measured B/tok of codecortex map output in this language (o200k_base)
+};
+
+// MEASURED B/tok of the whole minified map per dominant language (o200k_base; see the check's corpus).
+// Markup dominates the stream so the spread is compressed to ~2.36-2.59; the table keeps the honest
+// per-language differences rather than pretending they vanish. Unknown/absent → kBytesPerTokenDefault.
+inline constexpr TokenCalib kTokenCalib[] =
+{
+    { Lang::Cpp,        2.46 },   // C++/ObjC++ identifiers + terse tags
+    { Lang::ObjC,       2.46 },
+    { Lang::Python,     2.36 },   // snake_case + shorter names → denser tokens
+    { Lang::TypeScript, 2.59 },
+    { Lang::Go,         2.53 },
+    { Lang::Rust,       2.59 },
+    { Lang::Swift,      2.55 },
+    { Lang::JavaScript, 2.59 },   // same identifier shape as TypeScript
+    { Lang::Bash,       2.50 },   // short command names + $VARs; mid-band
+    { Lang::Java,       2.55 },   // verbose CamelCase identifiers; upper-mid band
+    { Lang::Ruby,       2.40 },   // snake_case + short method names, prose-like; denser
+    { Lang::Markdown,   2.56 },   // heading text tokenizes like prose
+    { Lang::Json,       3.10 },   // measured 2026-07 (n=108): package.json/tsconfig.json, o200k_base
+    { Lang::CSharp,     2.55 },   // B6.2: REASONED, not yet measured (no corpus run) — verbose PascalCase
+                                   // identifiers put it in Java's band; recalibrate once tokenbudgetcheck
+                                   // gets a C# corpus sample. Unlike Json, `s.lang==CSharp` never reaches
+                                   // this table via estimateTokens's contentBytesByLang[13] index (it
+                                   // clamps into the Unknown bucket, model.h's documented headroom) — this
+                                   // entry only feeds bytesPerTokenFor's OTHER direct callers (serialize.h).
+    { Lang::C,          2.46 },   // L3: REASONED, not measured — same short snake_case/terse identifier
+                                   // convention as C++ (they share a lexicon; a C corpus is not meaningfully
+                                   // denser/sparser than the C++ one this rate was measured on), so C
+                                   // borrows Cpp's exact rate rather than guessing a new one. Same headroom
+                                   // clamp as CSharp above: `s.lang==C` never reaches contentBytesByLang[13].
+    { Lang::Toml,       3.10 },   // REASONED, not measured — TOML borrows Json's exact rate rather than
+                                   // guessing a new one: both lanes emit t="sec" symbols whose names ARE the
+                                   // config keys, so the emitted stream has the same shape (short dotted/
+                                   // snake-case key text inside dense markup) that made Json the sparse
+                                   // outlier at 3.10. Recalibrate together with Json when tokenbudgetcheck
+                                   // next gets a config-file corpus sample. Same headroom clamp as CSharp/C
+                                   // above: `s.lang==Toml` (16) never reaches contentBytesByLang[13].
+    { Lang::Yaml,       3.10 },   // REASONED, not measured — the third data-config lane borrows the same
+                                   // Json rate for the same reason as Toml directly above: identical emitted
+                                   // shape (t="sec" rows whose names ARE the config keys). Recalibrate with
+                                   // Json/Toml together. Same headroom clamp: `s.lang==Yaml` (17) never
+                                   // reaches contentBytesByLang[13].
+    { Lang::Php,        2.55 },   // REASONED, not measured — PHP's emitted stream is dominated by verbose
+                                   // PascalCase class names and camelCase methods (PSR-1/PSR-12 make that a
+                                   // near-universal convention, and the laravel/framework shape-recall run in
+                                   // the port round confirmed the shape), which is Java's and C#'s band, so
+                                   // PHP borrows their 2.55 rather than guessing a new rate. Recalibrate with
+                                   // Java/CSharp when tokenbudgetcheck next gets a PHP corpus sample. Same
+                                   // headroom clamp as CSharp/C/Toml/Yaml above: `s.lang==Php` (18) never
+                                   // reaches contentBytesByLang[13].
+    { Lang::GDScript,   2.36 },   // REASONED, not measured — GDScript is Python's shape (indentation, snake_case
+                                   // members, `func`/`var`), so it borrows Python's MEASURED 2.36 rather than
+                                   // guessing a new rate. It is deliberately the DENSE end of the plausible band:
+                                   // Godot's PascalCase API names (CharacterBody2D, get_tree) push the true rate
+                                   // up toward the 2.55 Java/CSharp band, and under-stating bytes/token OVER-states
+                                   // the token count, which shrinks a budget rather than overrunning it — the safe
+                                   // direction. Recalibrate with Python when tokenbudgetcheck gets a .gd corpus.
+                                   // Same headroom clamp as every append since CSharp: `s.lang==GDScript` (23)
+                                   // never reaches contentBytesByLang[13].
+    { Lang::Lua,        2.40 },   // REASONED, not measured — Lua's convention is short lower-case and
+                                   // snake_case names over a very small keyword set, the same identifier shape
+                                   // that put Ruby at the dense end of the band, so Lua borrows Ruby's exact
+                                   // 2.40 rather than guessing. Recalibrate with Ruby. Same headroom clamp:
+                                   // `s.lang==Lua` (19) never reaches contentBytesByLang[13].
+};
+inline constexpr double kBytesPerTokenDefault = 2.50;   // Unknown-language / empty-map fallback (mid-band)
+
+// Full DEF BODY text (packBodies / --expand) tokenizes far LEANER than the map's signature-dense content:
+// method bodies carry indentation, braces, and repeated whitespace that BPE merges aggressively — MEASURED
+// ~3.8 B/tok on real o200k (vs ~2.46 for C++ SIGNATURE markup). Using the signature rate on body bytes
+// over-reads ~24% (buildGraph body is ~8.8K real tokens, not ~11K). So the
+// --expand body estimate scales body text at THIS rate, keeping markup/callee-sigs at their own (denser) rates.
+inline constexpr double kBytesPerTokenBody = 3.80;
+
+// The DENSEST (smallest B/tok) rate across the table = the most tokens a byte can cost. --max-tokens
+// converts its byte-fit budget with THIS conservative rate so the real token count of the packed map
+// never exceeds the requested ceiling regardless of the corpus's language mix. (Python is densest.)
+inline constexpr double kMinBytesPerToken = 2.36;
+
+// --max-tokens fits to a fraction of the requested budget so the number is a CEILING, not a target
+// (§2f: a 90%-of-budget headroom factor beats chasing exactness against a tokenizer we can't see).
+inline constexpr double kBudgetHeadroom = 0.90;
+
+// W3FIX H2/M1 — THE SINGLE-ENTRY OVERSHOOT TOLERANCE. The task lenses (--for, --pack-task) state a hard byte
+// ceiling in their own header (budgetTokens x kMinBytesPerToken), but their ranking section emits its FIRST
+// entry WHOLE — a symbol's signature is not divisible, so a bundle whose first row is large lands a little
+// over the ceiling with nothing left to trim. The design has always accepted that overshoot; it was written
+// down twice as a bare 1.15 in test/bundleidcheck.sh and test/partitioncheck.sh and NOWHERE in the code, so
+// the emitters could not consult the tolerance they are judged against and instead compared against the bare
+// ceiling. That mismatch is what made the ceiling disclosure fire on a 1.8%-over document and then push it to
+// 15% over with the disclosure's own bytes. This is the ONE number: at or under it, the bundle is conformant
+// and says nothing; past it, the lens has provably failed to trim to fit and labels itself over_ceiling.
+inline constexpr double kCeilingFirstEntryTolerance = 1.15;
+
+// The delivered-byte allowance a lens is judged against for a given token budget — ceiling x the tolerance
+// above, in ONE expression so --for and --pack-task cannot drift apart on the arithmetic.
+inline constexpr std::size_t ceilingAllowanceBytes( std::size_t budgetTokens ) noexcept
+{
+    return std::size_t( double( budgetTokens ) * kMinBytesPerToken * kCeilingFirstEntryTolerance );
+}
+
+// THE EXACT CEILING, IN THE UNIT THE ROOT PRINTS. Both task lenses label a root over_ceiling="1" on
+// `est_tokens > budget_tokens`, and est_tokens prices the delivered document at kBytesPerTokenDefault — so the
+// largest document that keeps the root silent is budgetTokens x kBytesPerTokenDefault, NOT the allowance above
+// and NOT budgetTokens x kMinBytesPerToken.
+//
+// WHY THIS EXISTS (2026-09-13, PR #215 review item 1). The ladder's free rungs were priced at kMinBytesPerToken
+// (2.36) while the verdict they exist to avoid is priced at kBytesPerTokenDefault (2.50), a 6% disagreement in
+// the direction that makes the lens trim a document its own root calls conformant. MEASURED on the pre-fix
+// binary: `test/cppqualfix --for="widget ping make box" --token-budget=1200` printed est_tokens="778" with no
+// over_ceiling= — comfortably inside its budget — and had still dropped three legend clauses "(ceiling)"; at
+// --token-budget=1300 the same query kept every clause at est_tokens="1146". A lens must not pay a rung for a
+// ceiling it is not against. The tolerance above is for the residual a lens cannot trim (a first signature is
+// not divisible) and still governs the rungs that COST something — see climbCeilingLadderBy, which takes both.
+inline constexpr std::size_t ceilingBytes( std::size_t budgetTokens ) noexcept
+{
+    return std::size_t( double( budgetTokens ) * kBytesPerTokenDefault );
+}
+
+// The conservative hard byte ceiling a token target implies at the DENSEST language rate — a different number
+// from ceilingBytes above, with a different job: --pack-task PUBLISHES it (`budget_ceiling_bytes` in the JSON
+// dialect, "ceiling C" in the ledger line) so a consumer can check a bundle without re-deriving a rate. It was
+// open-coded at three sites in packtask.h; one expression now, so the published number and the ledger's number
+// cannot drift. Deliberately NOT repointed at ceilingBytes: this one is what the lens declares to a caller, and
+// changing its rate would change a published contract that no defect asks to move.
+inline constexpr std::size_t declaredByteCeiling( std::size_t budgetTokens ) noexcept
+{
+    return std::size_t( double( budgetTokens ) * kMinBytesPerToken );
+}
+
+// The SHAPING budget the same token count buys — tokens x the densest-language byte rate x the headroom.
+// Distinct from the allowance above (which spends kCeilingFirstEntryTolerance, an OVERSHOOT bar) and
+// deliberately adjacent to it, so the two are read together and never confused.
+//
+// P11/H9 (capture-audit 2026-09-04): this expression was open-coded at SIX sites — --for, --pack-task,
+// --from-trace, --recall and both of their MCP twins — which is how --recall's front doors came to hand the
+// builder a byte count and lose the token number its own header had to disclose (H9). One expression now,
+// so a budget flag's unit cannot mean two things depending on which verb read it. 0 = no ceiling.
+inline constexpr std::size_t budgetBytesForTokens( std::size_t budgetTokens ) noexcept
+{
+    return budgetTokens == 0 ? 0 : std::size_t( double( budgetTokens ) * kMinBytesPerToken * kBudgetHeadroom );
+}
+
+// CA4 §B3 — the SAME bar, for a lens whose caller resolved the token budget into BYTES before the call.
+// --from-trace's FromTraceInputs carries `bundleBudgetBytes` (already tokens x kMinBytesPerToken x
+// kBudgetHeadroom), so it cannot call the sibling above without a `budgetTokens` field its two call sites do
+// not have. Algebraically identical, which is the point of expressing it here rather than open-coding a
+// second constant: bytes x (tolerance / headroom) == tokens x rate x headroom x tolerance / headroom
+// == tokens x rate x tolerance == ceilingAllowanceBytes( tokens ). One expression, so the three task lenses
+// cannot drift apart on the arithmetic.
+inline constexpr std::size_t ceilingAllowanceFromBudgetBytes( std::size_t budgetBytes ) noexcept
+{
+    return std::size_t( double( budgetBytes ) * ( kCeilingFirstEntryTolerance / kBudgetHeadroom ) );
+}
+
+// The three sentences a ceiling ladder splices into a header. Supplied by the caller because each lens writes
+// its comment in its own punctuation (--for uses [bracket notes], --pack-task a | pipe-separated report).
+struct CeilingLadderNotes { std::string_view echoDropped, echoAndRouteDropped, overCeiling; };
+
+// THE CEILING LADDER, one implementation for both task lenses — --for and --pack-task climbed identical rungs
+// in identical order, and a duplicated ladder is a ladder that will diverge. `build( withRouteAttr,
+// withTaskEcho, extraNotes )` returns the header for that shape; this PRICES shapes and returns the one to
+// emit, so a caller can never price a shape it then fails to build (the failure mode of the string-surgery
+// version this replaced). Rungs, cheapest information loss first:
+//   (a) as built — returned untouched when it already fits, which is the overwhelmingly common case;
+//   (b) the comment's task echo dropped: a byte-for-byte DUPLICATE, since the verbatim copy stays in task=;
+//   (c) that plus the verbatim route= attribute — the first rung that costs unique information;
+//   (d) nothing reaches the allowance: the header AS BUILT plus an over_ceiling sentence, because a caller who
+//       hit the wall is owed the complete bundle and an honest label, not a mutilated bundle.
+// Every candidate is measured WITH its own disclosure bytes included. Pure function of its inputs — no clock,
+// no map order — so the chosen shape is deterministic.
+//
+// THE FIT TEST IS THE CALLER'S when what rides a header depends on the header. --for prices its root AFTER the
+// ladder picks a shape: est_tokens=, plus over_ceiling="1" and the legend clause defining it whenever that price
+// exceeds budget_tokens. Those bytes change with the shape, so no fixed payload can stand in for them, and pricing
+// the BUILT header let a bundle ship 70 B past the allowance with no rung fired (PR #135, estchargecheck #11 A7).
+// climbCeilingLadderBy climbs the same rungs against `fits( candidateHeader )`. climbCeilingLadder is its
+// fixed-payload form, so the two cannot climb different ladders — and it returns the same CeilingLadderChoice,
+// because a caller that needs the rung must not have to go looking for it in the string (see below).
+//
+// M3 — THE RUNG IS RETURNED, NOT LEFT TO BE GUESSED. A caller needs the verdict (--for puts over_ceiling="1" on
+// its root when the last rung fires) and the only other place to read it from is the finished document, by
+// searching it for the rung's own note. That is FORGEABLE: the header carries the caller's task echoed verbatim
+// by contract (routeoncecheck), so a task containing the note text is indistinguishable from a rung that really
+// fired — --for shipped `budget_tokens="100000" est_tokens="3932" over_ceiling="1"` on a 9.8 KB document for
+// exactly that reason, a root contradicting itself in one unit, and --pack-task shipped the same label off the
+// 13-character substring `over_ceiling:` typed into a task. The branch that BUILDS a candidate is the branch
+// that knows its rung, so carrying that value OUT is what makes the forgery impossible rather than merely
+// unlikely. Gate: test/ceilingverdictcheck.sh, both lenses.
+//
+// `fits` is NOT told the rung, and the first version of M3 was wrong to pass it one. The terminal rung (d) is
+// the branch that never asks — it is what the ladder lands on when nothing fit — so `fits` can only ever be
+// called with (a), (b) or (c), and a predicate that tested for (d) was testing a value it could not receive.
+// --for had one, pricing over_ceiling="1"'s 70 B "onto the candidate that will actually carry them": invariantly
+// false, and harmless only because the caller's real predicate (est_tokens > budget_tokens) prices those bytes
+// on every candidate anyway. A branch that cannot fire is deleted here rather than documented.
+enum class CeilingRung : std::uint8_t
+{
+    AsBuilt = 0,           // (a) it already fitted — the overwhelmingly common case
+    EchoDropped,           // (b) the comment's task echo dropped — a byte-for-byte duplicate of task=
+    EchoAndRouteDropped,   // (c) that plus the verbatim route= attribute — the first unique-information loss
+    OverCeiling            // (d) nothing reached the allowance: the complete bundle, honestly labelled
+};
+
+struct CeilingLadderChoice
+{
+    std::string header;
+    CeilingRung rung = CeilingRung::AsBuilt;
+};
+
+// TWO CEILINGS, ONE LADDER (2026-09-13, PR #215 review item 1). `fitsExact` is the ceiling the root PROMISES
+// (est_tokens <= budget_tokens); `fitsAllowance` is that ceiling plus the first-entry tolerance. Each caller
+// decides how to SPELL them: the fixed-payload wrapper below has one rate and compares bytes, while --for's
+// lens prices markup and bodies at different rates and so asks its exact question in TOKENS, on the finished
+// document (verbs_for.h fitsExactCeiling). This template never assumes bytes — it only asks "does it fit".
+// Which rung is judged by which is the whole design:
+//   (a) as built is judged by fitsExact — a document that already fits what its root PROMISES keeps everything,
+//       and rung zero (the caller's droppable legend clauses, above this function in --for) is entered on the
+//       same ceiling for the same reason: both are free, so they are tried at the tighter number.
+//   (b) echo dropped is TRIED because (a) failed the exact ceiling, and ACCEPTED at the allowance. The two are
+//       not the same question and the asymmetry is deliberate: the echo is a byte-for-byte duplicate of task=,
+//       so DROPPING it costs the reader nothing and is worth doing at the tighter number; but REFUSING it for a
+//       residual inside the tolerance would send the ladder on to (c), which throws route= away — real, unique
+//       information — to buy bytes the tolerance already grants. Accepting (b) at the allowance is what keeps
+//       (c) from firing on an overshoot (c) exists to tolerate. A bundle can therefore stop at (b), keep route=,
+//       and still be labelled over_ceiling="1" by the verdict: that is the tolerance working, not a missed rung.
+//   (c) route= dropped and (d) the honest label are judged by fitsAllowance — (c) is the first UNIQUE-information
+//       loss and (d) is the verdict, and the tolerance exists precisely so neither fires on a residual a lens
+//       cannot trim. Trimming real content, or calling a lens failed, at the exact ceiling would spend the
+//       tolerance the design has always granted.
+// Passing the same predicate twice reproduces the pre-#215 single-ceiling ladder exactly, which is what
+// climbCeilingLadder's byte-ceiling pair does when a caller gives it one number.
+template<typename BuildFn, typename FitsExactFn, typename FitsAllowanceFn>
+inline CeilingLadderChoice climbCeilingLadderBy( BuildFn&& build, std::string_view builtHeader, FitsExactFn&& fitsExact,
+                                                 FitsAllowanceFn&& fitsAllowance, bool hasRouteAttr, const CeilingLadderNotes& notes )
+{
+    if( fitsExact( builtHeader ) )
+    {
+        return { std::string( builtHeader ), CeilingRung::AsBuilt };
+    }
+
+    // ONE fit test per candidate. The rung-(b) shape used to be priced twice — harmless when `fits` is the
+    // fixed-payload comparison below, but --for's predicate rebuilds and re-prices a whole header through
+    // finishForLensHeader, so the second call was a duplicated fixpoint on every budgeted run.
+    CeilingLadderChoice choice{ build( /*withRouteAttr=*/true, /*withTaskEcho=*/false, notes.echoDropped ), CeilingRung::EchoDropped };
+    // (b) is enough when it reaches the exact ceiling, and ALSO when it merely lands inside the allowance: the
+    // residual past the exact ceiling is what the tolerance is for, and nothing a reader would miss buys it back.
+    bool candidateFits = fitsAllowance( std::string_view( choice.header ) );
+    if( !candidateFits && hasRouteAttr )
+    {
+        choice        = { build( /*withRouteAttr=*/false, /*withTaskEcho=*/false, notes.echoAndRouteDropped ), CeilingRung::EchoAndRouteDropped };
+        candidateFits = fitsAllowance( std::string_view( choice.header ) );
+    }
+    if( !candidateFits )
+    {
+        choice = { build( /*withRouteAttr=*/true, /*withTaskEcho=*/true, notes.overCeiling ), CeilingRung::OverCeiling };
+    }
+    return choice;
+}
+
+// The fixed-payload form — same rungs, same return. It hands back the CHOICE and not the header alone because
+// both of its callers need the rung: --pack-task labels its root from it, and reading that label back out of
+// the chosen string is the forgery above (`chosen.find( "over_ceiling:" )`, live until 0.6.1).
+template<typename BuildFn>
+inline CeilingLadderChoice climbCeilingLadder( BuildFn&& build, std::string_view builtHeader, std::size_t payloadBytes,
+                                               std::size_t exactCeiling, std::size_t allowanceCeiling, bool hasRouteAttr,
+                                               const CeilingLadderNotes& notes )
+{
+    const auto fitsWithin = [ & ]( std::size_t ceiling )
+    {
+        return [ &, ceiling ]( std::string_view header ) { return header.size() + payloadBytes <= ceiling; };
+    };
+    return climbCeilingLadderBy( build, builtHeader, fitsWithin( exactCeiling ), fitsWithin( allowanceCeiling ),
+                                 hasRouteAttr, notes );
+}
+
+// ── B0.3 rank-adaptive --for payload budget (R1 hypothesis #4) ────────────────────────────────────────
+// The --for lens spends the same per-result payload on rank 40 as on rank 1, and long conceptual queries
+// (the A7 token blocker: production ceiling p95 +62.9%) surface doc-heavy winners. Downstream-LLM accuracy
+// measurably DEGRADES with context length (R1's context-rot evidence), so the tail is trimmed by a rule
+// that is a PURE function of (global rank, these fixed byte limits) — deterministic, query-independent:
+//   rank 1..kForDocFullRankCount        → untouched (full doc excerpt + full signature);
+//   rank ..kForDocExcerptRankCount      → doc excerpt truncated to kForDocExcerptBytes (UTF-8-safe + "…");
+//   rank beyond kForDocExcerptRankCount → signature-only (no doc), signature capped at kForTailSigBytes.
+// Applied ONLY when the caller opts in (the --for lens and the MCP `for` verb) — --pack-signatures, the
+// default map, --format=candidates, and the golden are untouched by construction (default param off).
+inline constexpr std::size_t kForDocFullRankCount    = 12;
+inline constexpr std::size_t kForDocExcerptRankCount = 24;
+inline constexpr std::size_t kForDocExcerptBytes     = 96;
+inline constexpr std::size_t kForTailSigBytes        = 160;
+
+// ── B0 round 2 (H1): GLOBAL deterministic payload budget for the ranked --for bundle ─────────────────
+// The rank tiers above cut only ~1% of the measured LocBench payload: the worst bundles are dominated by
+// the TOP-12 full entries with long doc comments (payload p50 12,776 B / p95 18,793 B), and the paired
+// token budget holds iff the whole response is capped at ≤ ~8,000 B (measured; 7,500 B ⇒ paired p95 ratio
+// 1.000). So the --for lens (CLI --for + MCP `for` verb ONLY — never --pack-signatures, the default map,
+// or the candidates export) enforces a fixed default budget over the whole bundle; the <sigs> block is
+// where trimming happens, via a LADDER that is a pure function of (global rank, these constants), applied
+// from the tail upward AFTER the rank tiers:
+//   A. tail (rank > kForDocExcerptRankCount)  : signature shrinks 160 → kForCapTailSigBytes;
+//   B. rank 13..24                            : doc excerpt dropped;
+//   C. rank 1..12                             : doc capped at kForDocExcerptBytes;
+//   D. rank 5..12                             : doc dropped, signature capped at kForTailSigBytes;
+//   E. rank 1..4                              : signature capped at kForTailSigBytes (doc keeps its
+//                                               kForDocExcerptBytes floor — never below sig 160 + doc 96);
+//   F. entries of rank ≥ 5 dropped whole, tail-first (rank 1..4 always survive at the floor).
+// Each single-entry action re-checks the budget, so the ladder stops at the first fitting state —
+// deterministic, query-independent, and self-announcing (capped="1" on <sigs>). An EXPLICIT
+// --token-budget=N overrides the default (N tokens × the conservative byte rate), so a caller who asks
+// for a bigger (or smaller) bundle beats the default — but in AUTO-BUNDLE mode the sig side's claim on
+// that wider ceiling is capped at THIS default budget (main.cpp sigSideCeiling; classb-bytes-memo §2's
+// N=8000 trap: an uncapped claim re-inflated the trimmed tail and crowded the auto bodies out), so the
+// excess buys bodies, not sig tail. An explicit --pack-top-n keeps the whole-ceiling sig claim, and
+// --signatures-only / --detail=N / --json (no auto bodies to reserve for) are likewise uncapped.
+inline constexpr std::size_t kForPayloadBudgetBytes = 7500;
+inline constexpr std::size_t kForCapTailSigBytes    = 96;
+
+// ── THE --for LENS'S RANKED-HEAD CAP, OWNED ONCE (round-4 finding F-03) ──────────────────────────────
+// How many ranked symbols the --for lens considers before the relevance floor narrows it and the ladder
+// above trims it. The CLI lens (`--pack-top-n`, else this) and the MCP `for` verb MUST read the same
+// number. They spelled it as two independent literals, and the MCP side was additionally handed the
+// SERVER-WIDE `--top-k` — default 200, the ranked MAP's row cap, a knob `--for` is documented to ignore
+// (cli.h honorsTopK). Since the `for` tool schema exposes no cap of its own, EVERY MCP `for` call an agent
+// could make ran a 5x wider candidate pool than the CLI's: on `parse arguments` over this repo,
+// dropped_positive="169" against the CLI's "11", and a substantially different served symbol set, with no
+// argument able to reach the CLI's behavior. Accepted-and-ignored is a named failure family here; silently
+// honoring a knob the twin surface ignores is its mirror image, and it moved what an agent was served.
+// Gate: test/mcpforparitycheck.sh compares the two dialects' served symbol SET and dropped_positive= value.
+inline constexpr int kForLensDefaultTopN = 40;
+
+// ── T3 terminal-by-default --for (pre-registered: docs/EVALS.md §4, T3 round) ────────────────────────
+// The default --for bundle serves the top-ranked symbols' FULL bodies inline after the signatures — the
+// month-scale transcript mine measured map-then-read as the single biggest non-terminal chain, and the
+// terminal verb that already carried bodies (--pack-task) was called zero times in the same month, so
+// the DEFAULT gets richer rather than a richer verb staying unreachable. This allowance is the body
+// budget the DEFAULT bundle gains ON TOP of kForPayloadBudgetBytes (~1.6K tokens at kBytesPerTokenBody):
+// the signature budget above is untouched, so the ranked map is byte-identical to the signatures-only
+// run and the bodies ride only on this disclosed extra. An EXPLICIT --token-budget=N is a hard ceiling —
+// no allowance; bodies take the budget the signature bundle left over, where the signature side's claim
+// is capped at kForPayloadBudgetBytes (main.cpp sigSideCeiling — the forbudgetmonotoncheck invariant: a
+// wider ceiling never serves less decisive content; at any ceiling >= kForPayloadBudgetBytes +
+// kForAutoBodyBudgetBytes the sig render equals the default regime's, so the bodies' leftover is
+// provably >= the default's and every body the default serves still fits). Disclosure is on
+// the <ctx> root (bundle="auto" bodies="N", reason="budget" when none fit) plus a legend sentence;
+// --signatures-only opts out byte-identically; --detail=N (the explicit knob) supersedes the automatic
+// selection. Candidate cap: kPackTaskBodyCandidates — the default --for converges on the pack-task shape.
+// This is the SIX-CANDIDATE pool; when the route's anchor restriction leaves exactly one candidate it is
+// superseded by kForAnchorBodyBudgetBytes just below. Nothing else supersedes it.
+inline constexpr std::size_t kForAutoBodyBudgetBytes = 6000;
+
+// ── THE ANCHOR-RESOLVED BODY ALLOWANCE (pre-registered: docs/EVALS.md, the T3 body-budget round) ──────
+// The allowance above is a POOL sized for up to kPackTaskBodyCandidates = 6 bodies. But on a name-exact
+// route restrictBodiesToRouteAnchor (main.cpp) runs first and frequently collapses the candidate set to
+// EXACTLY ONE — the anchor's own definition — and the bundle then rations a six-body pool against a
+// one-body answer. On a large class it refuses: default bundleBudget is kForPayloadBudgetBytes, so the
+// allowance cannot exceed 7500 + 6000 = 13,500 B even with a zero-byte signature side, while duckdb's
+// `class Deserializer` body is 14,875 B. Measured: the anchor-body round moved six golds to the right
+// anchor and two of them (ClientContext, Deserializer) then emitted bodies="0" reason="budget" —
+// the right answer not fitting where the WRONG one-line forward declaration always had.
+//
+// So when the route is at its MOST certain about what the caller wants — a name-exact query whose anchor
+// resolved to a definition, and a candidate set of exactly one — that one body is funded at a one-body
+// rate instead of a six-body pool's share. The three conditions are all checked at the one call site
+// (main.cpp buildForAutoBodies); this constant is only the rate.
+//
+// THE NUMBER IS DERIVED FROM THIS TOOL'S OWN REGISTERED CONSTANTS, not from the probe set that measured
+// the defect: it is what kPackTaskDefaultTokens buys at kBytesPerTokenBody, i.e. ONE ANCHOR-RESOLVED BODY
+// MAY COST AT MOST WHAT ONE WHOLE DEFAULT --pack-task BUNDLE COSTS. That identity is machine-checked by a
+// tolerance-band static_assert in packtask.h (where both terms are visible) rather than left as a comment,
+// so the value cannot drift away from its own rationale. Cost stays disclosed where it is incurred:
+// est_tokens already charges bodies at kBytesPerTokenBody.
+//
+// WHAT IT IS NOT, and the three bounds that keep it that way (gate: anchorbodycheck arms 7c/7d/7e):
+//   • not a general budget increase — kForAutoBodyBudgetBytes above is untouched, packBodies is untouched,
+//     and every other verb (--pack-task, --expand, --detail=N, --exemplar, --from-trace, MCP, the compact
+//     <hops> builder) is byte-identical by construction;
+//   • not a licence to serve a SET — the candidate set must be exactly 1, so "funds at most one body" is a
+//     fact about the input rather than an accounting argument; an anchored bundle with 2+ same-named
+//     definitions in the anchor's file keeps the fixed pool;
+//   • not a repeal of whole-body-or-nothing — truncateOversizedFirst stays false, so a definition larger
+//     than THIS ceiling is still dropped and disclosed. The honest zero does not go away; it moves.
+// An explicit --token-budget=N stays a hard ceiling and never sees this constant, exactly as T3 registered.
+inline constexpr std::size_t kForAnchorBodyBudgetBytes = 22800;
+
+// ── DEEP-TAIL d2: the FILE-GRAIN TAIL of the --for bundle (registered: docs/EVALS.md, deep-tail round) ──
+// The lens serves ranked SYMBOL heads concentrated in few files; a consumer that needs file-grain recall
+// 20+ deep (external re-measure: the pre-registered retrieval lanes score exactly that) runs out of files
+// long before that depth — measured externally as the ENTIRE recall gap on the one task family where the
+// head's MRR already wins. The tail is the cheapest honest widening: the REMAINING candidate files (a
+// positive lens score, not already in the served head's file set) as PATHS ONLY, in the deterministic
+// best-symbol projection of the same (score desc, id asc) order the head selected with — a projection of
+// the existing ranking, never a re-rank. Zero-score files are NOT served (the LB-A relevance-floor
+// reasoning at file grain: a file whose symbols matched nothing has no evidence to stand on). total=
+// counts every candidate file; shown= what this bundle printed; capped="1" when they differ. The legend
+// labels it file-grain, weaker evidence than the ranked rows above it.
+//   • DEFAULT regime: rows cap at kForFileTailShownCap; the bytes ride ON TOP of the sig/body budgets
+//     (the kForAutoBodyBudgetBytes precedent) and are measured into est_tokens — the ranked head and the
+//     bodies stay byte-identical to a tail-less bundle by construction.
+//   • EXPLICIT --token-budget: the ceiling stays hard — the tail is funded LAST (weakest evidence pays
+//     first): rows fit into the residual the rendered bundle actually left, trimming down to the honest
+//     empty shell. kForFileTailShellReserve rides inside the committed bytes handed to the body walk so
+//     that shell always fits — the kAutoAttrReserve pattern, sized for `<tail total="NNNNN" shown="0"
+//     capped="1"></tail>`.
+inline constexpr std::size_t kForFileTailShownCap     = 24;
+inline constexpr std::size_t kForFileTailShellReserve = 48;
+
+// The candidate walk, shared by the XML and JSON dialects (and the MCP `for` twin) so the three surfaces
+// cannot select differently. `headIds` is THE BUNDLE'S RESOLVED SURFACE (the exact set <sigs> selects);
+// paths are root-relativized exactly as every emitted p= is (R-R). paths.size() <= kForFileTailShownCap;
+// `total` keeps counting past the cap so the disclosure pair is honest.
+struct FileTail
+{
+    std::vector<std::string> paths;      // first kForFileTailShownCap tail files, ranker order, display form
+    std::size_t              total = 0;  // every remaining candidate file with a positive lens score
+};
+
+inline FileTail computeFileTail( const IngestResult& ing, const std::vector<float>& rank,
+                                 const std::vector<NodeId>& headIds, std::string_view rootArg )
+{
+    FileTail out;
+    std::vector<char> inHead( ing.files.size(), 0 );
+    for( NodeId sid : headIds )
+    {
+        if( sid < ing.symbols.size() && ing.symbols[ sid ].fileId < inHead.size() )
+        {
+            inHead[ ing.symbols[ sid ].fileId ] = 1;
+        }
+    }
+
+    const std::size_t   S = ing.symbols.size();
+    std::vector<NodeId> order( S );
+    for( NodeId i = 0; i < S; ++i )
+    {
+        order[i] = i;
+    }
+    sortutil::radixSortByScoreDescId( order, rank );
+
+    const std::string rootPrefix = rootArg.empty() ? std::string() : rw::sarif::rootPrefixOf( rootArg );
+    std::vector<char> seen( ing.files.size(), 0 );
+    for( std::size_t k = 0; k < S; ++k )
+    {
+        const NodeId id = order[k];
+        if( id >= rank.size() || !( rank[id] > 0.0f ) )
+        {
+            break;                                   // (score desc) order: the zero-score tail is contiguous
+        }
+        const std::uint32_t f = ing.symbols[id].fileId;
+        if( f >= seen.size() || seen[f] || inHead[f] )
+        {
+            continue;
+        }
+        seen[f] = 1;
+        ++out.total;
+        if( out.paths.size() < kForFileTailShownCap )
+        {
+            out.paths.emplace_back( rootArg.empty() ? std::string( ing.files[f] )
+                                                    : std::string( rw::sarif::rootRelativeUri( ing.files[f], rootPrefix ) ) );
+        }
+    }
+    return out;
+}
+
+// The XML shape: `<tail total="T" shown="K" capped="0|1"><t p="…"/>…</tail>` — §P8 vocabulary, always
+// emitted (a total of 0 means genuinely none remain, never not-computed — the B1.4 rule for elements).
+// `shownCap` lets the explicit-budget caller trim rows below the collected count; the JSON twin below
+// renders the SAME decision so the dialects cannot diverge on what was served.
+inline std::string renderFileTailXml( const FileTail& t, std::size_t shownCap, std::vector<char>& esc )
+{
+    const std::size_t shown = std::min( shownCap, t.paths.size() );
+    std::string x = "<tail total=\"" + std::to_string( t.total )
+                  + "\" shown=\"" + std::to_string( shown )
+                  + "\" capped=\"" + ( shown < t.total ? "1" : "0" ) + "\">";
+    for( std::size_t i = 0; i < shown; ++i )
+    {
+        x += "<t p=\"";  x += escapeXml( t.paths[i], esc );  x += "\"/>";
+    }
+    x += "</tail>";
+    return x;
+}
+
+// The JSON twin: `"tail":{"total":T,"shown":K,"files":[…]}` (the caller supplies the leading comma).
+inline std::string renderFileTailJson( const FileTail& t, std::size_t shownCap )
+{
+    const std::size_t shown = std::min( shownCap, t.paths.size() );
+    std::string j = "\"tail\":{\"total\":" + std::to_string( t.total )
+                  + ",\"shown\":" + std::to_string( shown ) + ",\"files\":[";
+    for( std::size_t i = 0; i < shown; ++i )
+    {
+        if( i > 0 )
+        {
+            j += ",";
+        }
+        j += '"';
+        jsonesc::escapeInto( t.paths[i], j, false, true, false );   // same core appendJsonStrField uses
+        j += '"';
+    }
+    j += "]}";
+    return j;
+}
+
+// The legend clause defining BOTH deep-tail surfaces (the r= rank fact and the <tail> element) — a named
+// constant, shared by the CLI --for header and the MCP `for` twin, so the sigs-budget exemption in each
+// dialect subtracts EXACTLY the bytes the clause adds (the kForAutoBundleLegend pattern). No "--" anywhere:
+// it rides inside an XML comment where "--" is ill-formed (G4).
+inline constexpr std::string_view kForFileTailLegend =
+    "; tail: file-grain tail, WEAKER evidence than the ranked rows (paths only): every positive-score file "
+    "NOT among the shown sigs rows — the files of trimmed rows first, best-symbol rank order; rows are t p=file; total=such files, "
+    "shown=printed, capped=1 when they differ. r= on a ranked row is its 1-based rank in this lens ranking, "
+    "rows in r= order, p= the file (a gap = a budget-trimmed row)";
+
+// R2-AF (round 2, S4): the legend clause defining `<hdr p= of=/>` — verbatim, round-2 amendment §R7. A
+// named constant, shared by the CLI --for header and the MCP `for` twin (rw::forNamedHeaderRows,
+// mention.h, is the ONE resolver both surfaces call), present-only: appended only on an answer that
+// actually carries a row. 198 B, priced and pinned (test/forhdrshapecheck.sh).
+inline constexpr std::string_view kForHdrLegend =
+    "; hdr p= of=: the file the task names (of=) has exactly one same-directory, same-stem declaration/"
+    "implementation partner (p=), listed first by name alone: a lookup, not a ranked or graph-derived row";
+
+// Explicit-budget row fit: the largest shown count whose rendered XML fits `budgetBytes` (0 rows always
+// "fits" — the shell is reserved by the caller). Walks down from the collected count; deterministic.
+inline std::size_t fileTailShownForBudget( const FileTail& t, std::size_t budgetBytes, std::vector<char>& esc )
+{
+    for( std::size_t shown = t.paths.size(); shown > 0; --shown )
+    {
+        if( renderFileTailXml( t, shown, esc ).size() <= budgetBytes )
+        {
+            return shown;
+        }
+    }
+    return 0;
+}
+
+// ── COMPACT CONCEPTUAL SERVING (pre-registered: docs/EVALS.md, the T3 route-narrowing round) ──────────
+// On the CONCEPTUAL route — the subtoken+body ranker, the route that names no anchor — the allowance
+// above is where this tool's bytes actually go and where they cost it the standing head-to-head: class B
+// runs 2.39x the competitor's bytes, bodies (CDATA plus their <calls> lists) are 52.7% of every class-B
+// byte, and the competitor answers the same neighbourhood question in 0.7-1.0 KB. That is the case for
+// this shape on its own. So the route serves the ranked map plus one-hop edge context and no body text.
+//
+// A transcript pass supports it — 17 of 17 body-serving episodes re-read the file before editing, zero
+// clean body-use — and that support is SCOPED: one mechanism behind it is that Claude Code 2.1.209's
+// Edit tool requires a prior Read, which other harnesses are not known to share and which any release
+// may change. Nothing here detects or conditions on a harness, and nothing here may be changed to: the
+// only condition this serving reads is the tool's own route tag. See docs/EVALS.md for the registered
+// re-measure trigger if that harness contract moves.
+//
+// THE CONSTANT IS DERIVED, NOT TUNED, and TWO independent derivations agree on it inside 11%, which is
+// why it is one number rather than a range:
+//   • the edge-context SHARE of what the body allowance buys — across the 15-query class-B set the
+//     <calls> lists are 14,602 B of the 97,470 B bodies section, 15.0%, and 15.0% of
+//     kForAutoBodyBudgetBytes is 900 B;
+//   • the competitor's own recorded one-hop `context` answer, the shape this mode copies, measured at
+//     0.7–1.0 KB per query in the same head-to-head round.
+//
+// IT BUDGETS THE WHOLE COMPACT SURFACE, not just the rows. The first registration draft priced the hops
+// alone and left the legend, the root attribute and the section wrapper riding free — the same "a
+// disclosure has BYTES" trap the --for root legend already recorded once. Corrected before any compact
+// byte was measured: the caller subtracts its own fixed disclosure from this number and passes the
+// remainder to packHops, so a longer legend buys fewer edges rather than a bigger bundle. Same regimes
+// as the body allowance otherwise: it is what the DEFAULT bundle gains on top of kForPayloadBudgetBytes,
+// and an EXPLICIT --token-budget=N stays a hard ceiling (the hops take only genuine leftover).
+inline constexpr std::size_t kForCompactSurfaceBudgetBytes = 1000;
+
+// deterministic UTF-8-safe prefix cut + a visible ellipsis (the honest "there was more" marker); the
+// boundary back-off mirrors docCommentBefore's cap cut. No-op when the text already fits.
+inline void truncateUtf8WithEllipsis( std::string& s, std::size_t maxBytes )
+{
+    if( s.size() <= maxBytes )
+    {
+        return;
+    }
+    std::size_t cut = maxBytes;
+    while( cut > 0 && ( static_cast<unsigned char>( s[cut] ) & 0xC0 ) == 0x80 )
+    {
+        --cut;
+    }
+    s.resize( cut );
+    s += "\xE2\x80\xA6";   // U+2026 ellipsis
+}
+
+inline constexpr double bytesPerTokenFor( Lang l ) noexcept
+{
+    for( const TokenCalib& c : kTokenCalib )
+    {
+        if( c.lang == l )
+        {
+            return c.bytesPerToken;
+        }
+    }
+    return kBytesPerTokenDefault;
+}
+
+// ── §H7: THE one conversion from EMITTED BYTES to reported tokens ──────────────────────────────────
+// est_tokens used to be a per-PAYLOAD formula, and the formulas did not keep up with the emitters:
+// estimateTokens() below models the map's kept symbol SET, --expand grew a second estimator of its own
+// (estimateExpandBodyTokens), and the remaining payloads were never charged at all — one measured number
+// covered four different documents (MEASURED on src/, --top-k=10: bare map 1435 B, --metrics 2129 B,
+// --pack-signatures 12850 B, --pack-top-n=3 67143 B, --outline 2668 B, all reporting est_tokens=507, up
+// to ~52x under). A formula per payload is exactly how that recurs, so no emitter estimates its own size
+// any more: each one MEASURES the bytes it actually wrote and converts them HERE, at the calibrated rate
+// for what those bytes ARE (a kTokenCalib / model-weighted rate for markup+signatures,
+// kBytesPerTokenBody for def bodies and raw source). Rounds to nearest so the number never systematically
+// under-reads. ASSUME, not a clamp: a non-positive rate is a corrupt caller, never a runtime condition.
+inline std::size_t tokensForEmittedBytes( std::size_t emittedBytes, double bytesPerToken ) noexcept
+{
+    ASSUME( bytesPerToken > 0.0 );
+    return std::size_t( double( emittedBytes ) / bytesPerToken + 0.5 );
+}
+
+// M11 (capture-audit 2026-09-04, lens 7 F-EST-1): THE PRICED ROOT. Every --token-budget consumer prices the
+// document it delivers ON ITS ROOT ELEMENT, in tokens — the unit budget_tokens=/budget= are in — so a parser
+// that discards comments still reads the number (attrvocabcheck §3 gave the map that; --pack-task/--from-trace/
+// --handoff/--expand --top-k=0 priced nothing, or only in prose). The attribute is part of the document it
+// prices, so the digits are converged the way --for's header splice converges them (≤4 passes). `markupBytes`
+// are priced at `markupRate`, `bodyBytes` at kBytesPerTokenBody. Returns the attribute string; `outTokens`
+// receives the number, so the caller's own --token-budget gate reads the SAME value the root shows.
+inline std::string pricedRootAttr( std::size_t markupBytes, double markupRate, std::size_t bodyBytes, std::size_t* outTokens )
+{
+    const std::size_t bodyTokens = bodyBytes > 0 ? tokensForEmittedBytes( bodyBytes, kBytesPerTokenBody ) : 0;
+    std::size_t estTokens = tokensForEmittedBytes( markupBytes, markupRate ) + bodyTokens;
+    std::string attr      = " est_tokens=\"" + std::to_string( estTokens ) + "\"";
+    for( int pass = 0; pass < 4; ++pass )
+    {
+        const std::size_t next = tokensForEmittedBytes( markupBytes + attr.size(), markupRate ) + bodyTokens;
+        if( next == estTokens ) { break; }
+        estTokens = next;
+        attr      = " est_tokens=\"" + std::to_string( estTokens ) + "\"";
+    }
+    if( outTokens ) { *outTokens = estTokens; }
+    return attr;
+}
+// R1 (terminality round A 2026-09-05): the ONE definition of over_ceiling=, hoisted to sit beside the
+// estimator whose number it qualifies. It was a function-local constant in verbs_for.h, which is why the
+// MCP `for` twin — priced at the same wave-2 merge (mcpverbs.h F5) — could serve est_tokens past a stated
+// budget_tokens with no attribute and no legend clause: the wording was not reachable from there, so the
+// rule was not either. Both --for dialects and the MCP twin splice THIS string, so the sentence a reader is
+// given and the predicate the surfaces apply cannot drift apart. No "--" in it: it rides inside an XML
+// comment, where a double hyphen is ill-formed (G4).
+inline constexpr std::string_view kOverCeilingLegend = " over_ceiling=1 says est_tokens exceeds budget_tokens";
+
+// #61 (2026-09-09): the same sentence for the OTHER ceiling a task lens can be handed. `--for --detail=N`
+// reads --max-tokens (cli.h's kShapingVerbs carve-out) and prints max_tokens= on its root, so a root can
+// name budget_tokens=, max_tokens=, or BOTH — and METHODOLOGY §9 #6 requires the definition to name the
+// ceiling actually on the document carrying it. Keyed on which ceilings the ROOT CARRIES rather than on
+// which one was exceeded: that keeps the choice independent of the est_tokens fixpoint the label rides
+// inside (the fixpoint only ever RAISES the number, so a which-one-fired spelling could be made stale by
+// the very bytes it costs), and it leaves a budget-only document byte-identical to what it was before.
+inline constexpr std::string_view kOverCeilingMaxTokensLegend = " over_ceiling=1 says est_tokens exceeds max_tokens";
+inline constexpr std::string_view kOverCeilingBothLegend      = " over_ceiling=1 says est_tokens exceeds budget_tokens or max_tokens";
+
+// The selector, so no surface picks the wording by hand. One sentence, one predicate, per document.
+inline constexpr std::string_view overCeilingLegendFor( bool namesBudgetTokens, bool namesMaxTokens ) noexcept
+{
+    if( namesBudgetTokens && namesMaxTokens )
+    {
+        return kOverCeilingBothLegend;
+    }
+    return namesMaxTokens ? kOverCeilingMaxTokensLegend : kOverCeilingLegend;
+}
+
+// Splices `attrs` into the FIRST start-tag of `doc` (the root — its own attribute values are XML-escaped, so
+// the first '>' closes it).
+inline void spliceRootAttrs( std::string& doc, std::string_view attrs, std::size_t rootTagAt = 0 )
+{
+    const std::size_t lt = doc.find( '<', rootTagAt );
+    const std::size_t gt = lt == std::string::npos ? std::string::npos : doc.find( '>', lt );
+    // Every caller composed `doc` itself around its own root start tag (main.cpp's <ctx>, packtask/tracelocus's bundle,
+    // handoff's packet, the MCP for bundle — traced 2026-09-19), so a document without one is a caller bug.
+    EXPECTS( gt != std::string::npos, "spliceRootAttrs: the caller built a document with a root start tag" );
+    const bool selfClosing = gt > 0 && doc[ gt - 1 ] == '/';
+    doc.insert( selfClosing ? gt - 1 : gt, attrs );
+}
+
+
+// A header that PRINTS est_tokens is part of the document est_tokens describes, so its own digit count feeds
+// back into the number. Emitters whose header is a plain string iterate that to a fixpoint (serialize(), and
+// recall.h's buildRecall before it); emitters whose header can only be produced by writing to a stream price
+// the digit string with this reserve instead — 8 digits covers any document up to ~100M tokens, i.e. ≈3
+// tokens of slack, far inside the estimate's own accuracy band.
+inline constexpr std::size_t kEstTokensFieldReserve = 8;
+
+// §H7 — a payload SECTION appended after the map (<sigs>, <src>, <bodies>, <outline>), rendered and charged
+// in ONE step: the bytes it will actually contribute, and what those bytes cost at the rate appropriate to
+// what they ARE. Every such block goes through here, which is the point — a new appended section cannot be
+// added without naming its rate, and cannot be added without being charged. That replaces the previous
+// arrangement, where --expand grew a bespoke estimator (estimateExpandBodyTokens: ~90 lines, a second read
+// of every file, mirroring packBodies' accounting closely enough to be "honest ±15%") and the other three
+// sections were simply never counted.
+//
+// DEGRADE: an open_memstream failure leaves isRendered false — the caller streams that section directly and
+// est_tokens then does not cover it, which is exactly the pre-§H7 behaviour for that one run, never a
+// fabricated number. Callers with a cheaper fallback estimate (--expand has one) may use it instead.
+struct ChargedSection
+{
+    std::string xml;                 // the rendered bytes — empty when the section emits nothing, or on degrade
+    std::size_t tokens     = 0;      // tokensForEmittedBytes( xml.size(), the section's own rate )
+    bool        isRendered = false;  // false ⇒ open_memstream failed; the caller must emit this section directly
+    // The DISCLOSE sink for the section's own charge failure: it leaves isRendered false, which every caller reads —
+    // it streams the section directly, and labels (or, the --for lens, omits) the est_tokens that left it out.
+    enum class DisclosureWhy : std::uint8_t
+    {
+        BufferOpenFailed,
+        BufferLostWrite,
+    };
+    void disclose( DisclosureWhy ) noexcept   // every reason records the same fact
+    {
+        isRendered = false;
+        xml.clear();
+        tokens = 0;
+    }
+};
+
+// ── THE est_tokens FAMILY'S ONE BUFFER SEAM, and the fault switch that makes its degrade path REACHABLE ──
+// The wave-1 verifier's declared coverage debt: these `open_memstream` failure paths were NEVER exercised,
+// so trap #3 ("a gate arm that asserts a degrade path must FAIL, not skip, on a build that cannot observe
+// alerts") was unanswered for §H7. `open_memstream` fails on ALLOCATION, not on fd exhaustion, so no
+// `ulimit -n` harness comes near it — the failure has to be injected.
+//
+// One seam for two reasons. (1) The family's degrade CONTRACT is one contract — the section/document still
+// emits complete, correct bytes; est_tokens falls back to the MODELLED number; a DISCLOSE says
+// which — and a contract restated at five call sites is a contract that diverges at one of them.
+// (2) A single switch then exercises the whole family, which is what test/estchargecheck.sh's degrade arm
+// asserts against.
+//
+// THE SWITCH EXISTS ONLY ON THE NON-NDEBUG FLAVOUR — the same flavour `DISCLOSE` itself exists
+// on. The hook and the observation it enables therefore appear and disappear TOGETHER: a release build has
+// neither, and `isChargeBufferFaultInjected()` is `constexpr false` there, so the branch and the getenv are
+// both deleted (G2/G3: zero release cost, no behaviour to diverge). Read ONCE per process, so the answer
+// cannot change mid-document and determinism holds.
+//
+// REJECTED ALTERNATIVE (the brief asks for a hook-free route if one is cleaner): interposing
+// `open_memstream` itself — macOS `__DATA,__interpose` + DYLD_INSERT_LIBRARIES, Linux LD_PRELOAD. It needs a
+// per-platform shim compiled inside the gate; it fails EVERY memstream in the process, including the cache
+// and sidecar paths, which confounds the very assertion that matters ("the bytes are still complete and
+// correct"); and it fights the ASan runtime, which this gate must also run under. Scoping the fault to the
+// est_tokens family is what keeps the assertions clean, so the in-source switch wins on honesty, not effort.
+// CA4 w1fix2-verifier G4: this once read `value[0] == '1'`, so `=10`, `=1x` and `=1000000` all injected the
+// fault — a prefix test where the contract is a switch. That rule now lives in ONE place, rw::faultSwitchOn
+// (infra/emit.h), which every fault switch reads through, so the next one cannot get it wrong again; the
+// once-per-process `static` stays here, where determinism needs it.
+inline bool isChargeBufferFaultInjected() noexcept
+{
+    static const bool isOn = rw::faultSwitchOn( "CODECORTEX_FAULT_CHARGE_BUFFER" );
+    return isOn;
+}
+
+// Drop-in for `open_memstream` at every est_tokens-family measurement buffer. nullptr ⇒ the caller takes its
+// own documented degrade path; this function never reports a failure it did not have.
+inline std::FILE* openChargeBuffer( char** bufOut, std::size_t* sizeOut ) noexcept
+{
+    if( isChargeBufferFaultInjected() )
+    {
+        return nullptr; // ENOMEM-class, on demand, non-release only
+    }
+    return os::open_memstream( bufOut, sizeOut );
+}
+
+// Open a MemoryStream through openChargeBuffer: the one way an est_tokens-family measurement opens its buffer, so the
+// fault switch above reaches every one of them, and no site calls the opener by hand (test/estchargecheck.sh #14g).
+inline std::FILE* openChargeStream( rw::MemoryStream& stream ) noexcept
+{
+    return stream.openWith( []( char** bufOut, std::size_t* sizeOut ) noexcept { return openChargeBuffer( bufOut, sizeOut ); } );
+}
+
+// ── §B4b: the <ctx> WRAPPER RULE for a verb that appends a section beside serialize()'s root ─────────────
+// serialize() OWNS a root element — it writes `<r …>` and it writes `</r>` — so anything a caller emits after
+// it is a SECOND top-level element and the document is not XML. G4 ("output | xmllint --noout clean") is one
+// of the four hard guardrails, and `--around` breached it at exit 0: `--around=buildRecall` tailed
+// `…</f></r><compose>…</compose>`, xmllint said "Extra content at the end of the document", codecortex said 0.
+// MEASURED 5 of 135 sampled symbols on this repo — every focus symbol whose ego-graph carries compose or
+// route edges — and the pre-wave binary breaches byte-identically, so it was pre-existing, not wave damage.
+//
+// The other two serialize() call sites already had the answer: runDefaultMap wraps <r> plus its four appended
+// sections in <ctx>…</ctx> whenever `hasExtension`, and the --for lens roots everything in ctxRootOpen().
+// This is that wrapper, expressed once, for the call site that never got it.
+//
+// The predicate is what will ACTUALLY BE EMITTED, not what edges exist: packCompose/packRoutes write nothing
+// when no edge touches the relevant node set, and a bare <ctx></ctx> around <r> would be 11 bytes of wrapper
+// disclosing nothing. A section whose charge DEGRADED (isRendered=false) is re-rendered straight to the sink
+// by emitChargedSection, so its byte count is unknown here — assume it emits and wrap, which is well-formed
+// either way.
+inline constexpr std::size_t kCtxWrapBytes = 11;   // "<ctx>" (5) + "</ctx>" (6) — charged, per trap #8
+
+struct CtxWrap
+{
+    bool        isNeeded = false;
+    std::size_t tokens   = 0;   // the wrapper's own charge, 0 when it is not emitted
+};
+
+inline bool sectionWillEmit( const ChargedSection& section, bool hasEdges ) noexcept
+{
+    return hasEdges && ( !section.isRendered || !section.xml.empty() );
+}
+
+// The whole decision — wrap or not, and what it costs — as ONE value, so the calling verb carries no boolean
+// algebra and no rate arithmetic of its own.
+inline CtxWrap ctxWrapFor( const ChargedSection& a, bool aHasEdges, const ChargedSection& b, bool bHasEdges ) noexcept
+{
+    if( !sectionWillEmit( a, aHasEdges ) && !sectionWillEmit( b, bHasEdges ) )
+    {
+        return {};
+    }
+    return { true, tokensForEmittedBytes( kCtxWrapBytes, kBytesPerTokenDefault ) };
+}
+
+template<typename RenderFn>
+inline ChargedSection chargeSection( RenderFn&& render, double bytesPerToken )
+{
+    ChargedSection   sec;
+    rw::MemoryStream stream;
+    std::FILE* const mem = openChargeStream( stream );
+    if( !mem )
+    {
+        DISCLOSE( sec, ChargedSection::DisclosureWhy::BufferOpenFailed, "chargeSection: open_memstream failed — this payload section streams uncharged" );
+        return sec;
+    }
+    render( mem );
+    const rw::MemoryStreamBytes rendered = stream.finish();
+    if( !rendered.isWhole )
+    {
+        // the same answer as a failed open: isRendered stays false, so emitChargedSection renders the section straight
+        // to the sink, whole and uncharged, instead of writing bytes a lost write left a hole in
+        DISCLOSE( sec, ChargedSection::DisclosureWhy::BufferLostWrite, "chargeSection: the charge buffer did not finish whole — this payload section streams uncharged" );
+        return sec;
+    }
+    sec.xml.assign( rendered.bytes );
+    sec.tokens     = tokensForEmittedBytes( sec.xml.size(), bytesPerToken );
+    sec.isRendered = true;
+    return sec;
+}
+
+// The other half of the contract, and the ONLY correct way to spend a ChargedSection: write the bytes that
+// were charged, or — when the charge degraded — render the section directly at the same inputs, so the
+// document is complete either way. It is a named seam rather than an if/else at each site because §F1 added
+// four more emission points to the one runDefaultMap already had as a local lambda, and "charged bytes if
+// rendered, else re-render" copied five times is the shape that eventually gets copied WRONG (emitting the
+// empty xml of a degraded section, which loses the section silently — the failure this whole item is about).
+template<typename RenderFn>
+inline void emitChargedSection( std::FILE* out, const ChargedSection& sec, RenderFn&& renderDirect )
+{
+    if( sec.isRendered )
+    {
+        std::fwrite( sec.xml.data(), 1, sec.xml.size(), out );
+    }
+    else
+    {
+        renderDirect();
+    }
+}
+
+// estimateTokens' answer: the modelled token count AND the modelled byte total it was derived from.
+// Publishing the byte total is what makes the model's language-weighted RATE reusable by a caller that
+// has MEASURED bytes — and that split is deliberate, because the two halves of the model have very
+// different accuracy. The per-language mix (kTokenCalib) is measured and good; the byte counting is a
+// handful of fixed per-element constants that know nothing about --metrics decoration, id=, overloads=,
+// bind=, prov= or the multi-root prologue, which is why the modelled byte total ran ~13% under the real
+// document even on the bare map. So serialize() takes the RATE from here and the BYTES from the document
+// it actually emitted.
+struct TokenEstimate
+{
+    std::size_t tokens     = 0;   // modelled tokens for the kept symbol set
+    std::size_t modelBytes = 0;   // the byte total that model priced (markup envelope + per-language content)
+
+    // this symbol set's own language-weighted bytes/token; the mid-band default for an empty/degenerate map
+    double bytesPerToken() const noexcept
+    {
+        return tokens > 0 ? double( modelBytes ) / double( tokens ) : kBytesPerTokenDefault;
+    }
+};
+
+// The near-constant markup ENVELOPE the map always carries, in bytes: the leading schema comment +
+// the <r>…</r> root + the stats preamble comment. Measured on the default (non-scip) header; the
+// estimate is informational (a ceiling for --max-tokens headroom), so a few bytes of drift between
+// header variants is immaterial. Content (file/symbol/edge markup + names) is added per-element below.
+inline constexpr std::size_t kEnvelopeBytes = 320;
+
+// Per-element MARKUP byte costs (default map), measured against real output:
+//   <f p="…">…</f>            = 12 + path            (+9 when a builtin layer= tag is present)
+//   <s t="…" n="…" …></s>     = 19 + name            (+11 for k=, +6+scope when scoped; metrics adds more)
+//   <c n="…"/>                = 9  + callee-name
+inline constexpr std::size_t kFileMarkupBytes   = 12;
+inline constexpr std::size_t kSymMarkupBytes    = 19 + 11;   // base tags + the default k="0.XXXX" attr
+inline constexpr std::size_t kEdgeMarkupBytes   = 9;
+
+// ── T3: fill-aware auto-ordering ────────────────────────────────────────────────────────────────────
+// MEASURED (Anthropic): query/actionable content at the END of a long input = up to +30%. §2f/§2g
+// refine WHEN it matters: the U-curve (primacy+recency both fine) holds while the window is <50%
+// full; beyond ~50% fill, recency dominates monotonically, so --most-important-last is the right
+// default ONLY for large outputs — for a small map, order is free (no measured effect either way),
+// so we do NOT disturb it (golden-neutral). kNominalWindowTokens follows the smaller point measured
+// in §2a's dose-response study (32K, LongCodeBench); the fill threshold is half of it.
+//
+// NOT SHIPPED (T7 §2g, measured-and-declined): bimodal emission (rank #1 top + #2 bottom) is a free
+// reorder but --eval structurally cannot score it (ranking-recovery is order-invariant) — it needs an
+// LLM-in-the-loop harness codecortex deliberately avoids, so it stays a documented open question, not a
+// T3 dependency. Markdown-KV/table sub-encoding was also measured (T7): a per-symbol Markdown-KV
+// block is +17% tokens (never amortizes); a Markdown TABLE only wins at >=4 rows on a tabular slice
+// (~7% on a whole --metrics map) — marginal with format-contract risk, evaluated and DEFERRED, not
+// built here.
+inline constexpr std::size_t kNominalWindowTokens  = 32000;                       // §2a's smaller measured dose-response point
+inline constexpr std::size_t kFillOrderThreshold   = kNominalWindowTokens / 2;    // ~16000: the measured "recency dominates" crossover
+
+// Extracted T1 byte-model (was inline in serialize()) so the auto-order decision (T3) and the actual
+// emission use the IDENTICAL estimate — one implementation, no drift between "decided" and "reported".
+// Pure function of the kept symbol set; independent of emit ORDER (bytes are the same regardless of
+// which end a symbol lands on), so it is safe to call BEFORE the ordering decision it feeds.
+//
+// §H7: this model is now the RATE SOURCE and the fill-order oracle, no longer the reported est_tokens.
+// The T3 auto-order decision has to be made before a byte of the map exists (the decision picks the emit
+// ORDER, so it cannot wait for the emitted bytes), which is precisely what a pure function of the symbol
+// set is for; the REPORTED size describes the finished document and is measured. Both are documented at
+// their use sites in serialize().
+// The sc= presence rule, declared here and defined beside writeScopeAttr below: the byte MODEL must charge a
+// scope attribute on exactly the rows the emitter prints one on, so it asks the same question the emitters do
+// rather than re-deriving it — that re-derivation is how the model came to charge a shape the row stopped
+// printing (PR #215 review).
+inline bool hasScopeAttr( const Symbol& s ) noexcept;
+
+inline TokenEstimate estimateTokens( const IngestResult& ing, const std::vector<NodeId>& order, std::size_t keep,
+                                     const std::vector<std::uint32_t>& outOff, const std::vector<NodeId>& outTargets )
+{
+    std::size_t                      markupBytes = kEnvelopeBytes;
+    // indexed by Lang, through Unknown: every later language clamps into Unknown's bucket (model.h's Lang note). The extent
+    // is spelled from the enumerator rather than as a literal 13, so the bound and the clamp below name the same value.
+    double                           contentBytesByLang[ std::size_t( Lang::Unknown ) + 1 ] = { 0 };
+    static_assert( int( Lang::Unknown ) == 12, "contentBytesByLang sized for the 13-value Lang enum" );
+    std::vector<char>                seen( ing.files.size(), 0 );
+    for( std::size_t k = 0; k < keep; ++k )
+    {
+        const NodeId        id = order[k];
+        const Symbol&       s  = ing.symbols[id];
+        const std::uint32_t f  = s.fileId;
+        const int           li = s.lang < Lang::Unknown ? int( s.lang ) : int( Lang::Unknown );
+        if( !seen[f] )
+        {
+            seen[f] = 1;
+            markupBytes += kFileMarkupBytes;
+            contentBytesByLang[ li ] += double( rootRelPath( ing, f ).size() );   // the file PATH is content, at this file's language — as p= PRINTS it,
+                                                                              // root-relative (#228: charging the typed root flipped the fill order)
+        }
+        markupBytes += kSymMarkupBytes;
+        contentBytesByLang[ li ] += double( s.name.size() );
+        if( hasScopeAttr( s ) )
+        {
+            // ROW 6, AND THE MODEL FOLLOWED IT LAST (PR #215 review, CodeRabbit 5191303552). The row used to
+            // print id="PATH::SCOPE::NAME", and this charged exactly that: the file path, the scope, the name
+            // and the two "::" separators. The row prints ` sc="SCOPE"` now — the path once per <f p=> (charged
+            // above, at `seen[f]`) and the name once on the row (charged just above) — so the path and the name
+            // were being billed a SECOND time on every scoped symbol. Over-charging is not the safe direction:
+            // mapEstTokens is what `--token-budget` withholds a map on (main.cpp, `withheld_est_tokens=`), what
+            // the open_memstream degrade path reports as est_tokens=, and what the T3 fill-order auto-flip
+            // compares against kFillOrderThreshold — so an inflated model withholds maps that fit and flips an
+            // order that should not have flipped. Charged at what the row prints: 6 B of markup for ` sc=""`
+            // and the scope segment as content, nothing else.
+            markupBytes += 6;
+            contentBytesByLang[ li ] += double( s.scope.size() );
+        }
+        for( std::uint32_t e = outOff[id]; e < outOff[id + 1]; ++e )
+        {
+            markupBytes += kEdgeMarkupBytes;
+            contentBytesByLang[ li ] += double( ing.symbols[ outTargets[e] ].name.size() );
+        }
+    }
+
+    // Weighted token estimate: envelope+markup at the mid-band rate, each language's content at its own
+    // measured B/tok. Rounds to nearest (0.5 up) so the reported number never systematically under-reads.
+    double estTokensF   = double( markupBytes ) / kBytesPerTokenDefault;
+    double modelBytesF  = double( markupBytes );
+    for( int l = 0; l <= int( Lang::Unknown ); ++l )
+    {
+        if( contentBytesByLang[ l ] > 0.0 )
+        {
+            estTokensF  += contentBytesByLang[ l ] / bytesPerTokenFor( Lang( l ) );
+            modelBytesF += contentBytesByLang[ l ];
+        }
+    }
+    return TokenEstimate{ std::size_t( estTokensF + 0.5 ), std::size_t( modelBytesF + 0.5 ) };
+}
+
+// §P6.3: const/non-const overloads (svector.h's buf()/buf() const, begin()/begin() const, end()/end()
+// const) canonicalize to the SAME id= — canonicalId() is path::scope::name, it has no notion of signature
+// or const-qualification — so a per-file bucket built straight from `order` carries one row per NodeId and
+// two rows print byte-identical name/id/rank, telling a reader nothing extra. collapseOverloadRows()
+// pre-filters a bucket down to one representative NodeId per (kind,id) BEFORE serialize()'s print loop
+// ever sees it, so that loop keeps iterating a plain vector with NO added branch — every decision this
+// collapse needs (first-occurrence tracking, counting) lives here instead of inflating the cognitive
+// complexity of the already-large function that loop lives in.
+struct OverloadRows
+{
+    std::vector<NodeId>        id;          // one representative NodeId per printed row, original order
+    std::vector<std::uint32_t> overloads;    // parallel: 1 = no collision, N>1 = N rows collapsed into this one
+};
+
+inline OverloadRows collapseOverloadRows( const IngestResult& ing, const std::vector<NodeId>& bucket )
+{
+    OverloadRows out;
+    rw::HashMap<std::string, std::size_t> rowOf;   // (kind,id) key -> index into out.id/out.overloads
+    for( NodeId nodeId : bucket )
+    {
+        const Symbol&     s   = ing.symbols[nodeId];
+        const std::string key = std::string( symTag( s.kind ) ) + '\x1f' + canonicalId( ing.files[ s.fileId ], s.scope, s.name );
+        const auto         it  = rowOf.find( key );
+        if( it == rowOf.end() ) { rowOf[key] = out.id.size();  out.id.push_back( nodeId );  out.overloads.push_back( 1 ); }
+        else
+        {
+            ++out.overloads[ it->second ];
+            // Deterministic representative choice, independent of traversal order: --most-important-last
+            // / T3 auto-flip walk this SAME bucket reversed, and if the min-id NodeId weren't pinned here
+            // the "first occurrence" would flip between the two overloads — printing a very-slightly
+            // different k= (each overload NodeId carries its own independently-computed PageRank) and
+            // breaking the set-equality a reader (and fillordercheck's #9) expects between two orderings
+            // of the identical symbol set. The lower NodeId always wins, so content is order-invariant.
+            if( nodeId < out.id[it->second] )
+            {
+                out.id[it->second] = nodeId;
+            }
+        }
+    }
+    return out;
+}
+
+// the shared "n > floor ? PREFIX+n+SUFFIX : empty" idiom behind every economy-of-attributes disclosure in
+// this tool (a count shown only when it says something the default value doesn't already imply) — one
+// primitive so a second dialect needing the same shape (e.g. packtask.h's JSON callers[].shared, the twin
+// of its own XML attribute) composes it instead of re-deriving an equivalent ternary.
+inline std::string countFieldIfAbove( std::uint32_t n, std::uint32_t floor, std::string_view prefix, std::string_view suffix = {} )
+{
+    return n > floor ? std::string( prefix ) + std::to_string( n ) + std::string( suffix ) : std::string();
+}
+
+// Row 6 (2026-09-12): the SHORT id on a symbol row — ` sc="<scope>"`, the one segment of the canonical
+// `path::scope::name` that neither the row's own p= nor its enclosing <f p=> already carries. Absent when the
+// symbol has no enclosing scope, which is exactly the case where the canonical id degrades to the bare name
+// (resolve.h canonicalId) and the old id= was skipped too — so the SET of rows carrying an identity attribute
+// is unchanged, only its spelling shrinks. The legend spells the composition (id = p::sc::n) and every
+// selector keeps accepting the composed form: test/scroundtripcheck.sh. ONE writer for the map <s> row and
+// the signature <d> row, so the two can never drift on when sc= appears.
+// THE PRESENCE RULE ITSELF, in one place. Four emitters spell sc= — this writer (the map <s> row), sigRowHead's
+// string form (the signature <d> row) and the two JSON twins — and each of them re-derived `!s.scope.empty()`.
+// A presence rule open-coded at four sites has three chances to be changed in two, and the legend clause that
+// DEFINES sc= is now gated on the same question (verbs_for.h, both dialects), which makes it five. One predicate.
+inline bool hasScopeAttr( const Symbol& s ) noexcept
+{
+    return !s.scope.empty();
+}
+
+template <typename W>
+inline void writeScopeAttr( W& w, const Symbol& s, std::vector<char>& esc )
+{
+    if( hasScopeAttr( s ) )
+    {
+        w.write( " sc=\"" );  w.write( escapeXml( s.scope, esc ) );  w.write( "\"" );
+    }
+}
+
+// " overloads=\"N\"" when N>1 rows collapsed into this one; empty (writes nothing) in the overwhelming
+// common case (every id unique) — the golden map stays byte-identical wherever no collision exists.
+inline std::string overloadsAttr( std::uint32_t n )
+{
+    return countFieldIfAbove( n, 1, " overloads=\"", "\"" );
+}
+
+// ── how THIS map was produced: the three OPTIONAL annotations, as one value ──────────────────────────
+// Each is a fact about the RUN rather than about the corpus, each is absent on the default path, and each
+// used to arrive as its own trailing defaulted pointer — the signature had reached 24 positional arguments
+// and a 25th would have been indistinguishable from the 24th at the call site. Defaulted ⇒ every field
+// null ⇒ `<r>` stays exactly `<r>`, zero token cost, byte-identical golden map, and — the house rule this
+// exists to protect — NO git subprocess is ever added to the bare default path.
+// H2H-Graft F3 (2026-09-07): the map's <recent> rows are gitmine.h's RecentFile — the file-level "what changed
+// recently" answer that rank_by=churn-decay computes and, until now, threw away behind a 200-symbol map.
+// Head-to-head vs Graft on rocksdb, the six "what changed recently in <dir>" questions: the verb emitted 35 KB
+// of symbols on every one and a random path list at the same budget named more of the gold. A file with the
+// newest decayed weight is the answer's natural grain; the symbol map stays, this rides in front of it.
+// The DISCLOSE sink for the map's own est_tokens measurement. When a charge buffer fails, the map keeps printing the
+// MODELLED number (the pre-§H7 estimate — no worse than before, never a fabricated one) and says so: est_measured="0"
+// on the root (and est_measured=0 in the header comment, "est_measured":false in JSON), defined in the same document.
+// The model prices neither decoration nor payload, so the number is typically BELOW the emitted size.
+struct MapEstimate
+{
+    enum class DisclosureWhy : std::uint8_t
+    {
+        ChargeBufferFailed,    // the map's own children/rows buffer did not open or did not finish whole
+        HeaderProbeFailed,     // JSON: the header size probe failed; the header is charged at the modelled envelope
+        PayloadUncharged,      // an appended payload section streamed uncharged (its chargeSection degraded)
+    };
+    bool isModelled = false;
+    void disclose( DisclosureWhy ) noexcept   // every reason records the same fact
+    {
+        isModelled = true;
+    }
+};
+
+// est_measured= is defined only in a document that carries it.
+inline constexpr const char* kEstModelledLegend =
+    "<!-- est_measured=0: a charge buffer failed, so est_tokens is the MODELLED estimate, not the emitted bytes (typically BELOW the "
+    "document's real size); a token-budget verdict on this run rests on that model -->";
+
+struct MapAnnotations
+{
+    // NOTE — the three fields below are initialized POSITIONALLY at the call site (main.cpp's mapAnn), so any
+    // new annotation goes at the END of this struct, never in front of them.
+    const std::size_t* changedCount = nullptr;   // D6: --map-diff's teleport-seed file count → `changed=N` in the
+                                                 // header comment. Non-null even at 0 (a clean tree), so a caller can tell a
+                                                 // clean-tree map-diff — teleport degrades to uniform, i.e. byte-identical to
+                                                 // the default map — from a real diff without shelling out to git itself.
+    const std::string* atStamp      = nullptr;   // r26-stamp Task A: gitstamp::stampAt → ` at="<sha>[+dirty]"` on `<r>`, for the
+                                                 // maps whose caller ALREADY ran git (--map-diff's diff, --rank-by=churn's mining).
+    const std::string* churnWindow  = nullptr;   // §A9.6: --rank-by=churn's effective window label ("18mo", or the --since value
+                                                 // when it resolved) → ` rank_by="churn" window="…"`, so a ranking mined entirely
+                                                 // from git history is not byte-shaped like a PageRank map.
+    // P0-4: WHICH churn ranker filled churnWindow. Defaulted to "churn" so every pre-existing caller keeps
+    // its exact bytes; --rank-by=churn-decay passes "churn-decay". A separate field rather than reusing
+    // rankByLabel because the serializer's `else if` states an exclusivity the caller guarantees — a
+    // windowed ranker and a windowless one must never both stamp rank_by=.
+    const char*        churnRankLabel = "churn";
+
+    // §B13.4: `--max-tokens=N` fits the map against a BYTE ceiling — N x kMinBytesPerToken x kBudgetHeadroom —
+    // while the map REPORTS est_tokens in the language-weighted currency, so a caller who asked for 1500
+    // received a document reporting 1216 (81% of the budget) with the shortfall disclosed NOWHERE, and a
+    // --help that invites composing --max-tokens with --token-budget as if the two Ns were the same unit.
+    // Both numbers now travel with the map they shaped. Null for every caller that did not pass
+    // --max-tokens ⇒ zero token cost, byte-identical default map.
+    //
+    // §F5 (CA4 wave-1 verifier): isOverCeiling is the label that keeps the cap a cap. The DISCLOSURE this item
+    // added costs 185-312 B, and at small N the map's fixed floor (envelope + legend + this clause + these two
+    // attributes) exceeds ceilingBytes with ZERO symbols of content — MEASURED at N=400: ceiling 849 B, emitted
+    // 975 B, 15% over, rc=0, stderr empty, the 849 stated inside the 975-byte document. Three more members of
+    // the same class ride in the same way, all of them "the probe priced a shape the emission did not build":
+    // --map-diff's changed=/at= (+31 B), --rank-by=churn's rank_by=/window= plus kChurnRankLegend (+~200 B) and
+    // the T3 auto-flip's longer order= spelling (+11 B). The fit is now priced with the SAME MapAnnotations and
+    // the same autoOrder the emission uses (main.cpp), and where the floor still cannot fit, the map SAYS so
+    // rather than overshooting in silence — the over_ceiling treatment --for/--pack-task/--recall already have.
+    // Monotone by construction: the label only ADDS bytes, and a document already past the ceiling cannot come
+    // back under by growing, so there is no oscillation to iterate out.
+    struct MaxTokensFit
+    {
+        std::size_t askedTokens   = 0;
+        std::size_t ceilingBytes  = 0;
+        bool        isOverCeiling = false;   // ⇒ ` over_ceiling="1"`; absent means the cap was honoured (measured, not assumed)
+        // A fit probe could not MEASURE the map (its buffer failed to open or lost a write): the cap is unverified, so
+        // over_ceiling=1 rides fail-closed beside fit_unmeasured=1 — "absent = cap held" would otherwise be a claim no
+        // measurement backs. This struct is the DISCLOSE sink for both probes in main.cpp's runDefaultMap.
+        bool        isUnmeasured  = false;
+        enum class DisclosureWhy : std::uint8_t
+        {
+            ProbeUnmeasured,
+        };
+        void disclose( DisclosureWhy ) noexcept   // every reason records the same fact
+        {
+            isUnmeasured = true;
+        }
+    };
+    const MaxTokensFit* maxTokensFit = nullptr;
+
+    // §B2.1 (CA4): the SAME defect §B1.2 fixed for churn, on the three rankers nobody swept in with it.
+    // --rank-by=authority / hub / rrf emitted a header keyset-identical to pagerank's in BOTH dialects while
+    // k= underneath meant something else entirely — MEASURED on src/, top row: pagerank 0.0957, authority
+    // 0.8254, hub 0.1679, rrf 0.0338, four different quantities under one attribute name and no tell. Churn
+    // could not use this field because its stamp also carries a window; these three have no window, so the
+    // annotation is the bare ranker LABEL and `churnWindow` stays the churn-only path. Static storage
+    // (kRankByLabel below) ⇒ safe to hold as a bare pointer, same rule as `marker`.
+    const char* rankByLabel = nullptr;
+
+    // W2-F: what the PageRank power iteration behind this map DID → ` pr_iters="N"` and, only on the
+    // truncating exit, ` pr_converged="0"` (src/prconverge.h owns both dialect spellings and the legend).
+    // Held BY VALUE, unlike every pointer above, because it is a POD with a meaningful default:
+    // `isPageRank == false` renders as the empty string, so a caller that ran no power iteration (a lexical
+    // query score, a HITS hub/authority map) keeps a byte-identical header by doing nothing. A pointer would
+    // make "no PageRank ran" and "the caller forgot to pass it" the same null — the silence this removes.
+    RankDisclosure prDisclosure{};
+
+    // M20 (capture-audit 2026-09-04, lens 6 F12, lens 2 L8) — the SEED disclosure, for a map a SEEDED verb
+    // produced. `--around=SYM` renders through this same serializer and came out under the PLAIN map root,
+    // `<r root="." est_tokens="10788">`: the seed was recoverable only by spotting the k="1.0000" row, and
+    // the two BOUNDS that decide what the neighbourhood even contains — --around-depth (default 2) and
+    // --around-fanout (default 32) — were not recoverable at all, from the output or from --help. A reader
+    // handed 189 rows could not tell a 1-hop from a 3-hop answer. defs= is the same single-pick disclosure
+    // --callers/--uses/--impact/--path already carry: resolveFocus takes ONE definition (graph.h states which), so a name
+    // with several says so on the root instead of silently answering about one of them.
+    // Held by value with a default that renders NOTHING (empty `of`), so every unseeded map is byte-identical.
+    struct SeedDisclosure
+    {
+        std::string of;             // the RESOLVED seed name (of= — the family's "what this is about" attribute)
+        int         depth  = 0;     // of the ego walk (depth=)
+        int         fanout = 0;     // per-hop neighbour cap (fanout=)
+        std::size_t defs   = 0;     // definitions the seed NAME has; >1 means a pick was made
+        // harvest B card C2: the bound that BIT, not only the bound that was SET. Stating depth=/fanout= made
+        // the boundary readable; it did not tell the reader whether either one CUT — and "fanout=32" alone
+        // cannot distinguish a ceiling that never bound from a knife. Both render ONLY when non-zero, so a
+        // neighbourhood the bounds did not clip is byte-identical to before (presence has to mean something).
+        std::uint32_t fanoutCut      = 0;       // symbols the fanout cap dropped that are absent from the whole answer (exact)
+        bool          depthTruncated = false;   // ≥1 symbol one hop past the last emitted hop is absent
+        // H1: the decl→def residue of a file:name seed — same-named definitions the selector found and could not tie to the
+        // file it named, so the walk never started from them. unproven_defs= beside defs= and its clause in the legend,
+        // both absent at zero (graphlegend.h unprovenDefsAttrXml / unprovenDefsVerbComment).
+        std::size_t   unprovenDefs   = 0;
+    };
+    // F3 (H2H-Graft): rank_by=churn-decay's file-level <recent> rows; null/empty ⇒ absent, byte-free. Positional
+    // slots 8 and 9 at main.cpp's mapAnn (seed below is filled by assignment, never positionally).
+    const std::vector<RecentFile>* recent   = nullptr;
+    std::size_t                    recentOf = 0;
+    // WAS HISTORY MINED, as a fact and not as a reading of the rows (CodeRabbit, review 5195637558). The block
+    // used to ride on `!recent->empty() || recentMergeBombsSkipped > 0`, which cannot tell a window that read
+    // no commit from one whose commits touched no indexed file: the first has no answer, the second answers
+    // n="0". main.cpp fills this from DecayedChurnMined::anyHistory. Filled by assignment, like seed.
+    bool                           recentMinedHistory = false;
+    SeedDisclosure seed{};
+    // merge_bombs_skipped= on <recent> (2026-09-12): commits in the mined window the >kChurnMergeBombMaxFiles rule
+    // skipped, uncounted. Filled by assignment (after the positional slots), always emitted with the block.
+    std::uint32_t                  recentMergeBombsSkipped = 0;
+    // C1-b (2026-09-12): in=DIR. scopedRecent != nullptr ⇒ a SECOND <recent scope=> block follows the global one (even with
+    // zero rows: of="0" is "none found"); stubSymbols ⇒ the <f> groups collapse to <symbols total= shown="0" next=/>. Views
+    // point into main.cpp runDefaultMap locals that outlive every serialize() call. Filled by assignment, like seed.
+    const std::vector<RecentFile>* scopedRecent   = nullptr;
+    std::string_view               scopeDir;            // DIR as typed, trailing '/' stripped — the scope= value
+    std::size_t                    scopedRecentOf = 0;  // DIR's files any counted commit touched — the block's of=
+    std::size_t                    scopedOffset   = 0;  // the row this page starts at — the window's offset
+    int                            scopedLimit    = 0;  // the run's own --limit (0 = none), for the paging half's limit=
+    std::string_view               scopedNext;          // the next page's invocation; empty ⇒ no next page fits or exists
+    bool                           stubSymbols    = false;
+    std::string_view               stubNext;            // the same run without in= — the map the stub stands for
+
+    // An appended payload section the caller could not charge (its chargeSection degraded): the map's est_tokens then
+    // leaves those bytes out, so serialize labels it est_measured="0". Set by the caller's DISCLOSE, never guessed.
+    bool payloadUncharged = false;
+
+    // L3 follow-up (CodeRabbit 4053600616): the .codecortex_notes read that fed this map's NoteIndex left something
+    // out (a skipped line, or the sidecar refused) — notes::NoteIndex::degraded, read BEFORE the caller nulls its
+    // pointer for emptiness (main.cpp), so a fully-degraded read still reaches this root. Absent on a clean read,
+    // the L3 inertness contract's only permitted exception. Filled by assignment, like the trailing fields above.
+    bool notesDegraded = false;
+};
+
+// F3: the <recent> element — rank_by=churn-decay's file-level answer FIRST, paths + age in days at HEAD's clock +
+// decayed weight — written before the first <f> group so "what changed recently" is answered before the symbol
+// map, not buried behind it. Absent (byte-free) on every other map and under multi-root.
+template <typename PathRel>
+inline void writeRcRows( XmlWriter& w, const std::vector<RecentFile>& rows, const PathRel& pathRel, std::vector<char>& esc )
+{
+    char rc[ 64 ];
+    for( const RecentFile& r : rows )
+    {
+        rw::formatTo( rc, sizeof rc, "\" age_d=\"{}\" w=\"{:.3g}\"/>", r.ageDays, r.weight );
+        w.write( "<rc p=\"" );  w.write( escapeXml( pathRel( r.fileId ), esc ) );  w.write( rc );
+    }
+}
+
+// ONE emitter for BOTH <recent> blocks — the global one and in=DIR's scoped twin. They differ only in the
+// attributes around the shared n=/of= count spelling, so they take them as parameters rather than as a second
+// copy of the tag: `pre` is the tag's subject (scope="DIR"), `post` the disclosure that follows the counts
+// (the global block's merge_bombs_skipped=, the scoped block's cap + paging half + next=). Composed on
+// std::string, never a fixed char[] — the rule above escapeXml (fixedbufsweep): `pre` carries ESCAPED text
+// and `post` carries already-markup, and a cut in either's escaped form is the defect that rule forbids.
+template <typename PathRel>
+inline void writeRecentBlock( XmlWriter& w, std::string_view pre, const std::vector<RecentFile>& rows, std::size_t of,
+                              std::string_view post, const PathRel& pathRel, std::vector<char>& esc )
+{
+    std::string open = "<recent";
+    open += pre;
+    open += " n=\"";   open += std::to_string( rows.size() );
+    open += "\" of=\""; open += std::to_string( of );
+    open += "\"";
+    open += post;
+    open += ">";
+    w.write( open );
+    writeRcRows( w, rows, pathRel, esc );
+    w.write( "</recent>" );
+}
+
+template <typename PathRel>
+inline void writeRecentRows( XmlWriter& w, const MapAnnotations& ann, const PathRel& pathRel, std::vector<char>& esc )
+{
+    // The global block: absent only when there is NOTHING to say — no rows and no skipped commit. A window whose every
+    // commit was a merge bomb prints <recent n="0" of="0" merge_bombs_skipped="N"></recent>: zero rows and the reason,
+    // rather than an absent block a reader would take for "no history mined" (churndecaycheck arm 7h).
+    // `recent` says the rows exist to be written; `recentMinedHistory` says a commit was READ. Both, and
+    // NEITHER inferred from the other: a mined window with no indexed path touched prints n="0" of="0" (an
+    // answer), and a window that mined nothing prints no block at all (no answer to give).
+    const bool hasGlobal = ann.recent != nullptr && ann.recentMinedHistory;
+    if( hasGlobal )
+    {
+        std::string post = " merge_bombs_skipped=\"";
+        post += std::to_string( ann.recentMergeBombsSkipped );
+        post += "\"";
+        writeRecentBlock( w, {}, *ann.recent, ann.recentOf, post, pathRel, esc );
+    }
+    // C1-b: the directory-scoped block, AFTER the global one and additive to it (three of the six reference questions have
+    // their gold outside the named directory). n=/of= are this element's own count spelling (pageview.h, THE TRUNCATION
+    // VOCABULARY rule 2), so the paging half rides WITHOUT total= — of= already is it (pagingDisclosure's emitTotal=false).
+    //
+    // ABSENCE MATCHES THE GLOBAL BLOCK'S, deliberately. The legend promises "a SECOND recent block, after the unchanged
+    // global one", and a run that mined nothing (an unreachable --since) printed no global block and a scoped
+    // n="0" of="0" anyway — a block claiming to have looked under DIR when no commit was read at all. Now the scoped
+    // block rides exactly when the global one does: absent ⇒ no history was mined; n="0" ⇒ history was mined and
+    // nothing under DIR was touched. Those are different answers and they now look different.
+    //
+    // merge_bombs_skipped= is deliberately NOT repeated here. It counts the WINDOW's skipped commits, not DIR's, and
+    // stamping the window's number on a directory-scoped element reads as "N commits under DIR were skipped" — a
+    // wrong answer for any DIR smaller than the repository. It stays on the global block, which is the window's own.
+    if( ann.scopedRecent && hasGlobal )
+    {
+        const std::size_t windowEnd = ann.scopedOffset + ann.scopedRecent->size();
+        char              pd[ kPageDisclosureCap ];
+        rw::pagingDisclosure( pd, sizeof pd, ann.scopedRecentOf, windowEnd, ann.scopedLimit, int( ann.scopedOffset ),
+                              rw::kXmlPageSyntax, /*emitTotal=*/false );
+
+        std::string pre = " scope=\"";
+        pre += escapeXml( ann.scopeDir, esc );
+        pre += "\"";
+
+        // Rule 3: capped= is ALWAYS emitted beside the shown= it qualifies (here n=), never left absent for
+        // "nothing was cut" — a reader must not have to read a missing attribute as a guarantee.
+        std::string post = ann.scopedRecent->size() < ann.scopedRecentOf ? std::string( " capped=\"1\"" ) : std::string( " capped=\"0\"" );
+        post += pd;
+        post += nextAttrXml( ann.scopedNext );
+        writeRecentBlock( w, pre, *ann.scopedRecent, ann.scopedRecentOf, post, pathRel, esc );
+    }
+}
+
+// ---- C2 (harvest B): the seeded map's BITE disclosure, attribute half and legend half -------------------
+// Kept beside each other and out of serialize() so the pair can never drift: an attribute this tool emits
+// with no legend clause is exactly what legendcoveragecheck exists to catch, and the two conditions below
+// are the SAME condition written once each.
+inline std::string seedBiteAttrs( const MapAnnotations::SeedDisclosure& s )
+{
+    // countFieldIfAbove IS the "shown only when it says something the default doesn't already imply" idiom
+    // (see its comment above) — exactly this attribute's rule, so it composes rather than re-derives it.
+    std::string a = s.depthTruncated ? std::string( " depth_truncated=\"1\"" ) : std::string();
+    return a += countFieldIfAbove( s.fanoutCut, 0, " fanout_cut=\"", "\"" );
+}
+
+// "" on a walk neither bound clipped — absent attributes, absent clause, zero bytes, byte-identical output.
+inline const char* seedBiteLegend( const MapAnnotations::SeedDisclosure& s ) noexcept
+{
+    if( !s.depthTruncated && s.fanoutCut == 0 )
+    {
+        return "";
+    }
+    return "<!-- a bound BIT this walk, so raising it would return more: depth_truncated=1 means at least one symbol one hop past "
+           "depth= is absent; fanout_cut=N means N distinct symbols were dropped by the fanout= cap and appear NOWHERE here (exact, "
+           "not a floor: a neighbour another hub re-admitted is not counted). Neither attribute is emitted when its bound cut "
+           "nothing, so absent means that bound did not bind and raising it returns nothing new. The knobs are around-depth=N and "
+           "around-fanout=K. -->";
+}
+
+// §B2.1 — the ranker-specific legend clause, one per non-default ranker, emitted ONLY on that ranker's map
+// for the same reason kChurnRankLegend is: a flag-only fact does not belong in the string every other run
+// shares. Each names WHAT k= is on that map and says the scores are not comparable across rankers, which is
+// the actual hazard — the numbers all look like ranks and only one of them is PageRank.
+// G4: no "--" anywhere inside an XML comment ⇒ flag names written bare.
+struct RankByDisclosure { const char* label; const char* legend; };
+inline constexpr RankByDisclosure kRankByDisclosure[] = {
+    { "authority",
+      "<!-- rank_by=authority: k= is a HITS AUTHORITY score (how much the graph's hub code points at this symbol), not PageRank importance; "
+      "the scale differs from every other ranker's, so a k= here is not comparable with a k= from another rank_by -->" },
+    { "hub",
+      "<!-- rank_by=hub: k= is a HITS HUB score (how much this symbol points at high-authority code), not PageRank importance; "
+      "the scale differs from every other ranker's, so a k= here is not comparable with a k= from another rank_by -->" },
+    { "rrf",
+      "<!-- rank_by=rrf: k= is a RECIPROCAL-RANK-FUSION score over pagerank plus the two HITS axes — a fused rank position, not an importance mass; "
+      "the scale differs from every other ranker's, so a k= here is not comparable with a k= from another rank_by -->" },
+};
+
+// The label → clause lookup. Returns nullptr for an unstamped map (the default pagerank path) so the caller's
+// null check is the same one it makes for churn. Table-driven per the house rule: a new ranker adds a ROW.
+inline const char* rankByLegendFor( const char* label ) noexcept
+{
+    if( label == nullptr )
+    {
+        return nullptr;
+    }
+    for( const RankByDisclosure& d : kRankByDisclosure )
+    {
+        if( std::string_view( d.label ) == label )
+        {
+            return d.legend;
+        }
+    }
+    return nullptr;
+}
+
+// The `at=` stamp's definition, in ONE place for every verb that prints the stamp. Found by the CA4
+// legend-coverage sweep: the identical `at="<sha>[+dirty]"` attribute is emitted by the map, --hotspots,
+// --owners, --cochange, --test-gate, --edit-check, --whereis and --quality-delta, and was defined by TWO of
+// them — the §B7 shape, spread over eight surfaces. A shared constant rather than eight sentences, so the
+// definition cannot drift into eight wordings the way the truncation vocabulary did before §P8.
+inline constexpr const char* kAtStampLegend =
+    "<!-- at= is the git commit these numbers were computed at; a trailing +shallow means the clone's history is truncated (a depth-limited clone: churn counts only the commits present), and a trailing +dirty means the working tree "
+    "differed from that commit, so the numbers describe the tree, not the commit -->";
+
+// §A9.6 — the churn-ranked map's own legend clause, emitted ONLY on that path. The v1 legend is a fixed
+// string every other run shares byte-for-byte, and a churn-only fact does not belong inside it.
+// The ev_why= value ("guard-return:2,loop-escape:1"): tags in kEvWhyTagTable's fixed declaration order,
+// only non-zero counts, comma-separated — one formatter shared by BOTH dialects so the XML and JSON
+// spellings can never drift (jsonparitycheck's standing posture). The charset is closed (tag literals,
+// ':', ',', digits), so the value needs no XML or JSON escaping. Composed on std::string, never through
+// a fixed char buffer — test/fixedbufsweep.sh's own rule for variable-length markup-bound text.
+inline std::string evWhyString( const Symbol& s )
+{
+    std::string why;
+    for( std::size_t tagIndex = 0; tagIndex < kEvWhyTagCount; ++tagIndex )
+    {
+        if( s.evWhy[ tagIndex ] == 0 )
+        {
+            continue;
+        }
+        if( !why.empty() )
+        {
+            why += ',';
+        }
+        why += kEvWhyTagTable[ tagIndex ];
+        why += ':';
+        why += std::to_string( unsigned( s.evWhy[ tagIndex ] ) );
+    }
+    return why;
+}
+
+// §L10 (2026-09-04): the old wording claimed "the same corpus ranked by pagerank orders differently" as a
+// blanket fact. It is not one — churn ranking IS PageRank, power-iterated over a teleport BIASED by git
+// change-frequency instead of the uniform one; call-graph structure still shapes k=, so on a corpus where
+// structure and churn point the same way the two orders coincide (measured on this repo's own top ranks,
+// 2026-09-04: --rank-by=churn and the default pagerank ranking agreed on the top 4 symbols, in order, with
+// only the k= values differing). What is always true, and what the mechanism actually guarantees, is stated
+// instead: it is a teleport swap, not a wholesale re-ranking, and the two provably diverge exactly where the
+// teleport differs from uniform enough to matter — a heavily-churned symbol with little call-graph support.
+inline constexpr const char* kChurnRankLegend =
+    "<!-- rank_by=churn: k= is PageRank re-run with the teleport BIASED by git CHANGE-FREQUENCY over window= "
+    "(a churn-weighted PageRank, not a raw frequency count), so call-graph structure still shapes k=; top "
+    "ranks can coincide with rank_by=pagerank when structure and churn agree, and diverge where a "
+    "heavily-churned symbol has little call-graph support -->";
+
+// P0-4 — the decayed sibling. It has MORE to disclose than plain churn, not less: the half-life is a chosen
+// constant (a conventional 90-day default, not a measurement on this corpus), and the age clock is HEAD's own
+// commit timestamp rather than the wall clock, which is the property that makes the default run reproducible
+// on a different day. Both facts change how a k= here should be read, so both are stated where k= is read.
+// G4: no "--" anywhere inside an XML comment ⇒ flag names written bare.
+// §L10: same correction as kChurnRankLegend — "orders differently" is not a fact this ranker can promise
+// either, for the same reason (it is still PageRank, still shaped by structure).
+inline constexpr const char* kChurnDecayRankLegend =
+    "<!-- rank_by=churn-decay: k= is a TIME-DECAYED git change-frequency prior, not call-graph importance. Each commit is "
+    "weighted 0.5^(age_days/half_life) with the half-life in window= (90d default, a conventional choice, not a measurement "
+    "on this corpus); age is measured from HEAD commit timestamp, never the system clock, so the same tree at the same HEAD "
+    "ranks identically on any day or machine. window= names the mined span (all-history by default: the decay is the window). "
+    "k= is PageRank re-run with the teleport biased by this decayed prior instead of the uniform one "
+    "rank_by=pagerank uses, or the undecayed one rank_by=churn uses; top ranks can coincide with either "
+    "sibling when structure and recent churn agree, and diverge where a stale-but-central symbol meets a "
+    "fresh, sparsely-called one. recent: the file-level answer to what changed recently, FIRST — the n= files the "
+    "NEWEST commits touched, of the of= files any commit touched, as rc p= age_d= (days since the file's newest "
+    "commit, at HEAD's clock) w= (its decayed weight), age_d asc then w desc then path; absent under multi-root. "
+    "merge_bombs_skipped= counts the commits in the mined window that touched more than 100 INDEXED files (files this "
+    "crawl holds, never the commit's raw file count) and were SKIPPED, uncounted (bulk sweeps, wide merges): a file only "
+    "such a commit touched is absent from these rows and from the prior, so a 0 means no commit was skipped, never that "
+    "none could be. It counts the WINDOW's commits, so it rides this block only -->";
+static_assert( kChurnMergeBombMaxFiles == 100, "kChurnDecayRankLegend spells the merge-bomb threshold as 100 — move both together" );
+
+// C1-b (2026-09-12): the in=DIR clause, spliced only when the scoped block is present (zero bytes elsewhere). Two halves around
+// kNextLegendClause, the ONE definition of next= every legend that meets it splices. No "--" inside a comment (G4).
+inline constexpr const char* kRecentScopeLegendOpen =
+    "<!-- in=DIR: recent scope=DIR is a SECOND recent block, riding exactly when the unchanged global one does, with DIR's "
+    "files only — p= root-relative exactly as the global block spells them, same order; n= rows on this page of of= files "
+    "under DIR any counted commit touched (of= IS this element's total, so the paging half below carries none); capped=1 "
+    "means DIR has more rows than this page; has_more=1 that a next page exists, at next_offset=; offset=/limit= the window "
+    "this page was cut by (limit=0 means no explicit limit was given). An absent block means no history was mined at all; "
+    "n=0 means history was mined and no file under DIR was touched. merge_bombs_skipped= is NOT repeated here: it counts "
+    "the window's skipped commits, not DIR's. ";
+inline constexpr const char* kRecentScopeLegendClose =
+    "symbols stubbed=1 would_show= next=: the symbol map this run did NOT ask for and did not render — would_show= is that "
+    "run's own shown=: DEFINITIONS, counted individually exactly as shown= counts them, so that run's <s> row count follows "
+    "from rows+sum(overloads-1)=shown; never the corpus total, which is this document's symbols=. next= fetches them -->";
+
+// Which churn legend belongs to which churn ranker — the table-driven form the sibling rankBy lookup uses,
+// so a third churn variant adds a row and not a branch.
+inline const char* churnRankLegendFor( const char* label ) noexcept
+{
+    return ( label != nullptr && std::string_view( label ) == "churn-decay" ) ? kChurnDecayRankLegend : kChurnRankLegend;
+}
+
+// §B7.3 (CA4) — the --metrics row vocabulary, emitted ONLY on a map that carries it, for the same reason
+// kChurnRankLegend is. The flag decorates every <s> row with up to thirteen attributes and shipped with NO
+// legend at all: the v1 legend defines t/p/n/id/k/c/amb/overloads and stops, so a reader met in= out= cx=
+// ccx= role= loc= params= nest= locals= cbo= lcom4= amp= tested= with nothing to read them against. role= is
+// the one that can actively mislead — here it is a fan-in THRESHOLD with a single value, while the same
+// attribute name on the use-site verb carries call|read|write|import|extends, and that verb discloses its
+// own vocabulary in-legend. Absence is meaningful for five of these (locals= joined the group at Phase 1,
+// local-variable-indexing, docs/LOCALS_INDEXING.md: absent for every non-C/C++ def, model.h
+// localsCountedLang) and is stated rather than left to be inferred from a missing attribute.
+// G4: no "--" anywhere inside an XML comment ⇒ flag names written bare.
+// Kept TERSE for kMaxTokensFitLegend's reason — it rides on every --metrics map and is charged. A 715 B
+// first draft made estchargecheck #9 red: that arm allows the two dialects' est_tokens to differ by the
+// ENCODING overhead but not by a factor, and 715 B of XML-only comment is content, not encoding (XML 1145
+// vs JSON 719 tokens, past the 25% bar). The long form of these definitions belongs in --help, which is not
+// charged against anyone's budget; what a reader needs IN BAND is the key-to-meaning map itself.
+// §N6-C — the ignore disclosure defines itself where the reader meets it, but ONLY on a map that carries
+// the attributes. Unconditional it would grow the map's FIXED FLOOR, which test/tokenbudgetcheck.sh arm #3
+// measures at SEVEN bytes of headroom on `src` at --max-tokens=500 — see buildUnindexedAttr's note below
+// for the measurement that settled the identical question for unindexed=.
+inline constexpr const char* kIgnoredLegend =
+    "<!-- hdr:ignored_files=files-git's-own-ignore-rules-covered(exact;would-otherwise-be-indexed;the-no-ignore-flag-restores-them)"
+    " hdr:ignored_dirs=SUBTREES-those-rules-pruned(walk-stopped-there:contents-UNKNOWN-not-zero;the-skipped-verb-rows-both) -->";
+
+// Tier 3's declines: the header's declined= and the answers' declined_calls=. Charged to the map that carries
+// declined= (kIgnoredLegend's rule), because an always-on entry measured +177 B and +70 est_tokens on
+// test/fixture, a map that cannot carry the attribute. No '>' anywhere: gates read these comments with a
+// [^>]* pattern, and one '>' inside the text silently empties what they read (lpincheck arm F found it).
+inline constexpr const char* kDeclinedMapLegend =
+    "<!-- hdr:declined=calls-tier-3-declined(two-or-more-same-language-defs,none-in-the-callers-file-or-dir,"
+    "none-pinned-by-a-qualifier/receiver/include;no-edge,no-guess;absent-if-0;callers/callees/impact-answers-carry-declined_calls=) -->";
+
+// §L10: sibs=/inc=/<calls> on an --expand <b> body (withFileContext=true — --expand's own two call sites,
+// never packBodies' other callers) had NO in-band definition anywhere — only in --help prose, which a
+// reader of the XML never sees. Printed once, right inside <bodies ...>, before the first <b> child, on
+// EVERY packBodies call that turns withFileContext on — including --top-k=0's payload-only "lean" mode,
+// which used to carry no legend at all (no ranked map ⇒ no kMapLegend either, and this one is independent
+// of that map legend by design for exactly that reason). Flowing through packBodies (not a separate
+// main.cpp fwrite) means it is priced by the SAME rw::chargeSection call that already charges every other
+// byte packBodies emits — no separate byte-accounting to keep in sync with the M6 cheapest-answer pricing.
+// NOTE for future edits: never spell a literal "<calls" (or any other real element name right after "<")
+// inside this string. A tag-scoped extractor elsewhere (grep -oE '<calls[^>]*>' | head -1, in
+// test/expandcallscheck.sh) matches the FIRST such substring in the document, comment or not, and this
+// legend is written before the real <calls ...> child — a bare "<calls...>" example here would shadow it.
+// E1 (terminality round A, 2026-09-05): redactInPlace, plus the answer to "did THIS body change?" read off the
+// tally delta — an agent about to paste the body back needs that on the element (<b redacted="1">), not in the
+// stderr summary it never sees. Its own function so packBodies' complexity does not carry the bookkeeping.
+inline bool redactBodyDisclosed( std::string& body, RedactCounts* redact )
+{
+    const std::uint32_t before = redact ? redact->total() : 0u;
+    redactInPlace( body, redact );
+    return redact != nullptr && redact->total() != before;
+}
+
+// the two "this CDATA is not the bytes on disk" markers a <b> can carry — absent means paste-back is byte-exact.
+// scrubbed="1": appendCdataSafe split a ]]> or replaced a C0/invalid-UTF-8 byte; redacted="1": a credential shape
+// was rewritten (kBodiesLegend defines both where the reader meets them).
+inline void appendBodyFidelityAttrs( std::string& children, bool bodyScrubbed, bool bodyRedacted )
+{
+    if( bodyScrubbed )
+    {
+        children += " scrubbed=\"1\"";
+    }
+    if( bodyRedacted )
+    {
+        children += " redacted=\"1\"";
+    }
+}
+
+// #60: the reading of <bodies bodyless=N>, written only into a document that carries the attribute — the
+// same "a legend that defines an attribute the document did not emit is the mirror-image false claim" rule
+// kExtentSuspectRowLegend follows. It exists so the reader is never told a body was CUT when there was no
+// body: capped="1" means "cut", and a module-scope owner has no span to cut.
+inline constexpr const char* kBodylessBodiesLegend =
+    "<!-- bodyless=N of total= are requested symbols that have NO BODY BY CONSTRUCTION, not a body this "
+    "answer dropped: today that is t=\"modscope\" (a file's module scope, n=<file-scope>). They are counted "
+    "in total=, never in shown=, and they do NOT raise capped= — absent when 0. -->";
+
+inline constexpr const char* kBodiesLegend =
+    "<!-- a body's sibs=\"a,b,...\" sibs_total=N are the file's OTHER indexed symbols (this body's own name "
+    "excluded), source order, capped at 8 (sibs_capped=\"1\" when the cap fired); inc=\"x.h,...\" inc_total=N "
+    "are the file's own #include/import targets, source order, capped at 24 (inc_capped=\"1\" when the cap "
+    "fired) — both absent when the count is 0 (a documented zero, not a degrade). Each body's own calls "
+    "child (1-hop callee signatures) carries total=/shown=/capped=\"1\" the usual way: capped=\"1\" only "
+    "when shown is below total. A body's CDATA is the bytes on disk unless the element says otherwise: "
+    "scrubbed=\"1\" = a ]]> was split (]]]]><![CDATA[>, rejoin it) or a C0/invalid-UTF-8 byte was replaced; "
+    "redacted=\"1\" = a credential shape was rewritten to a [REDACTED:kind] marker (the no-redact flag serves the "
+    "bytes; the edit verbs refuse a payload carrying MORE such markers than the bytes it would replace already "
+    "do, so source that spells one round-trips). Absent = paste-back is byte-exact. -->";
+
+// MODULE-SCOPE OWNERS (issue #60, ingest_model.h mintModuleScopeOwners) — the reading of the t="modscope" kind,
+// written only into a map whose corpus HAS one, by the same rule the extent clause below follows: a corpus with
+// no file-scope call stays byte-identical. Its own comment node rather than a widening of the t= list in the
+// opener, because that list is unconditional and this kind is not.
+inline constexpr std::string_view kModScopeMapLegend =
+    "<!-- t=modscope=a-file's-MODULE-SCOPE(n=<file-scope>):the-statements-outside-every-named-definition,where-a-top-level-call"
+    "-and-an-anonymous-callback-body's-calls-live;a-CALLER-never-a-callee(nothing-in-the-source-can-name-it)-with-no-body-to-expand;"
+    "a-file-with-no-such-call-has-no-such-row -->";
+
+// EXTENT HONESTY (src/extentsuspect.h, gate test/extentcheck.sh) — the ONE reading of extent_suspect= on every ROW
+// surface: the map's <s>, a bundle's <d> and <b>. Written only into a document that carries the attribute, right
+// where the reader meets it, so a corpus with nothing flagged stays byte-identical. The map adds the header count
+// as its own `hdr:` comment (the compact dialect already treats that opener as prose), so the row reading exists
+// once and cannot drift into two.
+inline constexpr std::string_view kExtentSuspectRowLegend =
+    "<!-- extent_suspect=containment-checks-this-definition-FAILED(its-span,id=-scope-and-t=-kind-may-be-parse-recovery-artifacts;"
+    "loc/cx/ccx/nest-summed-over-that-span-too;read-source;the-row-stays):name(its-own-name-lies-outside-its-own-signature)"
+    "|head(a-definition-sits-in-another's-return-type-position,before-its-name;C-family;marks-the-whole-top-level-definition-tree)"
+    "|scope(filed-under-C::-while-inside-a-different-class;C++)"
+    "|error(the-parse-recovered-its-class-or-kind;and-every-definition-inside-that-class)"
+    "(comma-joined-in-this-order;absent=every-check-held,not-a-proof-the-extent-is-right) -->";
+inline constexpr std::string_view kExtentSuspectHdrLegend =
+    "<!-- hdr:extent_suspect_syms=definitions-carrying-extent_suspect-corpus-wide(not-only-the-shown-rows;absent-if-0) -->";
+
+// MEMBER-MACRO RE-PARSE (src/macroreparse.h, gate test/macroreparsecheck.sh) — the map header's reading of
+// macro_blanked_files=, written only into a map that carries it (so a corpus with no re-parsed file keeps every byte).
+inline constexpr std::string_view kMacroBlankedHdrLegend =
+    "<!-- hdr:macro_blanked_files=files-whose-symbols-come-from-a-RE-PARSE(their-first-parse-held-error-bytes;"
+    "semicolon-less-ALL-CAPS-member-macro-invocations-blanked-to-spaces,offsets-unchanged;adopted-only-with-strictly-fewer-error-bytes;"
+    "the-skipped-verb-rows-each-with-macro_blanked=N;absent-if-0) -->";
+
+// The row attribute itself, on a std::string row (bundles). Absent when every check held.
+inline void appendExtentSuspectAttr( std::string& row, const Symbol& s )
+{
+    if( s.extentSuspect != 0 )
+    {
+        row += " extent_suspect=\"";
+        row += extent::extentSuspectReasons( s.extentSuspect );
+        row += "\"";
+    }
+}
+
+inline constexpr const char* kMetricsLegend =
+    "<!-- metrics: in=fan-in out=fan-out cx=cyclomatic ccx=cognitive loc=lines params=count nest=MAX-depth "
+    "humps=regions-reaching-the-nesting-bar deep=lines-inside-them(floor,see deep_floor) "
+    "(humps/deep are the PROFILE nest= cannot give: nest= is a max, so one deep line and a body that is deep "
+    "throughout report the same number; deep/loc is the fraction. Both absent exactly when nest<bar — "
+    "not-deep, never a hidden 0. deep counts LINES and humps counts REGIONS, and two regions can share a "
+    "line, so deep BELOW humps is legal: a one-line if/else at the bar is 2 regions on 1 line) "
+    "locals=local-var-decl-count(floor,C/C++-only,see locals_floor) "
+    "ppalt=preproc-alternative-branches-in-body(#else/#elif; metrics sum ALL branches, no single build "
+    "compiles them all) "
+    "ev=essential-cx(McCabe: 1=fully structured, 2+=jumps block extract-method; absent on a cx row means "
+    "exactly 1; floor per ev_floor — noreturn calls/macro-hidden exits unseen; not counted: &&/||, Rust ? "
+    "and yield/await/defer, hence Bash carries no ev) ev_why=which-jumps-raised-it tag:count "
+    "cbo=coupling lcom4=cohesion "
+    "amp=change-amplification tested=1 role=hub(fan-in 8+; uses spells role "
+    "call|macro|read|write|import|extends). Absence is PER-KEY: N/A for params/nest/locals/cbo/lcom4/amp "
+    "(wrong kind, or a language the metric is not counted for); a MEASURED value for loc/tested/ppalt/humps/deep "
+    "(0), ev (1) and role (fan-in below 8). -->";
+
+// §B13.4 — the --max-tokens fit's own legend clause, emitted ONLY on a map --max-tokens shaped, for the same
+// reason kChurnRankLegend is: a flag-only fact does not belong in the string every other run shares. It names
+// the two currencies explicitly, because the whole defect was that they were never named: the CEILING is
+// bytes (the DENSEST calibrated language rate x a 90% headroom, so N is a cap that holds for any language
+// mix and any tokenizer drift), while est_tokens is this corpus's own language-weighted estimate — so a
+// conformant fit lands BELOW the N you asked for, by design, and fit_bytes= is the number actually honoured.
+// Kept DELIBERATELY terse — it is charged against the very ceiling it describes (--max-tokens=500 buys only
+// ~1062 bytes in total), so the full statement of the consequence lives in --help, not here.
+// G4: no "--" ANYWHERE inside an XML comment. The flag names this clause has to talk about are therefore
+// written bare ("token-budget", not "--token-budget"); spelling one with its dashes made xmllint reject the
+// whole document ("Double hyphen within comment"), caught by tokenbudgetcheck #5.
+// §F5: the clause also has to define over_ceiling, because THIS clause is part of the very floor that makes it
+// fire — at a small max_tokens the legend plus the envelope exceed fit_bytes with zero symbols emitted, and a
+// marker no legend defines is the §B7 class this round is already closing. Kept to one hyphenated phrase for
+// that reason, and spelled WITHOUT the `=1` the attribute carries so that the literal `over_ceiling=1` occurs
+// in a document only where the map actually asserts it (a gate greping the marker cannot match its own gloss).
+inline constexpr const char* kMaxTokensUnmeasuredLegend =
+    "<!-- fit_unmeasured=1: the fit probe could not measure this map, so the cap is UNVERIFIED and over_ceiling=1 is set fail-closed -->";
+inline constexpr const char* kMaxTokensFitLegend =
+    "<!-- max_tokens=asked fit_bytes=honoured: fit_bytes = max_tokens x 2.36 (densest-language B/tok) x 0.90 "
+    "headroom, a CONSERVATIVE cap, so est_tokens (this corpus's own rate) lands ~10-20% BELOW max_tokens by "
+    "design; the token-budget gate compares against est_tokens, not fit_bytes; "
+    "over_ceiling=floor-alone-exceeded-fit_bytes(absent=cap-held) -->";
+
+// Serialize the top-K symbols (by rank, ties by id) grouped by file, to `out`.
+//   rank[i]      = PageRank of symbol i               (size = symbols.size())
+//   outOff/outTargets = resolved out-edges per symbol (CSR: targets of i are
+//                       outTargets[outOff[i] .. outOff[i+1]) )  → the <c> children
+//   mostImportantLast: EXPLICIT --most-important-last (hard force-on; unchanged behaviour).
+//   autoOrder: T3 — when true AND mostImportantLast/stable are NOT explicitly set, the emit order
+//              auto-flips to important-last once est_tokens crosses kFillOrderThreshold. Callers that
+//              want the pre-T3 behaviour (e.g. --around's ego-graph, or the --max-tokens probe pass)
+//              pass autoOrder=false and keep the prior explicit-only semantics.
+// §L1 — how many extensions the map header's `unindexed=` list may name before it is capped. ONE
+// definition: the XML and JSON header lanes must cap identically or the two surfaces disagree about what
+// "capped" means, and a consumer joining them would see a phantom difference.
+constexpr std::size_t kUnindexedHeaderExts = 6;
+
+// §L1 — `unindexed=` for the map header: the LANGUAGES this build could not read at all.
+// skipped_oversize= disclosed the files a ceiling dropped; nothing disclosed the files whose EXTENSION has
+// no grammar, and that is how a whole language disappears silently. On facebook/infer (11 923 files, ~60%
+// OCaml) the header gave no hint that the repo's primary language contributed nothing and the top-ranked
+// symbols were test fixtures.
+//
+// Top extensions by file count, `ext:count`. THE CAP IS ALWAYS DISCLOSED: the list stops at
+// kUnindexedHeaderExts and `unindexed_exts=N` rides alongside it exactly when the cap bit, naming how many
+// DISTINCT extensions exist — so the list is either complete or labelled, never a top-6 mistakable for a
+// total. Absent when nothing was cut, the same absent-means-nothing-happened rule skipped_oversize= and
+// overloads= already use, AND what keeps the disclosure inside the map's fixed envelope: at the smallest
+// --max-tokens budgets the floor has ~24 bytes of headroom (test/tokenbudgetcheck.sh arm #3), so a 17-byte
+// counter whose only message is "nothing was capped" is a counter that pushes the floor past a ceiling it
+// never needed to.
+//
+// Only source/text-looking extensions are counted (ingest.h::isNonTextExtension names the rule); an
+// unindexed .png is a picture, not a language codecortex failed to read. Returns "" when there are none, so a
+// fully-indexable tree's map stays byte-identical.
+//
+// WHERE THE DEFINITION LIVES, AND THE MEASUREMENT THAT KEEPS IT THERE. Both attributes are defined in the
+// --skipped verb's legend and docs/COMMANDS.md, NOT in the map legend the reader meets them on. That is a
+// real disclosure gap and it is recorded here rather than fixed, because it was attempted and MEASURED:
+// even the conditional form (append the clause only to a map that carries the attribute, the way
+// kMetricsLegend / kAtStampLegend / kMaxTokensFitLegend are charged) breaks test/tokenbudgetcheck.sh arm
+// #3. On `src` at --max-tokens=500 the map's fixed floor is 1173 B against a 1180 B allowance — SEVEN bytes
+// of headroom, so no clause of any wording fits, and the shortest honest one is ~150 B. Growing the floor
+// there would make --max-tokens overshoot its own ceiling (disclosed as over_ceiling=1, but overshooting
+// nonetheless) to define an attribute that IS defined one verb away. If that headroom is ever reclaimed,
+// this is the clause to add back.
+inline std::string buildUnindexedAttr( const CrawlSkips& skips )
+{
+    if( skips.unindexedExts.empty() )
+    {
+        return {};
+    }
+    const std::size_t shown = skips.unindexedExts.size() < kUnindexedHeaderExts
+                            ? skips.unindexedExts.size() : kUnindexedHeaderExts;
+    std::string attr = " unindexed=\"";
+    for( std::size_t i = 0; i < shown; ++i )
+    {
+        const UnindexedExt& ue = skips.unindexedExts[ i ];
+        if( i != 0 )
+        {
+            attr += ',';
+        }
+        // the leading '.' is dropped — `ml:7231` reads as a language, `.ml:7231` reads as a path
+        attr += ue.ext.size() > 1 && ue.ext[ 0 ] == '.' ? ue.ext.substr( 1 ) : ue.ext;
+        attr += ':';
+        attr += std::to_string( ue.files );
+    }
+    attr += '"';
+    if( skips.unindexedExts.size() > shown )
+    {
+        attr += " unindexed_exts=";
+        attr += std::to_string( skips.unindexedExts.size() );
+    }
+    return attr;
+}
+
+// §N6-C — what honouring the repository's own .gitignore removed from this corpus. TWO numbers because
+// they answer two different questions and one of them is a floor on a fact rather than the fact: an
+// ignored FILE is an exact drop the walk saw, an ignored SUBTREE stopped the walk at its directory, so how
+// many files sat under it is UNKNOWN, not zero — the contract excluded_dirs=/pruned_dirs= already carry.
+// Returns "" when the rule dropped nothing, so a tree with nothing ignored (and every non-git root, and
+// every --no-ignore run) stays byte-identical to the pre-lane map. That absence is what test/golden.xml
+// and every argvdiff vector ride on.
+inline std::string buildIgnoredAttr( const CrawlSkips& skips )
+{
+    std::string attr;
+    if( skips.ignoredFiles > 0 )
+    {
+        attr += " ignored_files=";  attr += std::to_string( skips.ignoredFiles );
+    }
+    if( skips.ignoredDirs > 0 )
+    {
+        attr += " ignored_dirs=";   attr += std::to_string( skips.ignoredDirs );
+    }
+    return attr;
+}
+
+// §SEC1 — how many files the crawl REFUSED because a symlink took them out of the root (ingest.h carries the
+// rule). On the DEFAULT map, not only on --skipped, because the default map is the surface an agent actually
+// reads and a corpus that quietly shrank is precisely what the honesty contract forbids: files= would
+// otherwise present the survivors as the tree. Same absent-when-zero rule as skipped_oversize= / ignored_files=
+// — a repository with no escaping symlink (every repository, until one is hostile) keeps a byte-identical map,
+// which is what test/golden.xml and every argvdiff vector ride on. The DEFINITION lives in the --skipped
+// legend and --help, not here, for the reason buildUnindexedAttr's note measured: the map's fixed floor has
+// seven bytes of headroom at the smallest --max-tokens budgets, and no clause of any wording fits.
+inline std::string buildEscapedRootAttr( const CrawlSkips& skips )
+{
+    return skips.escapedFiles == 0 ? std::string() : " escaped_root=" + std::to_string( skips.escapedFiles );
+}
+
+// The per-symbol honesty counters (graph.h ambOut / unresolvedOut / locPinOut) reach both map dialects as
+// NULLABLE vectors — nullptr ⇒ never measured (a pure sizing pass). These two are the only ways the emitters
+// read them, so "an absent counter reads as zero" is stated once instead of in six hand-rolled chains.
+inline std::size_t counterTotal( const std::vector<std::uint32_t>* v ) noexcept
+{
+    std::size_t total = 0;
+    if( v )
+    {
+        for( std::uint32_t k : *v )
+        {
+            total += k;
+        }
+    }
+    return total;
+}
+inline std::uint32_t counterAt( const std::vector<std::uint32_t>* v, NodeId id ) noexcept
+{
+    return ( v && id < v->size() ) ? ( *v )[ id ] : 0u;
+}
+
+inline void serialize( std::FILE* out, const IngestResult& ing, const std::vector<float>& rank,
+                       const std::vector<std::uint32_t>& outOff, const std::vector<NodeId>& outTargets,
+                       int topK, bool mostImportantLast = false,
+                       bool metrics = false, const std::vector<std::uint32_t>* fanIn = nullptr,
+                       const std::vector<std::uint32_t>* ambOut = nullptr, bool stable = false,
+                       const std::vector<std::uint8_t>* outProv = nullptr,
+                       // Q-compute per-symbol metrics — surfaced on --metrics ONLY (descriptive facts, never gates).
+                       // All optional (nullptr ⇒ that attribute is omitted); loc/params/nest live on Symbol itself.
+                       const std::vector<std::uint32_t>* cbo    = nullptr,   // Q5a distinct in-repo dependency targets
+                       const std::vector<std::uint8_t>*  tested = nullptr,   // Q2   referenced from a test-path file
+                       const std::vector<std::uint32_t>* lcom4  = nullptr,   // Q4   class cohesion (kLcom4NA ⇒ omit)
+                       const std::vector<std::uint32_t>* amp    = nullptr,   // Q2   change-amplification (callers + co-change partners)
+                       const std::vector<std::uint32_t>* unresolvedOut = nullptr,  // honesty lever #2: per-symbol lang-filtered
+                                                                                   // unresolved calls; summed into `unresolved=N`
+                       const std::vector<std::string>*   bind = nullptr,      // A4-R5 per-symbol cross-language binding
+                                                                               // label (graph.h g.bindLabel) — JNI decoded
+                                                                               // Java_pkg_Cls_method → "pkg.Cls.method".
+                                                                               // Emitted as bind="…" ONLY when non-empty
+                                                                               // (nullptr/empty-vector default ⇒ zero
+                                                                               // token cost, byte-identical golden map).
+                       bool autoOrder = false,                               // T3: fill-aware auto important-last (see above)
+                       std::size_t* outEstTokens = nullptr,                  // --token-budget: hand back the SAME est_tokens the
+                                                                              // header prints (no second counter) — nullptr ⇒ unused
+                       std::size_t extraPayloadTokens = 0,                   // §H7 (was extraBodyTokens): tokens of
+                                                                              // EVERY block the caller appends after this map —
+                                                                              // <sigs>, <src>, <bodies>, <outline> — each MEASURED
+                                                                              // from its rendered bytes by the caller (main.cpp's
+                                                                              // renderMapPayload) and converted through
+                                                                              // tokensForEmittedBytes. The old name said "body"
+                                                                              // and only --expand ever filled it, which is
+                                                                              // precisely why the four siblings went uncharged.
+                       const MapAnnotations& ann = {},                       // how THIS map was produced (see MapAnnotations
+                                                                              // above); defaulted ⇒ byte-identical golden map.
+                       // §B6 M10: keep the files=/symbols=/shown=/order= stanza on the FIRST SCREEN even under
+                       // `stable`. --stable moves it to a TRAILING comment to protect the cacheable prefix, which is
+                       // right for a CLI map a provider KV-caches and wrong for the MCP `analyze` verb, whose result
+                       // is ONE tool payload an agent reads top-down: there the reader met 197 of 6368 symbols with
+                       // no denominator and no order marker until the last line. The stanza is emitted ONCE either
+                       // way (never both places), so no count is stated twice. Only the MCP analyze front door
+                       // passes true; every CLI caller keeps the default and stays byte-identical.
+                       bool statsFirstScreen = false,
+                       // R-E (2026-08-17 harvest, report-memgraph §F6 seconded): the run's OWN root argument,
+                       // single-root callers only (empty ⇒ multi-root — already carries the roots=/<root
+                       // label=…> disclosure above and stays untouched — or a caller that never passes one, e.g.
+                       // a pure sizing pass, where a root= attribute would add bytes nothing reads). Same fact
+                       // --grep's root= states, same helper (sarif.h's rootPrefixOf/rootRelativeUri) — the two
+                       // verbs must not diverge on what "root-relative" means.
+                       std::string_view rootArg = {},
+                       // Phase 4: the S6-C locality-pin counter (graph.h g.locPinOut) → lpin="K" on the row, header
+                       // locality_pinned=N — both absent when zero, so a pin-free corpus is byte-identical.
+                       const std::vector<std::uint32_t>* locPinOut = nullptr,
+                       // Phase 5: the external-name veto's refusal count (graph.h g.externalCalls) → header external=N,
+                       // absent when zero, so a veto-free corpus is byte-identical.
+                       std::size_t externalCalls = 0,
+                       // Tier 3's per-caller declines (graph.h g.declinedOut) → header declined=N, absent when zero, so a
+                       // corpus where no call reached tier 3 undecided stays byte-identical.
+                       const std::vector<std::uint32_t>* declinedOut = nullptr )
+{
+    const std::size_t* changedCount = ann.changedCount;
+    const std::string* mapAtStamp   = ann.atStamp;
+    const std::string* churnWindow  = ann.churnWindow;
+    const std::size_t S = ing.symbols.size();
+    // R-E: normalize once, reuse at every <f p=…> row below — rootPrefixOf just strips a trailing '/', so
+    // this is O(1) work the loop below would otherwise repeat per row.
+    const std::string rootPrefix = rootArg.empty() ? std::string() : rw::sarif::rootPrefixOf( rootArg );
+    const auto         pathRel   = [ & ]( std::uint32_t fileId ) -> std::string_view
+    {
+        return rootArg.empty() ? std::string_view( ing.files[ fileId ] ) : rw::sarif::rootRelativeUri( ing.files[ fileId ], rootPrefix );
+    };
+
+    // C1-b: `keep` is the row count the map WOULD print, and it depends on topK and S alone — never on the
+    // ranking. So under in=DIR's stub it is still the honest would_show=, and every step that exists only to
+    // ORDER and BUCKET rows nobody prints is skipped: the radix sort over S symbols, the files-sized bucket
+    // allocation, and the fill loop. (The <f> loop below already walked an empty order; this is the work that
+    // ran to feed it.)
+    const std::size_t keep = std::min<std::size_t>( topK > 0 ? std::size_t( topK ) : S, S );
+    const bool        stubbed = ann.stubSymbols;
+
+    // rank order: (rank desc, id asc) — the id tie-break makes the top-K deterministic.
+    std::vector<NodeId> order;
+    if( !stubbed )
+    {
+        order.resize( S );
+        for( NodeId i = 0; i < S; ++i )
+        {
+            order[i] = i;
+        }
+        sortutil::radixSortByScoreDescId( order, rank );
+    }
+
+    // bucket the kept symbols by file, files ordered by their best (first-seen) rank.
+    std::vector<std::vector<NodeId>> buckets( stubbed ? 0 : ing.files.size() );
+    std::vector<std::uint32_t>       fileOrder;
+    std::vector<char>                seen( stubbed ? 0 : ing.files.size(), 0 );
+
+    for( std::size_t k = 0; !stubbed && k < keep; ++k )
+    {
+        const NodeId        id = order[k];
+        const Symbol&       s  = ing.symbols[id];
+        const std::uint32_t f  = s.fileId;
+        if( !seen[f] ) { seen[f] = 1;  fileOrder.push_back( f ); }
+        buckets[f].push_back( id );
+    }
+
+    // T1/§H7: the byte MODEL. It keeps two jobs and loses one. It still decides the T3 emit order below
+    // (which has to be decided before any byte exists — see §H7 at estimateTokens) and it still supplies
+    // the language-weighted bytes/token RATE, the half of it that is actually measured. What it no longer
+    // does is REPORT the size: the reported est_tokens is computed from the document's emitted bytes in
+    // PHASE 2 below, because a model of the symbol set cannot see --metrics decoration or an appended
+    // payload, which is how four different documents came to report one number (§H7).
+    // T3 note: the auto-order decision keys off the MAP's own estimate, NOT the payload — the fill-order
+    // heuristic reasons about the map that gets reordered; the appended <bodies>/<sigs>/<src> blocks are
+    // emitted after and cannot be reordered, so they must not shift the map's primacy/recency decision.
+    // C1-b: under the stub the map prints NO symbol rows, so the estimate is taken over none of them. It used
+    // to be taken over `keep` rows the document does not contain, which put an est_tokens= in the header for a
+    // payload that was not there — and paid a per-symbol pass to compute it.
+    const TokenEstimate mapEst      = estimateTokens( ing, order, stubbed ? 0 : keep, outOff, outTargets );
+    const std::size_t   mapEstTokens = mapEst.tokens;
+
+    // T3: fill-aware auto important-last. A PURE function of estTokens (itself a pure function of the
+    // kept symbol set) → deterministic, byte-identical run-to-run. Only engages when the caller opted
+    // in (autoOrder) AND neither --stable nor an explicit --most-important-last already decided the
+    // order — an explicit flag always wins, auto-order never overrides a user's stated intent. Does
+    // NOT trigger on the small default map (test/fixture est_tokens=619, src/ ~10.6K — both far under
+    // the ~16K threshold) so the golden output is unchanged.
+    const bool autoFlip         = autoOrder && !stable && !mostImportantLast && mapEstTokens > kFillOrderThreshold;
+    const bool effImportantLast = mostImportantLast || autoFlip;
+
+    // --stable: emit in PATH / symbol-id order (not rank order) so re-running on a slowly-changing repo
+    // keeps a byte-identical PREFIX → free provider KV-cache hits. Selection stays rank-based (the top-K
+    // membership is unchanged); only the emit order is stabilized. Takes precedence over --most-important-last.
+    if( stable )
+    {
+        std::sort( fileOrder.begin(), fileOrder.end(),
+                   [ & ]( std::uint32_t a, std::uint32_t b ) { return ing.files[a] < ing.files[b]; } );
+        for( std::vector<NodeId>& b : buckets )
+        {
+            std::sort( b.begin(), b.end() );                   // by symbol id == file+line order (stable)
+        }
+    }
+    // --most-important-last (explicit) OR T3 auto-flip: emit highest-rank file/symbol LAST (some models
+    // weight end-of-context more heavily). Order-only; det-gate still holds.
+    else if( effImportantLast )
+    {
+        std::reverse( fileOrder.begin(), fileOrder.end() );
+        for( std::vector<NodeId>& b : buckets )
+        {
+            std::reverse( b.begin(), b.end() );
+        }
+    }
+
+    std::vector<char> esc;
+
+    // The prov= legend is appended ONLY under --scip (outProv present) so the default header stays
+    // byte-identical to the pre-overlay output (no golden churn); prov="scip" marks a SCIP-pinned precise edge.
+    // §A8.7: shown= (in the `stats` comment below) counts overload-MERGED rows individually — rows +
+    // Σ(overloads-1) == shown — but overloads= itself (overloadsAttr(), above) was absent from this legend,
+    // the one clause that closes that arithmetic for a reader who has only the map, not the source.
+    // §H7: the legend is now COMPOSED into a string rather than streamed, because est_tokens can only be
+    // written once the document it describes has been measured (PHASE 2 below) and the legend's own bytes
+    // are part of what it describes.
+    std::string legend = outProv
+        ? "<!-- codecortex v1 t=fn|method|cls|struct|iface|var|sec|macro(#define;degraded:body-is-replacement-text,edges-cross-expansion) p=path layer=arch-layer(opt) n=name sc=enclosing-scope(absent-if-unscoped;the-full-id-is-p::sc::n-with-p=-from-the-enclosing-f,and-expand/callers/impact/uses-accept-it) k=rank c=call amb=ambiguous-calls(read-source) lpin=calls-pinned-by-locality-prior-alone(a-disclosed-guess;read-source;absent-if-0) overloads=N-same-name-defs-merged-into-this-row(absent-if-1;shown=counts-them-individually,so-rows+sum(overloads-1)=shown) prov=per-EDGE-confidence(orthogonal-to-k):scip(index-pinned;precise)|binding(cross-lang-FFI)|import(ES-named-import;module+export-named)|split(one-arm-of-a-k-way-pick;read-source;these-are-the-edges-amb=-counts)|final-segment(last-name-match;namespace-unchecked)(absent=uniquely-resolved-name-based) hdr:unresolved=call-name-defined-only-in-a-lang-incompatible-file (edges heuristic) hdr:locality_pinned=sum-of-lpin(absent-if-0) hdr:external=calls-refused-as-bound-outside-the-tree(builtin/stdlib-name-without-in-repo-evidence,external-import,super-past-the-tree;no-edge;absent-if-0) r:est_tokens=hdr-copy(none-if-stable) -->"
+        : "<!-- codecortex v1 t=fn|method|cls|struct|iface|var|sec|macro(#define;degraded:body-is-replacement-text,edges-cross-expansion) p=path layer=arch-layer(opt) n=name sc=enclosing-scope(absent-if-unscoped;the-full-id-is-p::sc::n-with-p=-from-the-enclosing-f,and-expand/callers/impact/uses-accept-it) k=rank c=call amb=ambiguous-calls(read-source) lpin=calls-pinned-by-locality-prior-alone(a-disclosed-guess;read-source;absent-if-0) overloads=N-same-name-defs-merged-into-this-row(absent-if-1;shown=counts-them-individually,so-rows+sum(overloads-1)=shown) hdr:unresolved=call-name-defined-only-in-a-lang-incompatible-file (edges heuristic) hdr:locality_pinned=sum-of-lpin(absent-if-0) hdr:external=calls-refused-as-bound-outside-the-tree(builtin/stdlib-name-without-in-repo-evidence,external-import,super-past-the-tree;no-edge;absent-if-0) r:est_tokens=hdr-copy(none-if-stable) -->";
+    // EXTENT HONESTY (src/extentsuspect.h): how many definitions carry extent_suspect= corpus-wide — the header's
+    // extent_suspect_syms= — and the row + header readings, appended ONLY when that is non-zero, so a corpus with
+    // nothing flagged keeps every byte of this legend.
+    // MODULE-SCOPE OWNERS (issue #60): the t="modscope" kind's reading, appended ONLY when the corpus
+    // actually has one, under the same byte-identity rule as the two clauses below — a corpus with no
+    // file-scope call keeps every byte of this legend, which is what kept test/printf_parity.manifest's
+    // --pack-signatures and --around hashes and every est_tokens ceiling where they were.
+    bool hasModuleScope = false;
+    for( const Symbol& sym : ing.symbols )
+    {
+        if( sym.kind == SymKind::ModuleScope ) { hasModuleScope = true; break; }
+    }
+    if( hasModuleScope )
+    {
+        legend += kModScopeMapLegend;
+    }
+
+    std::size_t extentSuspectTotal = 0;
+    for( const Symbol& sym : ing.symbols )
+    {
+        extentSuspectTotal += sym.extentSuspect != 0 ? 1u : 0u;
+    }
+    if( extentSuspectTotal > 0 )
+    {
+        legend += kExtentSuspectRowLegend;
+        legend += kExtentSuspectHdrLegend;
+    }
+    // MEMBER-MACRO RE-PARSE (src/macroreparse.h): files whose symbols come from a re-parse — the header's
+    // macro_blanked_files= — and its reading, appended ONLY when non-zero, under the same byte-identity rule.
+    const std::size_t macroBlankedFiles = macroBlankedFileCount( ing );
+    if( macroBlankedFiles > 0 )
+    {
+        legend += kMacroBlankedHdrLegend;
+    }
+    // R-E fix (2026-08-19): root= was added to <r> with nothing defining it — legendcoveragecheck's arm (A)
+    // named it on nine roster verbs at once (the default map, --around, and every map-* variant share this
+    // legend). Spelled in THIS legend's own key=meaning dialect rather than as the prose sentence
+    // graphlegend.h's kRootRelPathsLegend carries: the map legend is the one first screen every run pays for,
+    // and its whole style is one compact token per attribute. Conditional, so a multi-root map — which emits
+    // no root= — stays byte-identical and no golden moves for a document the clause would not describe.
+    if( !rootArg.empty() )
+    {
+        legend += "<!-- r:root=crawl-root-every-p=-is-relative-to(single-root-only;absent=>p=is-the-raw-ingest-path) -->";
+    }
+    if( churnWindow != nullptr )
+    {
+        legend += churnRankLegendFor( ann.churnRankLabel ); // §A9.6 / P0-4, churn-only (see the constants)
+        if( ann.scopedRecent != nullptr )
+        {
+            legend += kRecentScopeLegendOpen;   // C1-b: in=DIR — the scoped block, its page, and the map stub (present-only)
+            legend += kNextLegendClause;
+            legend += kRecentScopeLegendClose;
+        }
+    }
+    // §B2.1: the same treatment for authority/hub/rrf. Mutually exclusive with the churn arm by construction
+    // (main.cpp fills exactly one of the two fields), and null on the default pagerank map ⇒ zero bytes there.
+    if( const char* rbLegend = rankByLegendFor( ann.rankByLabel ) )
+    {
+        legend += rbLegend;
+    }
+    // M20: the seeded-verb clause, emitted only on a seeded map (see MapAnnotations::SeedDisclosure).
+    if( !ann.seed.of.empty() )
+    {
+        legend += "<!-- of= is the resolved SEED this neighbourhood is centred on; depth= call hops walked and fanout= "
+                  "neighbours kept per hop are its whole boundary, so a row's absence means outside them, not nonexistent. "
+                  "defs= (only when >1) = that NAME has N definitions and the lowest-id one was walked (a C/C++ declaration "
+                  "without a body yields to the lowest-id definition of its scope that has one); qualify with "
+                  "file:name or @FILE:LINE to pick another. -->";
+        legend += seedBiteLegend( ann.seed );   // C2: charged only on a run whose root carries a bite attribute (the at= rule)
+        // H1: charged only on a run whose root carries unproven_defs= — the same rule, and part of the head est_tokens prices.
+        legend += unprovenDefsVerbComment( UnprovenDefsVerb::Around, ann.seed.unprovenDefs > 0, "<!-- codecortex around: " );
+    }
+    if( metrics )
+    {
+        legend += kMetricsLegend; // §B7.3, metrics-only (ditto)
+    }
+    // Beyond the brief, found by the CA4 legend-coverage sweep: `at=` is the ONE root attribute the map can
+    // emit that no map legend ever defined — §B7.1 fixed exactly this on the quality-delta screen and the map
+    // is the other surface that prints it. Emitted only on the runs that carry the stamp (map-diff / churn),
+    // so the default map is untouched and the clause is charged where the attribute is.
+    if( mapAtStamp != nullptr && !mapAtStamp->empty() )
+    {
+        legend += kAtStampLegend;
+    }
+    if( ann.maxTokensFit != nullptr )
+    {
+        legend += kMaxTokensFitLegend; // §B13.4, --max-tokens-only (ditto)
+        legend += ann.maxTokensFit->isUnmeasured ? kMaxTokensUnmeasuredLegend : "";   // only on the degrade that sets it
+    }
+    const bool ignoreCut = ing.crawlSkips.ignoredFiles > 0 || ing.crawlSkips.ignoredDirs > 0;
+    legend += ignoreCut ? kIgnoredLegend : "";   // §N6-C — charged to the map that carries it; see kIgnoredLegend
+    // L3 follow-up (CodeRabbit 4053600616): notes.h's ONE marker, spelled identically on every notes-surfacing
+    // emitter — absent on a clean read (no sidecar, or every line parsed), so a map with nothing to disclose
+    // stays byte-identical to before this lane.
+    if( ann.notesDegraded )
+    {
+        legend += std::string( notes::kNotesDegradedComment );
+    }
+    // W2-F: the pr_iters= / pr_converged= definition, charged to the maps that carry the attributes — empty
+    // for a lexical or HITS ordering, and the prose half only on the map whose iteration stopped short.
+    legend += renderDisclosure( ann.prDisclosure, DiscloseAs::LegendComment );
+    // header honesty gauges: ambiguous=resolver guessed among >1 in-repo def (read source); unresolved=the callee
+    // name IS defined in-repo but EVERY def was language-filtered — a plausibly-internal, cross-language-filtered
+    // edge (NOT counted for genuine externals like stdlib/third-party, whose name has no in-repo def at all).
+    const std::size_t ambTotal        = counterTotal( ambOut );          // calls the resolver could not pin to one target
+    const std::size_t unresolvedTotal = counterTotal( unresolvedOut );   // calls to an in-repo name, all defs lang-filtered
+    const std::size_t locPinTotal     = counterTotal( locPinOut );       // Phase 4: calls the locality prior ALONE pinned
+    const std::size_t declinedTotal   = counterTotal( declinedOut );     // calls tier 3 declined: no edge, and no guess
+    legend += declinedTotal > 0 ? kDeclinedMapLegend : "";               // charged to the map that carries declined=
+    // C1 DRIFT FIX (Round C lane B, found by re-reading this header's own output). `precise=` means "how many
+    // out-edges a SCIP index PINNED", and the emitter's own comment below says it is "emitted ONLY under
+    // --scip". Both were true when outProv held only {0, 1}. A4-R5 then added value 2 (an FFI binding edge)
+    // and this counter — `v ? 1 : 0` — silently began reporting binding edges as SCIP-precise: codecortex's own
+    // default map, with no --scip anywhere, printed `precise=3` for 3 FFI binding edges, which is the exact
+    // "a surface that quietly guesses" shape docs/ARCHITECTURE.md §4 forbids. It is load-bearing here because
+    // C1 adds value 3, which would have inflated the same number by every split edge in the corpus.
+    // The counter now names ONE value, and the attribute is absent at zero (the tool-wide absent-if-0
+    // convention that lpin=/external=/locality_pinned= already follow) so a run with no overlay says nothing
+    // rather than saying `precise=0` about a measurement it never made.
+    std::size_t preciseTotal = 0;                              // how many out-edges the SCIP index pinned (value 1 ONLY)
+    if( outProv )
+    {
+        for( std::uint8_t v : *outProv )
+        {
+            preciseTotal += ( v == 1u ? 1u : 0u );
+        }
+    }
+    char precAttr[ 40 ];  precAttr[ 0 ] = '\0';                // emitted only when a SCIP overlay pinned something
+    if( preciseTotal > 0 )
+    {
+        rw::formatTo( precAttr, sizeof( precAttr ), " precise={}", preciseTotal );
+    }
+    // Multi-root workspace (A13): `roots=N` joins the header gauges and a
+    // `<root l="LABEL" p="PATH"/>` prologue opens <r> — ONLY when N≥2 (single-root output byte-unchanged).
+    char rootsAttr[ 32 ];  rootsAttr[ 0 ] = '\0';
+    if( ing.rootLabels.size() >= 2 )
+    {
+        rw::formatTo( rootsAttr, sizeof( rootsAttr ), " roots={}", ing.rootLabels.size() );
+    }
+    // D6: --map-diff's teleport-seed file count, ONLY when the caller passes changedCount
+    // (nullptr for every non-map-diff caller ⇒ zero token cost, byte-identical golden map). A clean
+    // tree reports "changed=0" so the caller can see the teleport degraded to uniform without shelling
+    // out to git a second time — that map is otherwise byte-identical to the plain default map.
+    char changedAttr[ 40 ];  changedAttr[ 0 ] = '\0';
+    if( changedCount )
+    {
+        rw::formatTo( changedAttr, sizeof( changedAttr ), " changed={}", *changedCount );
+    }
+    // §P0.5d: how many otherwise-indexable files the crawl dropped for exceeding a per-file size ceiling —
+    // --max-file-size, or (§B13.1) the .json lane's fixed 256 KB config ceiling that --max-file-size does not
+    // raise. `--max-file-size=8K` dropped ~296 of ~759 files on this repo and files= reported the survivors as
+    // if they WERE the corpus. Emitted ONLY when non-zero, per the house rule — absent means nothing was
+    // skipped, so a default run over a tree with nothing oversized stays byte-identical.
+    char skippedAttr[ 48 ];  skippedAttr[ 0 ] = '\0';
+    if( !ing.skippedOversize.empty() )
+    {
+        rw::formatTo( skippedAttr, sizeof( skippedAttr ), " skipped_oversize={}", ing.skippedOversize.size() );
+    }
+    // §L1: the LANGUAGES this build could not read at all — buildUnindexedAttr carries the whole rule.
+    const std::string unindexedAttr = buildUnindexedAttr( ing.crawlSkips );
+    const std::string ignoredAttr   = buildIgnoredAttr( ing.crawlSkips );   // §N6-C, empty unless the ignore rules cut something
+    const std::string escapedAttr   = buildEscapedRootAttr( ing.crawlSkips ); // §SEC1, empty unless a symlink left the root
+    // §B13.4: --max-tokens=N asked for a TOKEN count and got a BYTE ceiling. Both numbers, on the map that
+    // was shaped by them, so the ~10% the headroom leaves unused is a disclosed fact rather than a silent
+    // one. Emitted ONLY under --max-tokens (nullptr for every other caller ⇒ byte-identical default map).
+    // §F5: over_ceiling=1 rides the same attr — a cap that can be overshot is not a cap, so where the map's
+    // fixed floor cannot fit inside fit_bytes the map states that instead of quietly exceeding it. See
+    // MapAnnotations::MaxTokensFit for the four ways the cap was breached and why the label is monotone.
+    char fitAttr[ 96 ];  fitAttr[ 0 ] = '\0';
+    if( ann.maxTokensFit != nullptr )
+    {
+        rw::formatTo( fitAttr, sizeof( fitAttr ), " max_tokens={} fit_bytes={}{}{}",
+                       ann.maxTokensFit->askedTokens, ann.maxTokensFit->ceilingBytes,
+                       ann.maxTokensFit->isOverCeiling || ann.maxTokensFit->isUnmeasured ? " over_ceiling=1" : "",
+                       ann.maxTokensFit->isUnmeasured ? " fit_unmeasured=1" : "" );
+    }
+    // order= marker: T3's auto-flip must be OBSERVABLE, not a silent behaviour change — "important-
+    // last(auto:fill)" is distinct from the explicit "important-last" so a reader (or a diff) can tell
+    // the ordering was the fill-aware heuristic, not a requested flag.
+    const char* orderAttr = stable ? "stable"
+                          : mostImportantLast ? "important-last"
+                          : autoFlip ? "important-last(auto:fill)"
+                          : "important-first";
+
+    // ── the HEAD and the TAIL, as BUILDERS ─────────────────────────────────────────────────────────────
+    // Both state est_tokens, and est_tokens describes the whole document including them, so the digit count
+    // feeds back into the number: PHASE 2 below iterates these to a fixpoint. buildRecall (recall.h) has the
+    // identical fixpoint for the identical reason — "the header, last: it REPORTS est_tokens, so it can only
+    // be written once the payload is measured". Pure functions of estTokens + the attrs computed above.
+    MapEstimate estimate{ ann.payloadUncharged };   // the est_tokens measurement's DISCLOSE sink — read by the head builders below
+    const auto buildStats = [ & ]( std::size_t estTokens ) -> std::string
+    {
+        // summary preamble: counts so the agent knows the map's scope + est size. §B14 — was `char stats[480]`,
+        // and the LATENT member of that class: every interpoland is bounded, but the worst-case format width
+        // is 80 literal bytes + 7×20 (%zu at UINT64_MAX) + 251 (precAttr 39 + rootsAttr 31 + changedAttr 39 +
+        // skippedAttr 47 + fitAttr 95, each buffer's max strlen) + 25 (`important-last(auto:fill)`) = **496 B**,
+        // 497 with the NUL, against a 480-byte buffer. It sat at 432/480 on this repo, so it was one new header
+        // attribute away from truncating — and a cut here deletes the trailing ` -->`, which turns the ENTIRE
+        // document into one unterminated comment. Composed on std::string, the margin question disappears.
+        std::string stats = "<!-- files=";
+        stats += std::to_string( ing.files.size() );
+        stats += " symbols=";    stats += std::to_string( S );
+        stats += " edges=";      stats += std::to_string( outTargets.size() );
+        stats += " shown=";      stats += std::to_string( ann.stubSymbols ? std::size_t( 0 ) : keep );   // C1-b: the stub prints no row
+        stats += " est_tokens="; stats += std::to_string( estTokens );
+        if( estimate.isModelled )
+        {
+            stats += " est_measured=0";   // the number beside it is the model (MapEstimate); absent ⇒ measured
+        }
+        stats += " ambiguous=";  stats += std::to_string( ambTotal );
+        stats += " unresolved="; stats += std::to_string( unresolvedTotal );
+        if( locPinTotal > 0 )                                  // absent when 0 — zero bytes on a pin-free corpus
+        {
+            stats += " locality_pinned=";  stats += std::to_string( locPinTotal );
+        }
+        if( externalCalls > 0 )                                // Phase 5: same absent-when-0 rule
+        {
+            stats += " external=";  stats += std::to_string( externalCalls );
+        }
+        if( declinedTotal > 0 )                                // tier-3 declines: same rule, after external= so no adjacency moves
+        {
+            stats += " declined=";  stats += std::to_string( declinedTotal );
+        }
+        // The two parse-honesty gauges follow the call-resolution family (ambiguous= .. declined=), in this order,
+        // so declined= stays adjacent to external= and the resolver's gauges read as one contiguous run.
+        if( extentSuspectTotal > 0 )                           // extent honesty: same absent-when-0 rule
+        {
+            stats += " extent_suspect_syms=";  stats += std::to_string( extentSuspectTotal );
+        }
+        if( macroBlankedFiles > 0 )                            // member-macro re-parse: same absent-when-0 rule
+        {
+            stats += " macro_blanked_files=";  stats += std::to_string( macroBlankedFiles );
+        }
+        stats += precAttr;  stats += rootsAttr;  stats += changedAttr;  stats += skippedAttr;  stats += unindexedAttr;
+        stats += ignoredAttr;  stats += escapedAttr;  stats += fitAttr;
+        stats += " order=";      stats += orderAttr;
+        stats += " -->";
+        return stats;
+    };
+    // --stable: volatile counts move to a TRAILING comment (out of the cacheable prefix) — unless the caller
+    // asked for the first-screen placement (§B6 M10, the MCP analyze verb), in which case they stay here and
+    // the trailing copy is suppressed. Exactly one of the two builders emits `stats`.
+    const auto buildHead = [ & ]( std::size_t estTokens ) -> std::string
+    {
+        std::string h = legend;
+        if( estimate.isModelled )
+        {
+            h += kEstModelledLegend;
+        }
+        if( !stable || statsFirstScreen )
+        {
+            h += buildStats( estTokens );
+        }
+        // r26-stamp Task A: ` at="..."` ONLY when the caller passed a non-empty stamp (--map-diff); every other
+        // caller passes nullptr, so the hot default-map path pays a pointer compare, not a git call. at= stays
+        // FIRST — the `<r at="<sha>` byte sequence gitstampcheck.sh pins is unchanged.
+        h += "<r";
+        if( mapAtStamp != nullptr && !mapAtStamp->empty() ) { h += " at=\"";  h += *mapAtStamp;  h += "\""; }
+        // R-E: after at= (so gitstampcheck's `<r at="<sha>` byte sequence is unmoved), same slot --grep uses
+        // right after its own identifying attributes — the crawl root every <f p=…> below is now RELATIVE to.
+        if( !rootArg.empty() ) { h += " root=\"";  h += escapeXml( rootArg, esc );  h += "\""; }
+        // M20: the seeded-verb stanza, after root= and before the ranker attributes. Absent (and therefore
+        // byte-free) on every map that had no seed.
+        if( !ann.seed.of.empty() )
+        {
+            h += " of=\"";      h += escapeXml( ann.seed.of, esc );        h += "\"";
+            h += " depth=\"";   h += std::to_string( ann.seed.depth );     h += "\"";
+            h += " fanout=\"";  h += std::to_string( ann.seed.fanout );    h += "\"";
+            if( ann.seed.defs > 1 ) { h += " defs=\"";  h += std::to_string( ann.seed.defs );  h += "\""; }
+            h += unprovenDefsAttrXml( ann.seed.unprovenDefs );   // H1: beside defs=, the rest of what the seed name resolved to
+            h += seedBiteAttrs( ann.seed );   // C2: each bound's BITE, right after the bound it qualifies (empty when neither bit)
+        }
+        // §A9.6: after at= (so gitstampcheck's `<r at="<sha>` byte sequence is unmoved) — see MapAnnotations.
+        if( churnWindow != nullptr ) { h += " rank_by=\"";  h += ann.churnRankLabel;  h += "\" window=\"";  h += escapeXml( *churnWindow, esc );  h += "\""; }
+        // §B2.1: the windowless rankers stamp the same attribute in the same slot. `else if` states the
+        // exclusivity the caller guarantees, so a future edit that fills both cannot emit rank_by= twice.
+        else if( ann.rankByLabel != nullptr ) { h += " rank_by=\"";  h += ann.rankByLabel;  h += "\""; }
+        // §P8: est_tokens as a MACHINE-READABLE root attribute. The map reported its own size only inside the
+        // comment above, and a conformant parser may discard comments — so the number a budget-aware caller most
+        // needs was unreachable. Additive: the comment is kept, and this carries the SAME `estTokens` value
+        // (one estimator). --stable omits it on the precedent of the k= rank attribute below: --stable buys a
+        // byte-stable PREFIX, the root element is that prefix, and est_tokens is globally volatile.
+        if( !stable ) { char estAttr[ 40 ];  rw::formatTo( estAttr, sizeof( estAttr ), " est_tokens=\"{}\"", estTokens );  h += estAttr; }
+        if( !stable && estimate.isModelled ) { h += " est_measured=\"0\""; }   // beside the number it qualifies (MapEstimate)
+        // W2-F: LAST on the root, after est_tokens — the same placement rule counts_floor= follows, so no
+        // existing attribute-ADJACENCY assertion in test/ can break on it. Unlike est_tokens this is NOT
+        // suppressed under --stable: the iteration count is a property of the CORPUS and the ranker, not of
+        // the run's size, so it does not move between two runs over the same tree, and a byte-stable prefix
+        // that hides "this ranking is unfinished" would be a cache optimisation buying silence.
+        h += renderDisclosure( ann.prDisclosure, DiscloseAs::XmlAttrs );
+        // H14 (capture-audit 2026-09-04): --stable's omissions, DECLARED. Both are deliberate and both are
+        // argued for above — k= is globally volatile so dropping it is what buys the byte-stable prefix, and
+        // est_tokens= follows it for the same reason. But an agent reading a --stable map (which is what
+        // every MCP `analyze` call gets) saw 185 rows with no rank attribute and nothing saying the score
+        // exists elsewhere: membership is by PageRank, the emitted order is by file, and the score was
+        // simply gone. lens= names what is missing, so "absent" reads as "not served here", never as "not
+        // computed". Gate: test/mcpattrparitycheck.sh, whose lens= arm also fails on a stale name.
+        if( stable ) { h += " lens=\"k,est_tokens\""; }
+        // L3 follow-up (CodeRabbit 4053600616): TRULY last, past every pre-existing attribute — same placement
+        // rule as lens= just above, so no attribute-adjacency assertion in test/ can break on it.
+        if( ann.notesDegraded ) { h += notes::kNotesDegradedAttr; }
+        h += ">";
+        return h;
+    };
+    const auto buildTail = [ & ]( std::size_t estTokens ) -> std::string
+    {
+        return ( stable && !statsFirstScreen ) ? buildStats( estTokens ) : std::string{};
+    };
+
+    // ── PHASE 1: render <r>'s CHILDREN into a buffer ────────────────────────────────────────────────────
+    // §H7: est_tokens must charge the bytes the document actually carries, not a model of the symbol set —
+    // the model prices neither --metrics decoration nor an appended payload, which is how one number came to
+    // stand for five documents. So: measure, decide, then write (the order --recall's emitRecallBudgeted and
+    // the --for lens's pre-rendered sigs block already impose on themselves).
+    //
+    // DEGRADE: an open_memstream failure keeps the whole map — the head goes out FIRST carrying the MODELLED
+    // estimate (the pre-§H7 number, so this path is no worse than the old behaviour, never a fabricated one)
+    // and the children stream straight to `out` behind it.
+    rw::MemoryStream childStream;
+    std::FILE* const childMem = openChargeStream( childStream );
+    if( !childMem )
+    {
+        DISCLOSE( estimate, MapEstimate::DisclosureWhy::ChargeBufferFailed, "serialize: open_memstream failed — est_tokens reports the MODELLED bytes, not the emitted ones" );
+    }
+
+    const std::size_t modelledTokens = mapEstTokens + extraPayloadTokens;
+    // The children, as ONE renderer both paths call. This was inline code writing through a writer bound to "the buffer,
+    // or `out` when the buffer could not open". That serves a failed open, and cannot serve a buffer that opened and then
+    // lost a write: by then the children were already spent into it, and the only bytes left to print had a hole in them.
+    const auto writeChildren = [ & ]( XmlWriter& w )
+    {
+        // §P8 collision: this prologue spelled its LABEL `l=`, the two characters 22 other sites use for a LINE
+        // NUMBER — including the <f p= …> rows just below. Renamed: the label had exactly two references in the
+        // tree (both updated here) against 15+ readers of the line-number meaning that must not move.
+        if( ing.rootLabels.size() >= 2 )
+        { // A13 prologue: label → root path, canonical order
+            for( std::size_t r = 0; r < ing.rootLabels.size(); ++r )
+            {
+                w.write( "<root label=\"" );  w.write( escapeXml( ing.rootLabels[r], esc ) );
+                w.write( "\" p=\"" );     w.write( escapeXml( r < ing.rootPaths.size() ? ing.rootPaths[r] : std::string(), esc ) );
+                w.write( "\"/>" );
+            }
+        }
+        writeRecentRows( w, ann, pathRel, esc );   // F3: rank_by=churn-decay's file-level answer, before the symbol map
+        // C1-b: under in=DIR the symbol map is a DISCLOSED stub (docs/METHODOLOGY.md §9.3) — the caller asked for DIR's
+        // recent files, not the map.
+        //
+        // NOT total=/shown=, which is what this first shipped as. Under pageview.h's vocabulary total= is THE TOTAL
+        // (rule 2) and capped= always rides beside a shown= (rule 3), and the stub had neither property: it printed
+        // total="200" — the --top-k PAGE SIZE — on a document whose own header says symbols="18457", with no capped=,
+        // so the one number it carried was the one number it was not allowed to mean. The stub is not a page of the map
+        // and it must not borrow the page vocabulary to say so. It says what it IS instead:
+        //   stubbed="1"     the symbol map was not rendered at all (the <f> loop walks an empty order below)
+        //   would_show="N"  `keep` — the un-stubbed header's own shown=, and shown= counts symbol DEFINITIONS
+        //                   individually, not printed rows: the print loop runs collapseOverloadRows() per file
+        //                   bucket, so a const/non-const pair that both make the top-K cut prints ONE row carrying
+        //                   overloads=2. The row count therefore FOLLOWS from the identity the map legend already
+        //                   publishes for shown= — rows+sum(overloads-1)=shown — rather than being reported here.
+        //                   Measured on this repo 2026-09-14: shown=200, 193 <s> rows, 7 at overloads=2, 193+7=200.
+        //                   IT IS A DEFINITION COUNT AND NOT A CEILING, by owner decision 2026-09-14, and the
+        //                   reason is vocabulary: in this tool a floor/ceiling marker means "we could not see
+        //                   everything" (counts_floor=, _capped, the truncation disclosures). would_show is EXACT;
+        //                   what differs from a reader's guess is the UNIT. Spending an uncertainty marker on a
+        //                   unit difference would make "ceiling" mean "exact, but not in the unit you assumed" and
+        //                   weaken every honest use of the word elsewhere in the output. Naming the quantity is
+        //                   also the stronger claim: a ceiling cannot be inverted, while a definition count plus
+        //                   the published identity yields the rows. Reporting post-collapse rows instead — the
+        //                   review's original ask — is not available at this site for any price worth paying:
+        //                   which definitions survive the cut is a fact about the RANKING, and not ranking is the
+        //                   whole point of the stub (no pr_iters= rides its header). Not the corpus total either
+        //                   (that is symbols=), so the three cannot be read as each other.
+        //                   test/recentscopecheck.sh arms 14a/14b pin the arithmetic.
+        // Rule 3's own sentence sanctions the shape: "If a verb emits no shown=, it emits no capped= either."
+        if( ann.stubSymbols )
+        {
+            std::string stub = "<symbols stubbed=\"1\" would_show=\"";   // std::string, not a char[]: next= is already-markup (fixedbufsweep's rule)
+            stub += std::to_string( keep );   // `keep` is computed above from topK and S alone — the count with no ranking behind it
+            stub += "\"";
+            stub += nextAttrXml( ann.stubNext );
+            stub += "/>";
+            w.write( stub );
+        }
+        static const std::vector<std::uint32_t> kNoFiles;
+        for( std::uint32_t f : ann.stubSymbols ? kNoFiles : fileOrder )
+        {
+            w.write( "<f p=\"" );  w.write( escapeXml( pathRel( f ), esc ) );  w.write( "\"" );
+            if( const char* fl = builtinLayer( rootRelPath( ing, f ) ); *fl ) { w.write( " layer=\"" );  w.write( fl );  w.write( "\"" ); }   // P3
+            w.write( ">" );
+
+            // §P6.3: see collapseOverloadRows() above — const/non-const overload pairs are already folded to
+            // one representative row per (kind,id) before this loop runs, so the loop body below is unchanged
+            // shape (no added branch): it just iterates a shorter vector.
+            const OverloadRows rows = collapseOverloadRows( ing, buckets[f] );
+
+            for( std::size_t i = 0; i < rows.id.size(); ++i )
+            {
+                const NodeId         id  = rows.id[i];
+                const Symbol&        s   = ing.symbols[id];
+                const std::uint32_t  out = outOff[id + 1] - outOff[id];
+                w.write( "<s t=\"" );  w.write( symTag( s.kind ) );
+                w.write( "\" n=\"" );  w.write( escapeXml( s.name, esc ) );  w.write( "\"" );   // close n="…" here so sc= can follow
+
+                // S6-C / row 6 (2026-09-12): the SHORT id. The canonical SCIP-style id is `path::scope::name`, and
+                // on a map row the path is the enclosing <f p=> verbatim — 942 of 942 scoped rows on this tree
+                // repeated it, 11.2% of a flagless map. The row now prints ONLY the segment the wrapper does not
+                // carry: sc= the enclosing scope. The legend states the composition (id = p::sc::n), the selectors
+                // keep accepting the composed spelling, and test/scroundtripcheck.sh proves the composed multiset is
+                // byte-identical to the id= multiset this row used to print. Emitted ONLY when a scope exists —
+                // exactly when the canonical id differed from the bare name (canonicalId degrades to the name on an
+                // empty scope), so the row set that carries an identity attribute is unchanged.
+                writeScopeAttr( w, s, esc );
+
+                w.write( overloadsAttr( rows.overloads[i] ) );   // see overloadsAttr() above — empty in the common case
+
+                // A4-R5: bind="pkg.Cls.method" — the decoded JNI binding label (graph.h g.bindLabel), when this
+                // symbol has one. Unconditional (not --metrics-gated): it is an identity fact like id=, not a
+                // descriptive stat. Omitted whenever bind is nullptr or the per-symbol label is empty (the
+                // overwhelming common case) → zero token cost, byte-identical golden map on non-JNI corpora.
+                if( bind && id < bind->size() && !(*bind)[id].empty() )
+                {
+                    w.write( " bind=\"" );  w.write( escapeXml( (*bind)[id], esc ) );  w.write( "\"" );
+                }
+
+                char ambs[ 48 ];  ambs[ 0 ] = '\0';   // "fast guessed K of this symbol's call targets — read source"
+                // amb= (≤ 17 B) then lpin= (≤ 18 B) in ONE buffer, each absent when 0. The cursor is the OUT
+                // POINTER, never a would-have-written length: lpin= is written AT the offset the first write
+                // ended, so a count an implementation computed rather than wrote would place it inside the
+                // half-written amb= attribute. Same defect class as the appendf clamps below.
+                char*       ap = ambs;
+                char* const ae = ambs + sizeof( ambs );
+                if( const std::uint32_t ambK = counterAt( ambOut, id ); ambK > 0 )
+                {
+                    ap  = std::format_to_n( ap, ( ae - ap ) - 1, " amb=\"{}\"", ambK ).out;
+                    *ap = '\0';
+                }
+                if( const std::uint32_t lpinK = counterAt( locPinOut, id ); lpinK > 0 )   // Phase 4: the disclosed locality pin
+                {
+                    ap  = std::format_to_n( ap, ( ae - ap ) - 1, " lpin=\"{}\"", lpinK ).out;
+                    *ap = '\0';
+                }
+
+                // PageRank k= is GLOBALLY volatile (any edit perturbs every rank) → omit it in --stable mode
+                // so the prefix stays byte-identical for unedited files (provider KV-cache hits). Default keeps k=.
+                char kbuf[ 24 ];  kbuf[ 0 ] = '\0';
+                if( !stable )
+                {
+                    rw::formatTo( kbuf, sizeof( kbuf ), " k=\"{:.4f}\"", double( rank[id] ) );
+                }
+
+                // Q-compute descriptive attrs (loc/params/nest/locals/cbo/lcom4/tested), built into a side buffer
+                // that is appended before the closing '>' of the metrics attr. ALL --metrics-only; absent by
+                // default so the golden map is byte-identical. params/nest/locals emitted only for fns/methods
+                // (kind guard) so a class/sec never carries a 0 it can't have; lcom4 only for class-kinds with
+                // methods (kLcom4NA sentinel omits) — mutually exclusive with the fn/method group, which is why
+                // the buffer sizing below only has to cover ONE of the two groups' worst case, not both summed.
+                // 96 -> 160 (Phase 1, local-variable-indexing, docs/LOCALS_INDEXING.md): the fn/method worst
+                // case grew by locals="4294967295" locals_floor="1" (38 B) on top of the pre-existing
+                // loc+params+nest+cbo+amp+tested run (~88 B) — 96 would silently TRUNCATE (appendf's qe-clamp
+                // makes truncation safe from a buffer-overrun standpoint, but a truncated attr run is malformed
+                // XML, not a degrade worth shipping quietly). 160 -> 192 (ppalt disclosure): ppalt="65535"
+                // (+14 B) put the summed fn/method worst case within a rounding error of 160; 192 restores the
+                // same real headroom over the recomputed worst case.
+                char qbuf[ 192 ];  qbuf[ 0 ] = '\0';
+                if( metrics )
+                {
+                    char* qp = qbuf; char* const qe = qbuf + sizeof( qbuf );
+                    // A4-F8: snprintf returns the WOULD-HAVE-written length; on truncation `qp += ret` pushes qp
+                    // PAST qe, then the next size_t(qe-qp) underflows to a huge size → unbounded stack write. Clamp
+                    // qp to qe after every append (once full, further appends write nothing and stay clamped).
+                    // fmt is always a string literal at every call site below — the non-literal warning is
+                    // an artifact of routing it through the lambda parameter
+                    // rw::formatTo reproduces snprintf's contract EXACTLY, so the A4-F8 clamp below is kept
+                    // verbatim: it is applied to the same would-have-written length, and truncation therefore
+                    // happens at the same byte it always did.
+                    //
+                    // The obvious-looking rewrite — `qp = std::format_to_n( qp, qe - qp, ... ).out` — is WRONG,
+                    // and wrong in a way no fixture catches. snprintf( p, S, ... ) writes at most S-1 characters
+                    // PLUS a NUL; format_to_n( p, S, ... ) writes up to S and terminates nothing. It buys one
+                    // extra byte of room and drops the terminator. Measured 2026-09-09: that version emitted a
+                    // row carrying amp="1" where every previous release truncated it away, on test/ as the
+                    // corpus. The byte fence was green throughout — the fixture's attribute strings never reach
+                    // this 80-byte buffer, so only a differential run against the pre-conversion binary on a
+                    // REAL tree exposed it.
+                    //
+                    // What the conversion does keep: -Wformat-security is gone, because std::format_string
+                    // preserves compile-time checking THROUGH the lambda parameter where a const char* fmt
+                    // could not.
+                    const auto appendf = [ & ]< class... A >( std::format_string<A...> fmt, A&&... args )
+                    {
+                        // Bound by the OUT POINTER, never by a would-have-written length. std::format_to_n's
+                        // `out` is clamped to the n it was given on any implementation; its `size` is a
+                        // would-have-written count that an implementation can get wrong, and this clamp used
+                        // to depend on it. n is (qe-qp)-1 so the NUL below always lands in bounds, which is
+                        // snprintf's "at most S-1 characters plus a terminator", byte for byte.
+                        if( qp < qe )
+                        {
+                            const auto r = std::format_to_n( qp, ( qe - qp ) - 1, fmt, std::forward<A>( args )... );
+                            qp  = r.out;
+                            *qp = '\0';
+                        }
+                    };
+                    // loc: physical line span — always meaningful (SIZE is the master variable — report it first).
+                    if( s.loc > 0 )
+                    {
+                        appendf( " loc=\"{}\"", s.loc );
+                    }
+                    const bool isFn = ( s.kind == SymKind::Function || s.kind == SymKind::Method );
+                    if( isFn )
+                    {
+                        appendf( " params=\"{}\"", unsigned( s.params ) );
+                        appendf( " nest=\"{}\"", unsigned( s.maxNest ) );
+                        // The nesting PROFILE beside the max (model.h Symbol::humps/deepLoc). nest= alone cannot
+                        // distinguish a long run of shallow scoped steps from a body that sustains depth — both
+                        // report their deepest line and nothing about how much of the function is that deep.
+                        // Omitted, never a bare 0, when no region reached quality::kNestBar: that is exactly
+                        // nest < kNestBar, which the row already carries, so absence is lossless rather than a
+                        // truncation (test/nestprofilecheck.sh arm 5 pins the equivalence in both directions).
+                        if( s.humps > 0 )
+                        {
+                            appendf( " humps=\"{}\" deep=\"{}\" deep_floor=\"1\"", unsigned( s.humps ), unsigned( s.deepLoc ) );
+                        }
+                        // Phase 1 (local-variable-indexing, docs/LOCALS_INDEXING.md): locals= is ABSENT — never
+                        // a bare "0" — for every def outside model.h's localsCountedLang (MVP: C/C++ only), so a
+                        // reader never mistakes "not counted for this language" for "counted, and there are none".
+                        // locals_floor="1" always rides alongside a present locals=: `int a,b;` counts as ONE
+                        // declaration-statement, not two names (see cc_isCountableLocalDecl's own comment).
+                        if( localsCountedLang( s.lang ) )
+                        {
+                            appendf( " locals=\"{}\" locals_floor=\"1\"", unsigned( s.locals ) );
+                        }
+                        // ppalt disclosure: the body carries preproc branches that never coexist at compile
+                        // time, so this row's structural metrics are sums over ALL of them (model.h Symbol::
+                        // ppAlt). ABSENT when 0 — presence itself is the signal.
+                        if( s.ppAlt > 0 )
+                        {
+                            appendf( " ppalt=\"{}\"", unsigned( s.ppAlt ) );
+                        }
+                    }
+                    if( cbo && id < cbo->size() )
+                    {
+                        appendf( " cbo=\"{}\"", (*cbo)[id] );
+                    }
+                    if( lcom4 && id < lcom4->size() && ( *lcom4 )[id] != 0xFFFFFFFFu )
+                    { // 0xFFFFFFFF = kLcom4NA (graph.h) ⇒ omit
+                        appendf( " lcom4=\"{}\"", (*lcom4)[id] );
+                    }
+                    if( amp && id < amp->size() )
+                    {
+                        appendf( " amp=\"{}\"", (*amp)[id] );
+                    }
+                    if( tested && id < tested->size() && ( *tested )[id] )
+                    { // omit when 0 (lean output)
+                        appendf( " tested=\"1\"" );
+                    }
+                }
+
+                char attr[ 352 ];   // descriptive metric attrs (fan-in/out/cx/role/amb/lpin + Q-compute qbuf) — facts, never
+                                    // gates. The name quote + id= are already written above; this opens with a space.
+                                    // The closing '>' is written separately below so the ev run — composed on
+                                    // std::string, never a fixed char buffer (fixedbufsweep's own rule: ev_why= is
+                                    // variable-length text) — can sit inside the element.
+                if( metrics && fanIn )
+                {
+                    const std::uint32_t in = ( id < fanIn->size() ) ? (*fanIn)[id] : 0u;
+                    rw::formatTo( attr, sizeof( attr ), " in=\"{}\" out=\"{}\" cx=\"{}\" ccx=\"{}\"{}{}{}{}",
+                                   in, out, s.cx, s.ccx, ( in >= 8 ? " role=\"hub\"" : "" ), rw::cstr( qbuf ), rw::cstr( ambs ), rw::cstr( kbuf ) );
+                }
+                else
+                {
+                    rw::formatTo( attr, sizeof( attr ), "{}{}", rw::cstr( ambs ), rw::cstr( kbuf ) );
+                }
+                w.write( attr );
+                // EXTENT HONESTY (kExtentSuspectRowLegend): the containment checks this row's extent/scope/kind failed.
+                // After k= so every pre-existing adjacency holds; absent when every check held (clean corpora unchanged).
+                if( s.extentSuspect != 0 )
+                {
+                    w.write( " extent_suspect=\"" );
+                    w.write( extent::extentSuspectReasons( s.extentSuspect ) );
+                    w.write( "\"" );
+                }
+                // Essential complexity (model.h Symbol::ev), --metrics only. Emitted iff ev >= 2: ev >= 1 for any
+                // walked fn/method body, so on a row carrying cx= ABSENT means exactly ev == 1 — lossless in the
+                // strictest sense, and never a bare ev="1" (G4 + the honesty contract point the same way). Routed
+                // through evCountedLang so an uncovered language (Bash) reads as "not counted", never "counted, 1".
+                // ev_floor="1" always rides along: noreturn calls, macro-hidden returns and unresolvable gotos are
+                // invisible to the syntactic walk and can only RAISE the true value. ev_why= is the reason
+                // breakdown that keeps §10.1-Option-A honest (a guard-heavy row is visibly not a knot).
+                if( metrics && ( s.kind == SymKind::Function || s.kind == SymKind::Method ) && evCountedLang( s.lang ) && s.ev >= 2u )
+                {
+                    std::string evRun = " ev=\"" + std::to_string( s.ev ) + "\" ev_floor=\"1\" ev_why=\"" + evWhyString( s ) + "\"";
+                    w.write( evRun );
+                }
+                w.write( ">" );
+
+                for( std::uint32_t e = outOff[id]; e < outOff[id + 1]; ++e )
+                {
+                    w.write( "<c n=\"" );
+                    w.write( escapeXml( ing.symbols[ outTargets[e] ].name, esc ) );
+                    // A4-R5: prov="scip" on a SCIP-pinned (precise) edge, prov="binding" on an FFI
+                    // binding-table edge (pybind/extern-C/JNI), prov="import" on an ES named-import edge whose
+                    // module AND export the source named. C1: prov="split" on one arm of a k-way split the
+                    // resolver could not choose between. Absent = name-based AND uniquely resolved (the common case
+                    // → zero token cost). outProv parallels outTargets exactly, so index `e` is the same edge.
+                    //
+                    // C1, and this is the whole point of the marker: `amb="K"` on the enclosing <s> says K of this
+                    // symbol's CALLS were guesses and cannot say WHICH edges, so a consumer honouring the honesty
+                    // signal had to distrust every <c> child. prov="split" names the arms, and the suspect set
+                    // becomes the guessed edges and nothing else.
+                    if( outProv && e < outProv->size() && ( *outProv )[e] )
+                    {
+                        w.write( "\" prov=\"" );
+                        w.write( provLabel( ( *outProv )[e] ) );
+                    }
+                    w.write( "\"/>" );
+                }
+                w.write( "</s>" );
+            }
+            w.write( "</f>" );
+        }
+        w.write( "</r>" );
+    };
+    // DEGRADE, one path for both failures: the head goes out FIRST carrying the MODELLED estimate (the pre-§H7 number, so
+    // no worse than the old behaviour and never a fabricated one), the children stream straight to `out` behind it, then
+    // the trailing summary. The whole map, uncharged.
+    const auto emitModelled = [ & ]()
+    {
+        XmlWriter direct( out );
+        direct.write( buildHead( modelledTokens ) );
+        writeChildren( direct );
+        direct.write( buildTail( modelledTokens ) );   // trailing volatile summary — kept out of the byte-stable prefix
+        direct.flush();
+        if( outEstTokens )
+        {
+            *outEstTokens = modelledTokens;
+        }
+    };
+    if( !childMem )
+    {
+        emitModelled();
+        return;
+    }
+
+    // ── PHASE 2: measure, decide, then write ────────────────────────────────────────────────────────────
+    // The children go into the buffer, and the writer flushes BEFORE the memstream is finished (its destructor flushes
+    // again at the end of the block, with nothing left to write). A buffer that did not finish whole means a write was
+    // lost INSIDE the children (rw::MemoryStream::finish), so those bytes are never printed: the map is rendered again,
+    // straight to `out`, on the modelled path a failed open takes.
+    {
+        XmlWriter w( childMem );
+        writeChildren( w );
+        w.flush();
+    }
+    const rw::MemoryStreamBytes children = childStream.finish();
+    if( !children.isWhole )
+    {
+        DISCLOSE( estimate, MapEstimate::DisclosureWhy::ChargeBufferFailed,
+                  "serialize: the charge buffer did not finish whole — the map is rendered again, est_tokens reports the MODELLED bytes" );
+        emitModelled();
+        return;
+    }
+    const std::string_view childrenStr = children.bytes;   // owned by childStream, alive to the end of this function
+
+    // The fixpoint: est_tokens covers head + children + tail, and head/tail both PRINT est_tokens, so the
+    // digit count feeds back. Converges in ≤2 passes in practice (each extra digit moves the estimate by
+    // <1 token); the bound is 4, matching recall.h's.
+    //
+    // WHAT THE LOOP GUARANTEES (CA4 verifier L4 — the previous wording claimed an equality this loop does not
+    // deliver): the LAST built pair is always the pair emitted, and ON CONVERGENCE — the `break`, i.e. the
+    // number stopped moving — that pair's own bytes are exactly the bytes `estTokens` was measured over, so the
+    // document's stated number describes the document. On the BOUND (4 passes without convergence, not observed
+    // on any measured corpus) the emitted head/tail were rebuilt from the last `next` while `next` was measured
+    // over the PREVIOUS pair's widths, which differ only in the digit count of one field: at most a few bytes,
+    // i.e. a residual well under one token, and never a fabricated number. The honest statement is "converged ⇒
+    // exact; bounded ⇒ within a digit's worth of bytes", not "always exact".
+    std::size_t estTokens = modelledTokens;
+    std::string head      = buildHead( estTokens );
+    std::string tail      = buildTail( estTokens );
+    for( int pass = 0; pass < 4; ++pass )
+    {
+        const std::size_t next = tokensForEmittedBytes( head.size() + childrenStr.size() + tail.size(),
+                                                        mapEst.bytesPerToken() ) + extraPayloadTokens;
+        if( next == estTokens )
+        {
+            break;
+        }
+        estTokens = next;
+        head      = buildHead( estTokens );
+        tail      = buildTail( estTokens );
+    }
+    if( outEstTokens )
+    {
+        *outEstTokens = estTokens; // --token-budget reads THIS value — never a second counter
+    }
+
+    std::fwrite( head.data(), 1, head.size(), out );
+    std::fwrite( childrenStr.data(), 1, childrenStr.size(), out );
+    if( !tail.empty() )
+    {
+        std::fwrite( tail.data(), 1, tail.size(), out );
+    }
+}
+
+// --pack-top-n: append raw source of the top-N files (by aggregate symbol rank),
+// as CDATA, capped at budgetBytes; the last file is truncated at a newline with a marker.
+// Emitted AFTER </r> — a hybrid graph+source bundle (intentionally not a single XML doc).
+//
+// §B10.1 (W3-N1's discipline, extended): `redact` is REQUIRED — no default. Raw file source is the widest
+// credential seam this binary has, so a caller must state which run it belongs to; nullptr = --no-redact,
+// spelled deliberately. Both call sites already passed it, so this costs nothing and buys the compile error.
+inline void packSource( std::FILE* out, const IngestResult& ing, const std::vector<float>& rank,
+                        int topN, std::size_t budgetBytes, RedactCounts* redact )
+{
+    const std::size_t F = ing.files.size();
+    std::vector<float> fileRank( F, 0.f );
+    for( const Symbol& s : ing.symbols )
+    {
+        fileRank[s.fileId] += rank[s.id];
+    }
+
+    std::vector<std::uint32_t> order( F );
+    for( std::uint32_t i = 0; i < F; ++i )
+    {
+        order[i] = i;
+    }
+    sortutil::radixSortByScoreDescId( order, fileRank );
+
+    XmlWriter         w( out );
+    std::vector<char> esc;
+    std::size_t       used = 0;
+    const std::size_t keep = std::min<std::size_t>( topN > 0 ? std::size_t( topN ) : 0, F );
+
+    for( std::size_t k = 0; k < keep && used < budgetBytes; ++k )
+    {
+        std::FILE* in = std::fopen( diskPath( ing, order[k] ).c_str(), "rb" );
+        if( !in )
+        {
+            continue; // graceful: file gone
+        }
+
+        std::string body;
+        char        buf[ 4096 ];
+        std::size_t n;
+        while( ( n = std::fread( buf, 1, sizeof( buf ), in ) ) > 0 )
+        {
+            body.append( buf, n );
+        }
+        std::fclose( in );
+
+        bool truncated = false;
+        if( used + body.size() > budgetBytes )                 // truncate at a newline + UTF-8 boundary
+        {
+            const std::size_t room = budgetBytes - used;
+            std::size_t cut = body.rfind( '\n', room );
+            if( cut == std::string::npos )
+            {
+                cut = room;
+            }
+            // never cut mid-codepoint: back off any UTF-8 continuation bytes (10xxxxxx) so the
+            // CDATA stays valid UTF-8 (otherwise xmllint / the G4 guardrail rejects it)
+            while( cut > 0 && ( static_cast<unsigned char>( body[cut] ) & 0xC0 ) == 0x80 )
+            {
+                --cut;
+            }
+            body.resize( cut );
+            truncated = true;
+        }
+
+        // Redact credential shapes from the raw file body BEFORE CDATA-encoding — this is a
+        // body-emission seam (whole source files pasted into an LLM). Applied post-truncation (redaction
+        // only ever shrinks/relabels, never grows past the budget in a way that matters). No-op under --no-redact.
+        redactInPlace( body, redact );
+
+        std::string safe;  safe.reserve( body.size() );        // split ]]>; scrub C0 controls (G4) + invalid UTF-8 (A4-F20)
+        appendCdataSafe( body, safe );
+
+        w.write( "<src p=\"" );  w.write( escapeXml( ing.files[ order[k] ], esc ) );  w.write( "\"><![CDATA[" );
+        w.write( safe );
+        if( truncated )
+        {
+            w.write( "\n<!-- truncated -->" );
+        }
+        w.write( "]]></src>" );
+        used += safe.size();   // charge EMITTED CDATA bytes (post ]]> expansion), not raw body
+    }
+    w.flush();
+}
+
+// clean a signature slice [a,b): stop at the body '{' or the prototype-terminating ';', collapse
+// whitespace runs to single spaces, cap length. Shared by --pack-signatures and the Lego contract.
+//
+// §B0 family (W3-N1): a SIGNATURE is emitted text too — a default argument carries whatever literal the
+// author wrote (`int f( const char* key = "AKIA…" )`), so this is a credential seam exactly like a doc
+// comment or a body. `redact` is REQUIRED (no default): every present and future call site must state
+// which run it belongs to, so a new sig-emitting clone cannot silently opt out. nullptr = --no-redact,
+// the same convention redactInPlace already has.
+//
+// Order matters twice: redaction runs on the EMITTED extent (the prefix before '{' / ';') so a secret
+// inside a body we never print is not counted, and it runs BEFORE the kMaxSig cap so a secret straddling
+// the cap cannot survive as a half-visible prefix.
+inline std::string cleanSig( const char* data, std::size_t a, std::size_t b, RedactCounts* redact )
+{
+    std::string_view raw( data + a, b - a );
+    if( const std::size_t stop = raw.find_first_of( "{;" ); stop != std::string_view::npos )
+    {
+        raw = raw.substr( 0, stop );
+    }
+
+    std::string redacted;
+    if( redact != nullptr && redactSecrets( raw, redacted, *redact ) )
+    {
+        raw = redacted;
+    }
+
+    constexpr std::size_t  kMaxSig = 240;
+    std::string            sig;  sig.reserve( raw.size() < kMaxSig ? raw.size() : kMaxSig );
+    bool                   inSpace   = false;
+    bool                   truncated = false;
+    for( char c : raw )
+    {
+        if( c == ' ' || c == '\t' || c == '\n' || c == '\r' )
+        { if( !sig.empty() && !inSpace ) { sig.push_back( ' ' ); inSpace = true; } }
+        else
+        {
+            // The hard cap. Collect ONE byte past it rather than stopping AT it: truncateUtf8WithEllipsis
+            // below does the codepoint back-off itself, and it can only see that a cut is owed when the
+            // string it is handed is longer than the cap. `truncated` carries the fact separately because
+            // the trailing-space trim below can pull a cut string back to exactly kMaxSig (a signature of
+            // exactly 240 bytes followed by a space, then more) — and a cut that trims back under the cap
+            // is still a cut. This is the cap that used to `break` here and return the prefix with NO
+            // marker at all, on EVERY emitted signature: --pack-signatures, --for's <sigs>, the <calls>
+            // callee rows, --lego's contract and impl rows. METHODOLOGY §9 #3, "never cut silently".
+            if( sig.size() > kMaxSig )
+            {
+                truncated = true;
+                break;
+            }
+            sig.push_back( c ); inSpace = false;
+        }
+    }
+    while( !sig.empty() && sig.back() == ' ' )
+    {
+        sig.pop_back();
+    }
+    // ONE truncator, the one the three OTHER signature cuts already call (kForTailSigBytes,
+    // kForCapTailSigBytes, packtask.h's tail sig): UTF-8-safe prefix + a visible U+2026. A signature is
+    // already a RENDERING rather than raw file bytes — the body is stripped, whitespace runs collapse — so
+    // the in-band marker is the house spelling here, and it costs 3 bytes only on a signature that was cut.
+    if( sig.size() > kMaxSig )
+    {
+        truncateUtf8WithEllipsis( sig, kMaxSig );
+    }
+    else if( truncated )
+    {
+        sig += "\xE2\x80\xA6";
+    }
+    return sig;
+}
+
+// purity hint from the signature alone (no ingest/cache change): `constexpr`/`consteval` (≈ provably
+// pure) or a trailing `const` qualifier after the parameter list (a const method — reads, doesn't
+// mutate `this`). A descriptive "safe to depend on" fact, not a proof. (constexpr never appears in a
+// parameter list, so the substring test is collision-free; the trailing-const test looks only past
+// the last ')', avoiding const-ref parameters like `const vector3f&`.)
+inline bool pureFromSig( const std::string& sig, Lang lang = Lang::Cpp )
+{
+    if( sig.find( "constexpr" ) != std::string::npos || sig.find( "consteval" ) != std::string::npos )
+    {
+        return true;
+    }
+    if( lang == Lang::Swift )
+    { // a non-`mutating` func doesn't mutate its value-type receiver (the const-equivalent);
+        return sig.find( "func " ) != std::string::npos && sig.find( "mutating" ) == std::string::npos;   // a hint — imprecise for class (reference-type) methods
+    }
+    const std::size_t rp = sig.rfind( ')' );   // C/C++/ObjC: a trailing `const` after the parameter list
+    return rp != std::string::npos && sig.find( "const", rp ) != std::string::npos;
+}
+
+// L2: the doc comment immediately above a definition — consecutive // /// //! //< lines, or a /* … */
+// (Doxygen /** */) block sitting directly above (only whitespace between). Flattened + capped. "" if none.
+// Lexical back-scan over the already-read source — no AST, no cache change. Human intent is the highest-
+// signal context per token (the whole reason for L2).
+inline std::string docCommentBefore( const std::string& src, std::size_t defStart )
+{
+    if( defStart == 0 || defStart > src.size() )
+    {
+        return {};
+    }
+    std::size_t lineStart = defStart;                                          // back up to the def's line start
+    while( lineStart > 0 && src[lineStart - 1] != '\n' )
+    {
+        --lineStart;
+    }
+    if( lineStart == 0 )
+    {
+        return {};
+    }
+
+    const auto strip = []( std::string_view l ) -> std::string_view           // drop leading ws + //,/// markers + a space
+    {
+        std::size_t t = 0;
+        while( t < l.size() && ( l[t] == ' ' || l[t] == '\t' || l[t] == '*' ) )
+        {
+            ++t;
+        }
+        while( t < l.size() && l[t] == '/' )
+        {
+            ++t;
+        }
+        while( t < l.size() && ( l[t] == '!' || l[t] == '<' || l[t] == '*' ) )
+        {
+            ++t;
+        }
+        if( t < l.size() && l[t] == ' ' )
+        {
+            ++t;
+        }
+        std::string_view r = l.substr( t );
+        while( !r.empty() && ( r.back() == ' ' || r.back() == '\t' || r.back() == '\r' ) )
+        {
+            r.remove_suffix( 1 );
+        }
+        if( r.size() >= 2 && r.back() == '/' && r[r.size() - 2] == '*' )
+        {
+            r.remove_suffix( 2 ); // trailing */
+        }
+        while( !r.empty() && ( r.back() == ' ' || r.back() == '\t' || r.back() == '*' ) )
+        {
+            r.remove_suffix( 1 );
+        }
+        return r;
+    };
+
+    std::vector<std::string_view> rev;                                        // comment lines, bottom-up
+    std::size_t cur = lineStart;
+    for( int guard = 0; cur > 0 && guard < 12; ++guard )
+    {
+        const std::size_t le = cur - 1;                                       // the '\n' ending the line above
+        std::size_t ls = le;
+        while( ls > 0 && src[ls - 1] != '\n' )
+        {
+            --ls;
+        }
+        std::string_view line( src.data() + ls, le > ls ? le - ls : 0 );
+        std::size_t tt = 0;
+        while( tt < line.size() && ( line[tt] == ' ' || line[tt] == '\t' ) )
+        {
+            ++tt;
+        }
+        const std::string_view tl = line.substr( tt );
+        const bool isLineComment  = tl.size() >= 2 && tl[0] == '/' && tl[1] == '/';
+        const bool isBlockPiece   = !tl.empty() && ( tl[0] == '*' || ( tl.size() >= 2 && tl[0] == '/' && tl[1] == '*' )
+                                                     || ( tl.size() >= 2 && tl[ tl.size() - 1 ] == '/' && tl[ tl.size() - 2 ] == '*' ) );
+        if( isLineComment || isBlockPiece )
+        {
+            rev.push_back( tl );
+            cur = ls;
+            if( tl.size() >= 2 && tl[0] == '/' && tl[1] == '*' )
+            {
+                break;
+            }
+        }
+        else
+        {
+            break; // first non-comment line → stop
+        }
+    }
+    if( rev.empty() )
+    {
+        return {};
+    }
+
+    std::string doc;
+    for( auto it = rev.rbegin(); it != rev.rend(); ++it )
+    {
+        const std::string_view piece = strip( *it );
+        if( piece.empty() )
+        {
+            continue;
+        }
+        if( !doc.empty() )
+        {
+            doc += ' ';
+        }
+        doc += std::string( piece );
+        if( doc.size() >= 200 )
+        {
+            // never cut mid-codepoint (G4): back off any UTF-8 continuation bytes at the cap, same rule
+            // as the packSource budget cut. (The decorative trailing-strip below happens to eat partial
+            // sequences too — its alnum test is ASCII-only — but make the guarantee explicit here.)
+            std::size_t cut = 200;
+            while( cut > 0 && ( static_cast<unsigned char>( doc[cut] ) & 0xC0 ) == 0x80 )
+            {
+                --cut;
+            }
+            doc.resize( cut );
+            break;
+        }
+    }
+    // strip decorative leading/trailing non-alphanumeric runs (── box dividers, ===, ***), keep the label
+    const auto alnum = []( char c ) { return ( c >= 'a' && c <= 'z' ) || ( c >= 'A' && c <= 'Z' ) || ( c >= '0' && c <= '9' ); };
+    std::size_t b0 = 0, b1 = doc.size();
+    while( b0 < b1 && !alnum( doc[b0] ) )
+    {
+        ++b0;
+    }
+    while( b1 > b0 && !alnum( doc[b1 - 1] ) )
+    {
+        --b1;
+    }
+    return doc.substr( b0, b1 - b0 );
+}
+
+// --compress (P2-B): strip block comments /* … */ and line comments // … from a body string, while
+// preserving comment-like text that appears INSIDE string or char literals.  Also collapses runs of
+// 3+ blank (whitespace-only) lines down to a single blank line, and drops leading-whitespace-only lines
+// that follow stripping (i.e. lines that contained only a comment and are now empty).
+//
+// Correctness guarantee: a "//" or "/*" that appears inside a "…" or '…' literal is NEVER treated as
+// a comment.  We track the lexer state through the following states:
+//   NORMAL       → default; comments and literals start here
+//   IN_STRING    → inside "…"; ends at an unescaped "
+//   IN_CHAR      → inside '…'; ends at an unescaped '
+//   IN_RAW       → inside R"delim(…)delim" (C++ raw string); ends at )delim"
+//   IN_LINE_CMT  → inside // …; ends at the next \n (the \n is kept so line count is preserved)
+//   IN_BLK_CMT   → inside /* … */; the entire span including markers is consumed
+//
+// NOTE: does NOT strip the <doc> doc-comment field — that is emitted separately by the call site and
+// is never passed into this function (only the raw body bytes [sigStartByte, endByte) are compressed).
+inline std::string compressBody( std::string_view src )
+{
+    // Phase 1: lex out comments, preserving content inside string/char literals.
+    //
+    //  output: the source with all comment content removed; literal content intact.
+    //  We output character-by-character into `out` for simplicity (the budget-capped
+    //  bodies are not huge — typically <200 KB — so quadratic string appending is fine).
+    std::string out;
+    out.reserve( src.size() );
+
+    const std::size_t N = src.size();
+    std::size_t       i = 0;
+
+    while( i < N )
+    {
+        const char c = src[i];
+
+        // ── String literal "…" ────────────────────────────────────────────────────────────
+        if( c == '"' )
+        {
+            // Check for C++ raw string R"delim(
+            if( i >= 1 && src[i - 1] == 'R' && ( i < 2 || src[i - 2] != '\\' ) )
+            {
+                // Raw string: collect delimiter between " and (
+                std::size_t j = i + 1;
+                std::string delim;
+                while( j < N && src[j] != '(' && src[j] != '\n' )
+                {
+                    delim += src[j++];
+                }
+                if( j < N && src[j] == '(' )
+                {
+                    // We're inside R"delim(...).  Copy everything verbatim until )delim"
+                    const std::string terminator = ")" + delim + "\"";
+                    out += src.substr( i, j - i + 1 );   // R"delim(
+                    i = j + 1;
+                    const std::size_t termLen = terminator.size();
+                    while( i < N )
+                    {
+                        if( i + termLen <= N && src.substr( i, termLen ) == terminator )
+                        {
+                            out += terminator;
+                            i += termLen;
+                            break;
+                        }
+                        out += src[i++];
+                    }
+                    continue;
+                }
+                // Not a raw string (malformed R"... without a paren) — fall through to
+                // regular string literal handling below.
+            }
+
+            // Regular double-quoted string literal.
+            out += c;  // emit the opening "
+            ++i;
+            while( i < N )
+            {
+                const char sc = src[i];
+                out += sc;
+                if( sc == '\\' && i + 1 < N ) { out += src[++i]; }   // escape: skip next char
+                else if( sc == '"' )
+                {
+                    break; // end of string
+                }
+                ++i;
+            }
+            ++i;   // step past the closing "
+            continue;
+        }
+
+        // ── Char literal '…' ──────────────────────────────────────────────────────────────
+        if( c == '\'' )
+        {
+            out += c;  // opening '
+            ++i;
+            while( i < N )
+            {
+                const char sc = src[i];
+                out += sc;
+                if( sc == '\\' && i + 1 < N ) { out += src[++i]; }
+                else if( sc == '\'' )
+                {
+                    break;
+                }
+                ++i;
+            }
+            ++i;
+            continue;
+        }
+
+        // ── Comment detection (only reached OUTSIDE string/char literals) ─────────────────
+        if( c == '/' && i + 1 < N )
+        {
+            // Line comment: // …  — consume to end of line, emit a newline to preserve line count.
+            if( src[i + 1] == '/' )
+            {
+                while( i < N && src[i] != '\n' )
+                {
+                    ++i;
+                }
+                // leave the \n to be emitted in the NORMAL branch below
+                continue;
+            }
+            // Block comment: /* … */ — consume entirely (no newline kept; blank lines handle the gap)
+            if( src[i + 1] == '*' )
+            {
+                i += 2;   // skip /*
+                while( i + 1 < N && !( src[i] == '*' && src[i + 1] == '/' ) )
+                {
+                    if( src[i] == '\n' )
+                    {
+                        out += '\n'; // preserve newlines so line numbers survive
+                    }
+                    ++i;
+                }
+                if( i + 1 < N )
+                {
+                    i += 2; // skip */
+                }
+                continue;
+            }
+        }
+
+        // ── Normal character — emit as-is ─────────────────────────────────────────────────
+        out += c;
+        ++i;
+    }
+
+    // Phase 2: post-process the comment-stripped text:
+    //   (a) Drop lines that are now whitespace-only (previously held only a comment).
+    //   (b) Collapse runs of 3+ blank lines → a single blank line.
+    //
+    // "Blank line" = a line whose trimmed content is empty.  We preserve lines that have ANY
+    // non-whitespace content after comment stripping (this keeps intentional blank lines between
+    // logical blocks — only the *excess* is collapsed).
+    std::string result;
+    result.reserve( out.size() );
+
+    std::size_t pos      = 0;
+    int         blanks   = 0;    // consecutive blank lines seen so far
+    bool        firstLine = true; // suppress leading blanks at the very start of a body
+
+    const std::size_t M = out.size();
+    while( pos < M )
+    {
+        // Find end of line.
+        std::size_t eol = out.find( '\n', pos );
+        if( eol == std::string::npos )
+        {
+            eol = M;
+        }
+
+        const std::string_view line( out.data() + pos, eol - pos );
+
+        // Is this line blank (all whitespace)?
+        bool isBlank = true;
+        for( char ch : line )
+        {
+            if( ch != ' ' && ch != '\t' && ch != '\r' )
+            {
+                isBlank = false;
+                break;
+            }
+        }
+
+        if( isBlank )
+        {
+            // Suppress leading blank lines at the very start of a body (artifact of stripping
+            // the opening comment of a function body), and collapse 3+ consecutive blanks.
+            if( !firstLine )
+            {
+                ++blanks;
+            }
+            // Emit at most one blank line (we allow up to 2 accumulated before we start collapsing;
+            // the spec says "runs of 3+ → single blank", so blanks==1 and blanks==2 are both fine).
+            if( !firstLine && blanks <= 2 )
+            {
+                result += '\n';   // the blank line itself (the \n that terminated the previous line)
+            }
+            // If blanks > 2: suppress (collapse).
+        }
+        else
+        {
+            // Non-blank line: reset counter, emit.
+            blanks    = 0;
+            firstLine = false;
+            result.append( out.data() + pos, eol - pos );
+            if( eol < M )
+            {
+                result += '\n';
+            }
+        }
+
+        pos = ( eol < M ) ? eol + 1 : M;
+    }
+
+    // Trim a single trailing newline that may have been added (cosmetic).
+    while( !result.empty() && result.back() == '\n' )
+    {
+        result.pop_back();
+    }
+    return result;
+}
+
+// --pack-signatures: emit each top-N ranked definition's SIGNATURE (declaration up to
+// the body), bodies elided — ~70% fewer tokens than raw source while keeping the structural shape.
+// Grouped by file, capped at budgetBytes. Emitted AFTER </r>, like packSource. With L2: a <doc> child.
+// Q3 QUALITY LENS (--for only): the quality facts for the symbols the agent is about to touch, folded
+// onto the <d> blocks so a single read-time bundle carries steering signal (facts fed at read time
+// measurably change output). ALL optional (nullptr ⇒ that attribute is omitted) so the plain
+// --pack-signatures call-site — which passes none of them — stays byte-identical to its golden/gates.
+// churn is PER-FILE (indexed by fileId); clone/tested/amp are PER-SYMBOL (indexed by symbol id). ccx is
+// already emitted under metrics=true, so the lens = ccx (there) + churn/clone/tested/amp (here).
+// append one `,"key":"escaped-value"` field to a JSON object under construction, IN PLACE — jsonesc::escapeInto
+// appends, so no per-field scratch string is needed (the reused-buffer posture jsonesc documents).
+inline void appendJsonStrField( std::string& out, const char* keyWithComma, std::string_view value )
+{
+    out += keyWithComma;  out += '"';
+    jsonesc::escapeInto( value, out, false, true, false );
+    out += '"';
+}
+
+// P2.4 — the `,"cx":…,"ccx":…[,"in":…]` metrics run of a JSON signature row. "in" is emitted ONLY when a
+// fan-in vector was actually supplied: an absent key means "not measured", never a fabricated 0 (which reads
+// as "nobody calls this"). Mirrors sigRowHead's rule for the XML sibling.
+inline void appendJsonMetricFields( std::string& out, const Symbol& s, NodeId id, const std::vector<std::uint32_t>* fanIn )
+{
+    char num[ 64 ];
+    rw::formatTo( num, sizeof( num ), ",\"cx\":{},\"ccx\":{}", s.cx, s.ccx );
+    out += num;
+    if( fanIn && id < fanIn->size() )
+    { rw::formatTo( num, sizeof( num ), ",\"in\":{}", ( *fanIn )[ id ] );  out += num; }
+}
+
+
+// P2.3/P2.4 — the per-row descriptive facts sigRowHead() folds in, grouped (not individual params) so the
+// helper stays well under the params-regression bar. `lens` is the pre-rendered churn/amp/clone/tested attr
+// run; `pure` is " pure=\"1\"" or "". Both are borrowed views onto the caller's stack buffers.
+struct SigRowFacts
+{
+    bool                              metrics = false;
+    const std::vector<std::uint32_t>* fanIn   = nullptr;   // nullptr / short ⇒ in= is OMITTED, never printed as 0
+    const char*                       lens    = "";
+    const char*                       pure    = "";
+    std::uint32_t                     rank    = 0;         // deep-tail d1: 1-based GLOBAL rank in the lens ranking (the
+                                                           //   (score desc, id asc) order this section selected with);
+                                                           //   0 ⇒ attribute absent (non-lens serving stays byte-
+                                                           //   identical). Emitted LAST in the attribute run so the
+                                                           //   "<d l=" opening and every existing attribute adjacency
+                                                           //   stay byte-stable. Same r= spelling AND meaning as the
+                                                           //   <cand r=> flat export — one rank vocabulary, two shapes.
+    std::string_view                  topNext = {};         // L-W (forpage.h): the r=1 row's next= when the caller decided
+                                                           //   the answer is THIN — the file-grain widening page. Empty ⇒
+                                                           //   the body follow-up (--expand=FILE:NAME) exactly as before.
+};
+
+// P7 (terminality round A, lane R, 2026-09-05): a lens row's own file, spelled root-relative exactly as the
+// <f p=> wrapper it replaced was — the ONE spelling both dialects' rows (p= / "p") and the r=1 next= use.
+inline std::string lensRowPath( const IngestResult& ing, std::uint32_t fileId, std::string_view rootArg )
+{
+    return rootArg.empty() ? std::string( ing.files[ fileId ] )
+                           : std::string( rw::sarif::rootRelativeUri( ing.files[ fileId ], rw::sarif::rootPrefixOf( rootArg ) ) );
+}
+
+// P2.3/P2.4 — the exact "<d …>" opening tag of ONE signature row, defined once so the two-phase (globally
+// budgeted) emitter and the streaming emitter can never drift by a byte: the budget ledger measures exactly
+// the string this returns.
+// P2.3 — n= (and sc= when the symbol has an enclosing scope; a free function's canonical id IS its bare
+// name, so it costs zero bytes there) is the CHAIN KEY: without it a reader had to parse a C++ declarator
+// out of the signature text to chain into --expand/--callers. Row 6: the id composes as p::sc::n — the same
+// rule the default map's <s sc="…"> rows follow, so an id composed from a bundle row addresses the same
+// symbol in either lens.
+// The `l=` prefix is DELIBERATELY kept first — existing consumers key on the "<d l=" opening.
+// P2.4 — in= is emitted ONLY when a fan-in vector was actually supplied. A bundle assembled without one used
+// to print in="0", which reads as "nobody calls this" — a FALSE ZERO. An absent attribute means "not
+// measured"; in="0" now means, and only means, a measured zero.
+inline std::string sigRowHead( const IngestResult& ing, NodeId id, const SigRowFacts& facts, std::vector<char>& esc,
+                               std::string_view rootArg )   // R-R: the root this row's id= is relative to
+{
+    ASSUME( id < ing.symbols.size() );
+    const Symbol& s = ing.symbols[ id ];
+    ASSUME( s.fileId < ing.files.size() );
+
+    // declaration line, then identity (the chain key)
+    char lineAttr[ 32 ];
+    rw::formatTo( lineAttr, sizeof( lineAttr ), "<d l=\"{}\" n=\"", s.line );
+    std::string head = lineAttr;
+    head += escapeXml( s.name, esc );          // escapeXml returns a view INTO esc — copy before the next call
+    head += "\"";
+    if( hasScopeAttr( s ) )   // row 6: the short id — the scope segment only; p= (this row's, or its <f>'s) supplies the rest
+    { head += " sc=\"";  head += escapeXml( s.scope, esc );  head += "\""; }
+    // P7 (terminality round A, lane R, 2026-09-05): p= (and layer= when the file sits in a builtin layer) ride
+    // EVERY row that carries r= — the lens serving is FLAT now (rows in rank order, no <f p=> wrapper), so the
+    // row itself names its file; the non-lens serving (rank 0: --pack-signatures) keeps the wrapper and no p=.
+    // Same root-relative spelling the wrapper used and the r=1 next= below uses.
+    if( facts.rank > 0 )
+    {
+        head += " p=\"";  head += escapeXml( lensRowPath( ing, s.fileId, rootArg ), esc );  head += "\"";
+        if( const char* fl = builtinLayer( rootRelPath( ing, s.fileId ) ); *fl ) { head += " layer=\"";  head += fl;  head += "\""; }
+    }
+
+    // descriptive facts — cx/ccx/in only under metrics; the Q3 lens + pure ride along either way.
+    // deep-tail d1: r= (the row's 1-based global lens rank) closes the run — see SigRowFacts::rank.
+    char rankAttr[ 24 ];  rankAttr[ 0 ] = '\0';
+    if( facts.rank > 0 )
+    {
+        rw::formatTo( rankAttr, sizeof( rankAttr ), " r=\"{}\"", facts.rank );
+    }
+    char tail[ 224 ];
+    if( facts.metrics )
+    {
+        char inAttr[ 24 ];  inAttr[ 0 ] = '\0';
+        if( facts.fanIn && id < facts.fanIn->size() )
+        {
+            rw::formatTo( inAttr, sizeof( inAttr ), " in=\"{}\"", ( *facts.fanIn )[ id ] );
+        }
+        rw::formatTo( tail, sizeof( tail ), " cx=\"{}\" ccx=\"{}\"{}{}{}{}>", s.cx, s.ccx, rw::cstr( inAttr ), facts.lens, facts.pure, rw::cstr( rankAttr ) );
+    }
+    else
+    {
+        rw::formatTo( tail, sizeof( tail ), "{}{}{}>", facts.lens, facts.pure, rw::cstr( rankAttr ) );
+    }
+    head += tail;
+    // extent honesty (kExtentSuspectRowLegend): after r=, before next=, absent when every check held — so every
+    // pre-existing adjacency on an unflagged row is byte-stable and the budget ledger still measures this string.
+    if( s.extentSuspect != 0 )
+    {
+        head.pop_back();   // the '>'
+        appendExtentSuspectAttr( head, s );
+        head += '>';
+    }
+    // P3 (L7, nextverb.h): the TOP-ranked row hands the agent the body to read — --expand=FILE:NAME, the
+    // file-qualified selector (a same-named def elsewhere cannot answer), spelled with the same root-relative
+    // path the row's own p= carries. Only r=1: one next per document, the one that ends the search.
+    if( facts.rank == 1 )
+    {
+        head.pop_back();   // the '>'
+        // L-W (forpage.h): a THIN answer hands over the file-grain widening page instead of the body — the follow-up
+        // most likely to COMPLETE the answer, not the one most likely to be a body (L-N).
+        head += facts.topNext.empty() ? nextAttrXml( nextFlag( "--expand=", lensRowPath( ing, s.fileId, rootArg ) + ":" + s.name ) )
+                                      : nextAttrXml( facts.topNext );
+        head += '>';
+    }
+    return head;
+}
+
+// ── LB-A (r10 GitNexus round) — THE RELEVANCE FLOOR ──────────────────────────────────────────────────
+// `order` is already sorted by (score desc, id asc), so every row that scored ZERO forms one contiguous
+// TAIL. This walks that tail off the kept head and returns the shortened count.
+//
+// It is an ADMISSION rule, not a ranking one: no score is touched and no row moves, so the emitted set
+// stays exactly the (score desc, id asc) head — only where the head STOPS changes. That distinction is
+// what keeps this out of the pre-registered-band regime: a row with score 0 matched no query term at all,
+// so there is no recall hypothesis to be wrong about. (r10 §5 LB-A measured such rows at 64-84% of a
+// class-A bundle's bytes on all 12/12 of that round's symbol-lookup queries — mean ~73%, and 17.5% of
+// everything the tool emitted over the whole 48-query sweep.)
+//
+// Shared by packSignatures and packSignaturesJson for the §A4a reason the trim ladder above is shared: two
+// copies of a selection rule are how the two dialects silently diverge one round from now.
+//
+// The `topN == 0 ⇒ all` convention below makes an empty kept set unrepresentable through topN alone, which
+// is why this is a floor applied AFTER `keep` rather than a caller-side clamp: a query nothing scores on
+// must emit ZERO rows, not the whole corpus.
+inline std::size_t relevanceFlooredKeep( const std::vector<NodeId>& order, const std::vector<float>& rank, std::size_t keep ) noexcept
+{
+    while( keep > 0 && order[ keep - 1 ] < rank.size() && !( rank[ order[ keep - 1 ] ] > 0.0f ) )
+    {
+        --keep;
+    }
+    return keep;
+}
+
+// WHY THE FLOOR EXISTS (measured, r10 §5 LB-A). --for's --pack-top-n was read as a TARGET rather than a
+// ceiling: once the name-exact route resolved its anchor, the remaining slots were filled from the
+// (score desc, id asc) tail — which, for a wall of zeros, is crawl/path order, and dot-directories sort
+// first. Over that round's twelve symbol-lookup queries those rows were 64-84% of a class-A bundle's bytes
+// (mean ~73%), and 17.5% of everything the tool emitted across the whole 48-query sweep. It is NOT those
+// directories: excluding them refilled with the next files in path order and the bundle got BIGGER.
+//
+// WHERE THE CALLER APPLIES IT. On the FINAL lens rank — after route, anchor, mention, co-change and
+// doc-mention have all landed — so a row still at zero matched no query term under any of them. --for's
+// forTopN is the one knob every consumer reads (the sigs quota, lensSurfaceIds, the lego/compose scope,
+// the JSON dialect, the auto-bodies set), so narrowing it there floors all of them at once. The emitters
+// take the floor as a flag TOO, and that is not belt-and-braces: their `topN == 0 ⇒ all` convention makes
+// an empty kept set unrepresentable through the count alone, and a query nothing scores on must emit zero
+// rows, not the corpus.
+//
+// The caller-side half of the floor: how many slots of the quota survive it, and the note that says so.
+// ONE spelling for both --for dialects (CLI runForLens, MCP forTaskText) — a bundle-composition rule with
+// two implementations is a rule with two behaviours, which is the drift class the §B4 echo-site rule and
+// this file's own shared trim ladder both exist to stop. Structured-binding return (CONTRIBUTING §3) rather
+// than an in/out `int&` so the caller cannot forget the note.
+//
+// `note` is empty EXACTLY when the floor did not fire, so an inert call is byte-identical. The note's
+// wording is the --adaptive cut's idiom, because it reports the same kind of fact: this quota is smaller
+// than you asked for, here is by how much and why.
+struct RelevanceFloorCut
+{
+    int         topN;   // the narrowed quota (never above the requested one)
+    std::string note;
+};
+inline RelevanceFloorCut relevanceFloorCut( const std::vector<float>& rank, int topN )
+{
+    std::size_t positiveCount = 0;
+    for( const float s : rank )
+    {
+        if( s > 0.0f ) { ++positiveCount; }
+    }
+    if( topN <= 0 || positiveCount >= std::size_t( topN ) )
+    {
+        return { topN, {} };
+    }
+    char nb[ 200 ];
+    rw::formatTo( nb, sizeof( nb ), " [relevance floor: kept {} of {} - the other {} scored zero on this query, so the bundle shrank instead of padding]",
+                   positiveCount, topN, std::size_t( topN ) - positiveCount );
+    return { int( positiveCount ), std::string( nb ) };
+}
+
+// ── A2 (survey card, 2026-09-03) — THE dropped_positive ARITHMETIC, shared by packSignatures (XML) and
+// packSignaturesJson so the two dialects cannot report two different counts for the same query.
+//
+// WHAT IT COUNTS. `candidatePositives` is how many symbols in the ladder's kept head scored ABOVE the
+// relevance floor (rank>0) — positives by the ranker's OWN cut, independent of whether relevanceFloorCut
+// was applied to narrow topN first (LB-A already guarantees every --for kept symbol is positive; --pack-task
+// never applies that narrowing, so its eligible set can still mix positive and zero-score members — this
+// arithmetic works either way because it re-checks rank>0 per symbol rather than assuming the caller floored
+// first). Of those, `positivesContentSkipped` never became a <sigs> row for a CONTENT reason (an unreadable
+// file, an out-of-range sig span, an empty cleaned signature) — not a budget reason, so THE DISCLOSURE (a
+// count of what the PAYLOAD CEILING removed) must not blame the ceiling for it. `positivesSurvived` is how
+// many actually reached the final emitted set (collected AND not later dropped by the H1 ladder's step F).
+// Every candidate positive falls into exactly one of three buckets — content-skipped, budget-dropped (never
+// collected because the collection-phase byte gate broke first, or collected then step-F dropped), or
+// survived — so subtracting the first and third from the total leaves exactly the second, with no need to
+// track "never visited due to budget" as its own running counter.
+//
+// BAND (docs/EVALS.md, A2 registration): this count must be EXACTLY correct on every one of the standing
+// --for-gate sweep's serving shapes — a floor label (`_floor`/`_capped`) is for a count that admits it might
+// be short; this one has no such hedge, so getting it wrong is worse than not shipping it at all.
+inline std::size_t droppedPositiveCount( std::size_t candidatePositives, std::size_t positivesContentSkipped, std::size_t positivesSurvived ) noexcept
+{
+    ASSUME( candidatePositives >= positivesContentSkipped + positivesSurvived );   // see the three-bucket partition above
+    return candidatePositives - positivesContentSkipped - positivesSurvived;
+}
+
+// ── §A4a — THE ONE SIGNATURE-PAYLOAD TRIM LADDER (steps A..F, kForPayloadBudgetBytes above) ──────────
+// Extracted from packSignatures so the JSON sibling runs the SAME ladder rather than a second copy of it:
+// §A4a found `--for --json` byte-identical at --token-budget=1000 and 20000 because the
+// JSON emitter had no budget at all, and the honest fix is one ladder with two serializations — a cloned
+// ladder is exactly the "new clone of a reused helper" --quality-delta gates on, and two copies is how the
+// XML and JSON trims would silently diverge one round from now.
+//
+// Format-agnostic by construction: every decision it makes reads only (globalRank, doc, sig, dropped, fileSlot)
+// on an entry and (wrapBytes, liveCount) on its file — never a tag, brace, or quote. The
+// FORMAT lives entirely in the caller's `entryCost`, which reports the exact emitted byte cost of one entry
+// in that caller's own serialization (0 for a dropped entry). Templated on the caller's own row structs
+// (duck-typed on those member names) so neither emitter has to reshape its rows to call this.
+//
+// `total` is the running exact byte total of the whole block and is updated in place. NOTE on the delta
+// order: an action can GROW an entry by a couple of bytes (the appended ellipsis on a barely-over string),
+// so subtract the old cost first and add the new one — never form `before - after` (it can be negative,
+// i.e. unsigned-overflow UB under G1's -fsanitize=integer). `total >= before` always holds (before is a
+// summand of total).
+template<class EntryT, class FileT, class CostFn>
+inline void trimSigLadder( std::vector<EntryT>& entries, std::vector<FileT>& files,
+                           std::size_t& total, std::size_t effectiveBudget, CostFn entryCost )
+{
+    const auto fits      = [ & ] { return total <= effectiveBudget; };
+    const auto shrinkSig = [ & ]( EntryT& e, std::size_t cap )
+    { total -= entryCost( e ); truncateUtf8WithEllipsis( e.sig, cap ); total += entryCost( e ); };
+    const auto dropDoc   = [ & ]( EntryT& e )
+    { total -= entryCost( e ); e.doc.clear(); total += entryCost( e ); };
+    const auto capDoc    = [ & ]( EntryT& e, std::size_t cap )
+    { total -= entryCost( e ); truncateUtf8WithEllipsis( e.doc, cap ); total += entryCost( e ); };
+
+    // ladder steps A..F (see kForPayloadBudgetBytes above); entries walk tail → head. Plain
+    // pre-decrement countdown loops — `k-- > 0` wraps at 0, which G1's -fsanitize=integer traps.
+    for( std::size_t k = entries.size(); k > 0 && !fits(); )
+    { // A: tail sigs 160 → 96
+        if( --k; entries[k].globalRank > kForDocExcerptRankCount )
+        {
+            shrinkSig( entries[k], kForCapTailSigBytes );
+        }
+    }
+    for( std::size_t k = entries.size(); k > 0 && !fits(); )
+    { // B: rank 13..24 lose the excerpt
+        if( --k; entries[k].globalRank > kForDocFullRankCount && entries[k].globalRank <= kForDocExcerptRankCount )
+        {
+            dropDoc( entries[k] );
+        }
+    }
+    for( std::size_t k = entries.size(); k > 0 && !fits(); )
+    { // C: rank 1..12 doc capped at 96
+        if( --k; entries[k].globalRank <= kForDocFullRankCount )
+        {
+            capDoc( entries[k], kForDocExcerptBytes );
+        }
+    }
+    for( std::size_t k = entries.size(); k > 0 && !fits(); )
+    { // D: rank 5..12 doc dropped + sig capped
+        if( --k; entries[k].globalRank > 4 && entries[k].globalRank <= kForDocFullRankCount ) { dropDoc( entries[k] ); shrinkSig( entries[k], kForTailSigBytes ); }
+    }
+    for( std::size_t k = entries.size(); k > 0 && !fits(); )
+    { // E: rank 1..4 sig capped (doc floor stays)
+        if( --k; entries[k].globalRank <= 4 )
+        {
+            shrinkSig( entries[k], kForTailSigBytes );
+        }
+    }
+    // F: drop whole entries, LOWEST RANK first. P7 (terminality round A, lane R, 2026-09-05): `entries` is in
+    // rank order (both callers sort it before the ladder runs), so the tail walk IS the rank walk — the old
+    // file-major form ("tail file first, source order inside it") could drop a rank-5 row in the last file
+    // while a rank-39 row in the first file survived. A file's wrapBytes (its file notes now — the <f>
+    // wrapper is gone) go with the file's last live row, exactly as before.
+    for( std::size_t k = entries.size(); k > 0 && !fits(); )
+    {
+        EntryT& e = entries[ --k ];
+        if( e.dropped || e.globalRank <= 4 )
+        {
+            continue; // rank 1..4 always survive (the floor)
+        }
+        total -= entryCost( e );
+        e.dropped = true;
+        FileT& sf = files[ e.fileSlot ];
+        if( --sf.liveCount == 0 )
+        {
+            total -= sf.wrapBytes; // the file's notes go with its last live row
+        }
+    }
+}
+
+// §B10.1 — WHY `redact` KEEPS ITS DEFAULT HERE, and it is not an oversight. W3-N1's rule is "REQUIRED, no
+// default, so a new emitting clone cannot silently opt out", and packSource / packOutline / buildRecall have
+// now all taken it (their `redact` is the LAST parameter, so dropping the default costs nothing). Here it is
+// a MIDDLE parameter with six more defaulted parameters behind it, and C++ requires defaults to be trailing:
+// removing this one is ill-formed unless churnPerFile/cloneMember/tested/amp/rankAdaptivePayload/
+// payloadBudgetBytes/noteIndex all lose theirs too, which rewrites every call site across main.cpp,
+// mcpverbs.h, packtask.h and tracelocus.h — four files, three concurrent lanes. packBodies is the same shape
+// (four trailing defaults). So the compile net is 8 of 10, and the two the compiler cannot hold are held by
+// test/fixedbufsweep.sh's population sweep instead: a new sig/body emitter shows up there as an
+// unclassified site. Reordering the parameter list is the real fix and belongs to a round that owns all four
+// files at once.
+// H2H-Graft lane 2 (2026-09-07): the ids of the sigs rows a packer actually EMITTED, in emitted order — ONE
+// mapping for both dialects (globalRank is 1-based into the packer's (score desc, id asc) `order`). The file-grain
+// tail used to exclude every file of the 40-candidate SURFACE, so a row the byte ladder trimmed (rank 5..40)
+// appeared in neither section: on rocksdb three single-file answers at candidate rank 5/10/5 were served
+// nowhere. The tail now excludes only the files of these rows (computeFileTail's headIds).
+inline void resetShownSigIds( std::vector<NodeId>* shownIdsOut )
+{
+    if( shownIdsOut )
+    {
+        shownIdsOut->clear();
+    }
+}
+inline void pushShownSigId( std::vector<NodeId>* shownIdsOut, const std::vector<NodeId>& order, std::uint32_t globalRank )
+{
+    if( shownIdsOut && globalRank >= 1 && globalRank <= order.size() )
+    {
+        shownIdsOut->push_back( order[ globalRank - 1 ] );
+    }
+}
+
+inline void packSignatures( std::FILE* out, const IngestResult& ing, const std::vector<float>& rank,
+                            int topN, std::size_t budgetBytes,
+                            bool metrics = false, const std::vector<std::uint32_t>* fanIn = nullptr,
+                            const std::vector<char>* impure = nullptr, RedactCounts* redact = nullptr,
+                            const std::vector<std::uint32_t>* churnPerFile = nullptr,   // Q3 per-FILE recent-commit count (git; omit w/o git)
+                            const std::vector<std::uint8_t>*  cloneMember  = nullptr,   // Q3 per-symbol: 1 = a member of a duplicate-clone group
+                            const std::vector<std::uint8_t>*  tested       = nullptr,   // Q3 per-symbol: 1 = referenced from a test-path file
+                            const std::vector<std::uint32_t>* amp          = nullptr,   // Q3 per-symbol change-amplification (callers + co-change partners)
+                            bool rankAdaptivePayload = false,    // B0.3: rank-adaptive doc/sig budget (--for lens only; see the constants above)
+                            std::size_t payloadBudgetBytes = 0,  // H1 (B0 r2): GLOBAL byte budget for this <sigs> block — 0 = no global
+                                                                 //   budget (the pre-H1 path, byte-identical); only the --for lens and the
+                                                                 //   MCP `for` verb pass one (kForPayloadBudgetBytes minus the sibling blocks)
+                            const notes::NoteIndex* noteIndex = nullptr,   // L3: field notes — surfaces <note> children on each <f>
+                                                                            //   (path target) and <d> (canonical-id target). nullptr ⇒ INERT
+                                                                            //   (byte-identical). W3-N2: note bytes are CHARGED to the budget
+                                                                            //   (as the JSON sibling charges them) but the ladder never TRIMS a
+                                                                            //   note — user-attached memory always survives; the payload around
+                                                                            //   it shrinks to make room. Charging nothing put a note-heavy tree
+                                                                            //   56% over a tight --token-budget the JSON mode honored.
+                            std::string_view rootArg = {},   // R-E (2026-08-17): same single-root-only root
+                                                             // argument serialize() takes — see its comment.
+                            bool hasRelevanceFloor = false,  // LB-A: drop the zero-score TAIL of the kept head rather
+                                                             //   than padding the quota with it (relevanceFlooredKeep
+                                                             //   above). Off ⇒ byte-identical to the pre-LB-A path.
+                            std::size_t* droppedPositiveOut = nullptr,   // A2 (survey card, 2026-09-03): how many
+                                                             //   POSITIVE-scored candidates (rank>0) within the kept
+                                                             //   head never reached the emitted <sigs> — cut either
+                                                             //   by the collection-phase byte budget or by the H1
+                                                             //   ladder's step F. nullptr ⇒ caller does not want it
+                                                             //   (no extra cost). Only meaningful on the rank-adaptive
+                                                             //   ladder path below; left at 0 on every other path —
+                                                             //   see droppedPositiveCount above for the shared arithmetic.
+                            std::vector<NodeId>* shownIdsOut = nullptr,   // lane 2 (2026-09-07): the ids of the rows this call
+                                                             //   EMITTED, emitted order — see pushShownSigId. nullptr ⇒ not
+                                                             //   wanted. Filled on the flat lens path only.
+                            bool* cappedOut = nullptr,       // did the H1 ladder TRIM this block? The JSON twin
+                                                             //   (packSignaturesJson outCapped) has always reported it;
+                                                             //   this side made the caller re-read the rendered bytes for
+                                                             //   the same fact. A caller needs it to splice the legend
+                                                             //   clause defining the budget_bytes= the capped open tag
+                                                             //   carries — a clause that must cost nothing when the
+                                                             //   ladder did not fire.
+                            std::string_view topRowNext = {} )   // L-W (forpage.h): the r=1 row's next= when the caller
+                                                             //   judged the answer THIN (the widening page); "" ⇒ the
+                                                             //   --expand body follow-up, byte-identical to before.
+{
+    if( droppedPositiveOut )
+    {
+        *droppedPositiveOut = 0;   // default: unset until the ladder path (below) computes the real count
+    }
+    if( cappedOut )
+    {
+        *cappedOut = false;   // default: no ladder ran, or it ran and trimmed nothing
+    }
+    resetShownSigIds( shownIdsOut );
+    // budgetBytes == 0 ⇒ UNLIMITED (A3-F1): the MCP `for` verb has no byte budget, and 0 must never mean
+    // "cap at zero bytes" (the cap fired before the first signature and emitted a bare <sigs></sigs>).
+    // Matches buildRecall's "0 = no cap" convention; the CLI always passes a real budget (default 64 KB).
+    if( budgetBytes == 0 )
+    {
+        budgetBytes = SIZE_MAX;
+    }
+
+    const std::size_t S = ing.symbols.size();
+    // R-E: same convention serialize()'s pathRel uses — fileNoteTarget() below is UNAFFECTED (D5: it takes
+    // the raw ing.files[] spelling and relativizes it against the NoteIndex's OWN root for the LOOKUP key,
+    // never the displayed p=), so only the two `<f p=…>` sites and their byte-length estimate use this.
+    const std::string rootPrefix = rootArg.empty() ? std::string() : rw::sarif::rootPrefixOf( rootArg );
+    const auto         pathRel   = [ & ]( std::uint32_t fileId ) -> std::string_view
+    {
+        return rootArg.empty() ? std::string_view( ing.files[ fileId ] ) : rw::sarif::rootRelativeUri( ing.files[ fileId ], rootPrefix );
+    };
+
+    // top-N symbols by (rank desc, id asc)
+    std::vector<NodeId> order( S );
+    for( NodeId i = 0; i < S; ++i )
+    {
+        order[i] = i;
+    }
+    sortutil::radixSortByScoreDescId( order, rank );
+    std::size_t keep = std::min<std::size_t>( topN > 0 ? std::size_t( topN ) : S, S );
+    if( hasRelevanceFloor )
+    {
+        keep = relevanceFlooredKeep( order, rank, keep );   // LB-A: shrink, never pad
+    }
+
+    // bucket kept symbols by file; files ordered by first-seen (best) rank
+    std::vector<std::vector<NodeId>> buckets( ing.files.size() );
+    std::vector<std::uint32_t>       fileOrder;
+    std::vector<char>                seen( ing.files.size(), 0 );
+    for( std::size_t k = 0; k < keep; ++k )
+    {
+        const std::uint32_t f = ing.symbols[ order[k] ].fileId;
+        if( !seen[f] ) { seen[f] = 1; fileOrder.push_back( f ); }
+        buckets[f].push_back( order[k] );
+    }
+
+    // B0.3: the payload rule keys on each kept symbol's GLOBAL rank (collection below is file-major and
+    // source-ordered inside a file, so the rank must be recorded before the per-file re-sort; P7 then sorts
+    // the collected rows back into this order for emission). 1-based; 0 = not kept.
+    std::vector<std::uint32_t> globalRankOf;
+    if( rankAdaptivePayload )
+    {
+        globalRankOf.assign( S, 0 );
+        for( std::size_t k = 0; k < keep; ++k )
+        {
+            globalRankOf[order[k]] = std::uint32_t( k + 1 );
+        }
+    }
+
+    XmlWriter         w( out );
+    std::vector<char> esc;
+    std::size_t       used = 0;
+
+    // ── H1 (B0 round 2): two-phase GLOBALLY-BUDGETED emission for the lens serving ───────────────────
+    // Derive every entry exactly as the streaming loop below would (same gates, same rank tiers, same
+    // budgetBytes accounting, same redaction order) but into memory; then, if the exact emitted byte
+    // count exceeds payloadBudgetBytes (0 = no ladder), walk the deterministic trim LADDER
+    // (kForPayloadBudgetBytes doc above) until it fits; then emit.
+    //
+    // P7 (terminality round A, lane R, 2026-09-05): EVERY rank-adaptive caller (--for, --for --json's XML
+    // twin, MCP for, --pack-task's ranking, --from-trace) takes this path now, budgeted or not, and the
+    // emission is FLAT IN RANK ORDER — `<d l= n= [id=] p= … r=>` rows with r= strictly increasing, no
+    // <f p=> wrapper. The old shape bucketed the kept head by file (files in first-seen-rank order, rows in
+    // SOURCE order inside each wrapper), so this repo's `--for="rank graph teleport"` read `r= 15 8 5 2 7 1
+    // …` — the r=1 row sixth, under a file whose best row was r=15 — and the legend told the reader to
+    // "sort by r=", i.e. to do the tool's job. An agent reads a bundle top-down; the first row is the one
+    // it opens, so rank order is what makes the first row the terminating one (METHODOLOGY §9 #1). The
+    // collection loop below is still file-major (a file is read once, its rows cut from one buffer); only
+    // the emission order and the ladder's drop order (trimSigLadder step F) changed. Each row's p= (and
+    // layer=) is rendered by sigRowHead; a FILE note rides the file's best-ranked live row as a
+    // <note … p="FILE"> child (appendOneNote), charged once as the file's wrapBytes and released with its
+    // last live row — the wrapper's old accounting, minus the wrapper. Gate: test/forrankordercheck.sh.
+    if( rankAdaptivePayload )
+    {
+        struct SigFile
+        {
+            std::uint32_t fileId     = 0;
+            std::size_t   wrapBytes  = 0;   // exact emitted bytes of the file's note children (nothing else is per-file now)
+            std::string   notes;            // W3-N2: file notes, PRE-RENDERED so wrapBytes is exact (P7: each carries p="FILE")
+            std::size_t   liveCount  = 0;   // non-dropped entries (the notes are dropped when this hits 0)
+        };
+        struct SigEntry
+        {
+            std::uint32_t globalRank = 0;   // 1-based global rank — the ladder's only rank input
+            std::size_t   fileSlot   = 0;   // index into sigFiles (P7: the ladder releases the file's notes at liveCount 0)
+            std::string   head;             // the exact "<d …>" opening tag
+            std::string   doc;              // RAW doc text after the rank tiers ("" ⇒ no <doc> child)
+            std::string   sig;              // RAW one-line signature after the rank tiers
+            std::string   notes;            // W3-N2: this symbol's note children, PRE-RENDERED (the JSON sibling's shape)
+            bool          dropped    = false;
+            bool          positive   = false;   // A2: rank[id] > 0 at collection time (the disclosure's own definition of "positive")
+        };
+        std::vector<SigFile>  sigFiles;
+        std::vector<SigEntry> entries;
+
+        // A2: the kept head's own positive-score population (LB-A's floor already narrows --for's `keep` to
+        // exactly this set; --pack-task's eligibleIds does not, so this is computed fresh rather than assumed).
+        std::size_t candidatePositives = 0;
+        for( std::size_t k = 0; k < keep; ++k )
+        {
+            if( rank[ order[k] ] > 0.0f ) { ++candidatePositives; }
+        }
+        std::size_t positivesContentSkipped = 0;   // A2: positives lost to a CONTENT reason, never the budget
+
+        // phase 1 — collect (mirrors the streaming loop byte-for-byte, including the budgetBytes gate)
+        for( std::uint32_t f : fileOrder )
+        {
+            if( used >= budgetBytes )
+            {
+                break;
+            }
+
+            std::FILE* in = std::fopen( diskPath( ing, std::uint32_t( f ) ).c_str(), "rb" );
+            if( !in )
+            {
+                // A2: this file's whole bucket never gets a content-skip OR a collection attempt below — it is
+                // a content reason (the file is gone), not a budget one, so tally it here before the `continue`.
+                for( NodeId missed : buckets[f] )
+                {
+                    if( rank[missed] > 0.0f ) { ++positivesContentSkipped; }
+                }
+                continue; // graceful: file gone
+            }
+            std::string src;
+            char        buf[ 4096 ];
+            std::size_t n;
+            while( ( n = std::fread( buf, 1, sizeof( buf ), in ) ) > 0 )
+            {
+                src.append( buf, n );
+            }
+            std::fclose( in );
+
+            std::vector<NodeId>& syms = buckets[f];
+            std::sort( syms.begin(), syms.end(), [ & ]( NodeId a, NodeId b )
+            { return ing.symbols[a].sigStartByte < ing.symbols[b].sigStartByte; } );
+
+            SigFile sf;
+            sf.fileId    = f;
+            sf.notes     = renderNoteChildren( noteIndex, fileNoteTarget( noteIndex, ing.files[f] ), esc, pathRel( f ) );   // W3-N2 + P7 (p="FILE")
+            sf.wrapBytes = sf.notes.size();                                                                              //   charged, never trimmed
+            const std::size_t fileSlot = sigFiles.size();
+            for( NodeId id : syms )
+            {
+                if( used >= budgetBytes )
+                {
+                    break;
+                }
+                const Symbol&     s = ing.symbols[id];
+                const std::size_t a = s.sigStartByte, b = s.sigEndByte;
+                if( a >= src.size() || b > src.size() || a >= b )
+                {
+                    if( rank[id] > 0.0f ) { ++positivesContentSkipped; }   // A2: a content reason, not the budget
+                    continue;
+                }
+
+                std::string sig = cleanSig( src.data(), a, b, redact );
+                if( sig.empty() )
+                {
+                    if( rank[id] > 0.0f ) { ++positivesContentSkipped; }   // A2: ditto — an empty cleaned signature
+                    continue;
+                }
+
+                const std::uint32_t globalRank = globalRankOf[ id ];
+                if( globalRank > kForDocExcerptRankCount )
+                {
+                    truncateUtf8WithEllipsis( sig, kForTailSigBytes );
+                }
+
+                const bool  pureSig = pureFromSig( sig, s.lang ) && !( impure && id < impure->size() && (*impure)[id] );
+                const char* pure    = pureSig ? " pure=\"1\"" : "";
+
+                char qbuf[ 80 ];  qbuf[ 0 ] = '\0';
+                {
+                    char* qp = qbuf; char* const qe = qbuf + sizeof( qbuf );
+                    // see the sibling appendf above — including why the clamp is kept rather than replaced
+                    // by format_to_n's .out, which silently widens the buffer by one byte.
+                    const auto appendf = [ & ]< class... A >( std::format_string<A...> fmt, A&&... args )
+                    {
+                        // see the sibling appendf: clamp by out-pointer, never by would-have-written size.
+                        if( qp < qe )
+                        {
+                            const auto r = std::format_to_n( qp, ( qe - qp ) - 1, fmt, std::forward<A>( args )... );
+                            qp  = r.out;
+                            *qp = '\0';
+                        }
+                    };
+                    if( churnPerFile && f < churnPerFile->size() && (*churnPerFile)[f] > 0 )
+                    {
+                        appendf( " churn=\"{}\"", (*churnPerFile)[f] );
+                    }
+                    if( amp && id < amp->size() && (*amp)[id] > 0 )
+                    {
+                        appendf( " amp=\"{}\"", (*amp)[id] );
+                    }
+                    if( cloneMember && id < cloneMember->size() && (*cloneMember)[id] )
+                    {
+                        appendf( " clone=\"1\"" );
+                    }
+                    if( tested && id < tested->size() && (*tested)[id] )
+                    {
+                        appendf( " tested=\"1\"" );
+                    }
+                }
+
+                std::string head = sigRowHead( ing, id, SigRowFacts{ metrics, fanIn, qbuf, pure, globalRank, topRowNext }, esc, rootArg );   // d1: rank fact (ladder path)
+
+                std::string doc = docCommentBefore( src, a );
+                redactInPlace( doc, redact );
+                if( globalRank > kForDocExcerptRankCount )
+                {
+                    doc.clear();
+                }
+                else if( globalRank > kForDocFullRankCount )
+                {
+                    truncateUtf8WithEllipsis( doc, kForDocExcerptBytes );
+                }
+
+                if( !doc.empty() )
+                {
+                    used += doc.size() + 12; // the same budgetBytes accounting as the streaming path
+                }
+                used += sig.size() + 16;
+
+                SigEntry e;
+                e.globalRank = globalRank;
+                e.fileSlot   = fileSlot;
+                e.head       = std::move( head );
+                e.doc        = std::move( doc );
+                e.sig        = std::move( sig );
+                e.notes      = renderNoteChildren( noteIndex, symbolNoteTarget( noteIndex, ing, s ), esc );   // L3/D5 key + W3-N2 pre-render
+                e.positive   = rank[id] > 0.0f;   // A2: this symbol's own score, at collection time
+                entries.push_back( std::move( e ) );
+                ++sf.liveCount;
+            }
+            sigFiles.push_back( std::move( sf ) );
+        }
+        // P7: rank order — the emission order AND the ladder's drop order (globalRank is unique per entry,
+        // so the sort is a total order and the output stays deterministic)
+        std::stable_sort( entries.begin(), entries.end(), []( const SigEntry& a, const SigEntry& b ) { return a.globalRank < b.globalRank; } );
+
+        // exact emitted byte count of the block as collected
+        const auto entryCost = [ & ]( const SigEntry& e ) -> std::size_t
+        {
+            if( e.dropped )
+            {
+                return 0;
+            }
+            std::size_t c = e.head.size() + 4;                                       // "<d …>" + "</d>"
+            if( !e.doc.empty() )
+            {
+                c += 11 + escapeXml( e.doc, esc ).size(); // "<doc>" + "</doc>"
+            }
+            c += escapeXml( e.sig, esc ).size();
+            return c + e.notes.size();                                               // W3-N2: notes are pre-rendered, so their
+            //   EXACT emitted size is known (jsonSigEntryCost)
+        };
+        // extent honesty: a flagged row carries extent_suspect=, and its reading rides this same block — CHARGED here,
+        // so the ladder budgets it like every other byte it writes. Over-reserved only when the ladder later drops every
+        // flagged row; then the reading is not written and those bytes simply go unused.
+        const auto isFlaggedEntry  = [ & ]( const SigEntry& e ) { return ing.symbols[ order[ e.globalRank - 1 ] ].extentSuspect != 0; };   // globalRank is 1-based
+        const bool anyFlaggedEntry = std::any_of( entries.begin(), entries.end(), isFlaggedEntry );
+        std::size_t total = 6 + 7 + ( anyFlaggedEntry ? kExtentSuspectRowLegend.size() : 0u );   // "<sigs>" + "</sigs>" (+ the reading)
+        for( const SigFile& sf : sigFiles )
+        {
+            total += sf.wrapBytes;
+        }
+        for( const SigEntry& e : entries )
+        {
+            total += entryCost( e );
+        }
+
+        const bool capped = payloadBudgetBytes > 0 && total > payloadBudgetBytes;   // 0 = no ladder (MCP's unbudgeted twin)
+        if( capped )
+        {
+            // the marker itself costs bytes — budget the trimmed state INCLUDING it (guard tiny budgets).
+            // capture-audit 2026-09-04: the marker is now ` shown="S" total="T" capped="1"` — S ≤ T, so
+            // both numbers fit in T's digit count, and T (entries.size()) is known before the ladder runs.
+            std::size_t totalDigits = 1;
+            for( std::size_t t = entries.size(); t >= 10; t /= 10 ) { ++totalDigits; }
+            const std::size_t markerBytes     = ( sizeof( " shown=\"\" total=\"\" capped=\"1\"" ) - 1 ) + 2 * totalDigits;
+            const std::size_t effectiveBudget = payloadBudgetBytes > markerBytes ? payloadBudgetBytes - markerBytes : 0;
+
+            // one ladder ACTION on one entry, tail-first; every action re-checks the budget so the ladder
+            // stops at the first fitting state. Pure function of (global rank, the kFor* constants) — the
+            // ladder itself is trimSigLadder() above, shared verbatim with the JSON sibling (§A4a).
+            trimSigLadder( entries, sigFiles, total, effectiveBudget, entryCost );
+        }
+
+        // A2: the exact count, computed AFTER the ladder has made its final drop decisions (droppedPositiveCount
+        // above — the shared arithmetic with the JSON sibling). Pure bookkeeping, no output bytes either way.
+        if( droppedPositiveOut )
+        {
+            std::size_t positivesSurvived = 0;
+            for( const SigEntry& e : entries )
+            {
+                if( e.positive && !e.dropped ) { ++positivesSurvived; }
+            }
+            *droppedPositiveOut = droppedPositiveCount( candidatePositives, positivesContentSkipped, positivesSurvived );
+        }
+
+        // phase 2 — emit (identical write shapes to the streaming path)
+        //
+        // §P8 vocabulary (see src/pageview.h, THE TRUNCATION VOCABULARY, rule 5): this marker used to be
+        // payload="capped" — a STRING ENUM, the tool's only one, readable solely by string-matching the
+        // literal (packtask.h did exactly that). It is now the same boolean capped= every other truncating
+        // element spells, so one parser reads them all.
+        // capture-audit 2026-09-04 (lens 4 / lens 1 F7 / lens 2 L5): it carries shown=/total= too. The
+        // earlier "no honest S<T pair" argument was half right — a ladder step that shrinks a signature drops
+        // no row — but the ladder's LAST steps drop whole entries, and on the audited binary 11 of 40
+        // adaptive-kept rows vanished behind a bare capped="1" while every sibling section (<tail>, <hops>,
+        // <calls>, <bodies>) said how many it was handed. shown= = rows printed, total= = rows handed to the
+        // ladder; capped="1" with shown == total means every row survived but was SHRUNK (doc excerpts /
+        // signature tails cut). Absent = untrimmed. Gate: truncvocabcheck.sh arms (C) + (F).
+        if( cappedOut )
+        {
+            *cappedOut = capped;
+        }
+        if( capped )
+        {
+            std::size_t shownRows = 0;
+            for( const SigEntry& e : entries ) { if( !e.dropped ) { ++shownRows; } }
+            // NOTE for anyone adding an attribute here: this open tag is BYTE-PINNED by
+            // forbudgetmonotoncheck, whose invariant is that the sig section renders byte-identically at
+            // the default ceiling and at any explicit ceiling above it. An attribute whose VALUE depends on
+            // the run (the operative byte budget, say) breaks that identity even when every served row is
+            // the same. The --for lens names its ceiling on the <ctx> root instead, spliced after this
+            // render (verbs_for.h, budget_bytes=), which is why cappedOut above exists.
+            char open[ 80 ];
+            rw::formatTo( open, sizeof( open ), "<sigs shown=\"{}\" total=\"{}\" capped=\"1\">", shownRows, entries.size() );
+            w.write( open );
+        }
+        else
+        {
+            w.write( "<sigs>" );
+        }
+        // extent honesty: the row reading, charged into `total` above, written only when a flagged row survived the ladder
+        if( std::any_of( entries.begin(), entries.end(), [ & ]( const SigEntry& e ) { return !e.dropped && isFlaggedEntry( e ); } ) )
+        {
+            w.write( kExtentSuspectRowLegend );
+        }
+        std::vector<char> fileNotesPending( sigFiles.size(), 1 );   // P7: a file's notes ride its FIRST live row
+        for( const SigEntry& e : entries )
+        {
+            if( e.dropped )
+            {
+                continue;
+            }
+            pushShownSigId( shownIdsOut, order, e.globalRank );   // lane 2
+            w.write( e.head.c_str() );
+            if( !e.doc.empty() ) { w.write( "<doc>" );  w.write( escapeXml( e.doc, esc ) );  w.write( "</doc>" ); }
+            w.write( escapeXml( e.sig, esc ) );
+            w.write( e.notes );                                                // L3: symbol notes on this <d> (inert when null)
+            if( fileNotesPending[ e.fileSlot ] )
+            {
+                fileNotesPending[ e.fileSlot ] = 0;
+                w.write( sigFiles[ e.fileSlot ].notes );                       // L3/D5 + P7: the file's notes, <note p="FILE"> (rendered in phase 1)
+            }
+            w.write( "</d>" );
+        }
+        w.write( "</sigs>" );
+        w.flush();
+        return;
+    }
+
+    // ── the NON-lens serving (--pack-signatures on the map): file-grouped <f p=> wrappers, source order inside,
+    // no r= — P7 left this shape alone (nothing here carries a rank to order by); every rank-adaptive caller
+    // returned from the flat path above, so the tiers this loop used to apply under rankAdaptivePayload are gone.
+    w.write( "<sigs>" );
+    // extent honesty: this streaming path writes rows as it reads them, so the reading rides whenever the corpus holds
+    // a flagged definition — a superset of what these rows can carry (defining an absent attribute costs bytes, never truth).
+    if( std::any_of( ing.symbols.begin(), ing.symbols.end(), []( const Symbol& sym ) { return sym.extentSuspect != 0; } ) )
+    {
+        w.write( kExtentSuspectRowLegend );
+    }
+    for( std::uint32_t f : fileOrder )
+    {
+        if( used >= budgetBytes )
+        {
+            break;
+        }
+
+        std::FILE* in = std::fopen( diskPath( ing, std::uint32_t( f ) ).c_str(), "rb" );
+        if( !in )
+        {
+            continue; // graceful: file gone
+        }
+        std::string src;
+        char        buf[ 4096 ];
+        std::size_t n;
+        while( ( n = std::fread( buf, 1, sizeof( buf ), in ) ) > 0 )
+        {
+            src.append( buf, n );
+        }
+        std::fclose( in );
+
+        // signatures in source order for readability
+        std::vector<NodeId>& syms = buckets[f];
+        std::sort( syms.begin(), syms.end(), [ & ]( NodeId a, NodeId b )
+        { return ing.symbols[a].sigStartByte < ing.symbols[b].sigStartByte; } );
+
+        w.write( "<f p=\"" );  w.write( escapeXml( pathRel( f ), esc ) );  w.write( "\"" );
+        if( const char* fl = builtinLayer( rootRelPath( ing, f ) ); *fl ) { w.write( " layer=\"" );  w.write( fl );  w.write( "\"" ); }   // P3
+        w.write( ">" );
+        {
+            const std::string fileNotes = renderNoteChildren( noteIndex, fileNoteTarget( noteIndex, ing.files[f] ), esc );   // L3/D5
+            w.write( fileNotes );
+            used += fileNotes.size();                                                                   // W3-N2: charged like the JSON wrapBytes
+        }
+        for( NodeId id : syms )
+        {
+            if( used >= budgetBytes )
+            {
+                break;
+            }
+            const Symbol&     s = ing.symbols[id];
+            const std::size_t a = s.sigStartByte, b = s.sigEndByte;
+            if( a >= src.size() || b > src.size() || a >= b )
+            {
+                continue;
+            }
+
+            // compact one-line declaration (shared cleaner: stop at '{' or ';', collapse whitespace)
+            std::string sig = cleanSig( src.data(), a, b, redact );
+            if( sig.empty() )
+            {
+                continue;
+            }
+
+            const bool  pureSig = pureFromSig( sig, s.lang ) && !( impure && id < impure->size() && (*impure)[id] );   // const/non-mutating AND no transitive side-effects
+            const char* pure    = pureSig ? " pure=\"1\"" : "";
+
+            // Q3 quality lens — the steering facts folded onto the <d> block (built into a side buffer,
+            // appended before pure). Each attr is emitted only when its vector is present AND the value is
+            // worth a token (lean output: churn/amp only when >0; clone/tested only when the flag is set).
+            // ccx already rides the metrics attrs below — the lens completes it with churn/clone/tested/amp.
+            char qbuf[ 80 ];  qbuf[ 0 ] = '\0';
+            {
+                char* qp = qbuf; char* const qe = qbuf + sizeof( qbuf );
+                // A4-F8: clamp qp to qe after each append — an un-clamped `qp += snprintf(...)` overruns on
+                // truncation (the next size_t(qe-qp) underflows into an unbounded stack write). See site #1.
+                // fmt is always a string literal at every call site below — the non-literal warning is
+                // an artifact of routing it through the lambda parameter
+                // rw::formatTo reproduces snprintf's contract EXACTLY, so the A4-F8 clamp below is kept
+                // verbatim: it is applied to the same would-have-written length, and truncation therefore
+                // happens at the same byte it always did.
+                //
+                // The obvious-looking rewrite — `qp = std::format_to_n( qp, qe - qp, ... ).out` — is WRONG,
+                // and wrong in a way no fixture catches. snprintf( p, S, ... ) writes at most S-1 characters
+                // PLUS a NUL; format_to_n( p, S, ... ) writes up to S and terminates nothing. It buys one
+                // extra byte of room and drops the terminator. Measured 2026-09-09: that version emitted a
+                // row carrying amp="1" where every previous release truncated it away, on test/ as the
+                // corpus. The byte fence was green throughout — the fixture's attribute strings never reach
+                // this 80-byte buffer, so only a differential run against the pre-conversion binary on a
+                // REAL tree exposed it.
+                //
+                // What the conversion does keep: -Wformat-security is gone, because std::format_string
+                // preserves compile-time checking THROUGH the lambda parameter where a const char* fmt
+                // could not.
+                const auto appendf = [ & ]< class... A >( std::format_string<A...> fmt, A&&... args )
+                {
+                    // Bound by the OUT POINTER, never by a would-have-written length. std::format_to_n's
+                    // `out` is clamped to the n it was given on any implementation; its `size` is a
+                    // would-have-written count that an implementation can get wrong, and this clamp used
+                    // to depend on it. n is (qe-qp)-1 so the NUL below always lands in bounds, which is
+                    // snprintf's "at most S-1 characters plus a terminator", byte for byte.
+                    if( qp < qe )
+                    {
+                        const auto r = std::format_to_n( qp, ( qe - qp ) - 1, fmt, std::forward<A>( args )... );
+                        qp  = r.out;
+                        *qp = '\0';
+                    }
+                };
+                if( churnPerFile && f < churnPerFile->size() && (*churnPerFile)[f] > 0 )
+                {
+                    appendf( " churn=\"{}\"", (*churnPerFile)[f] );
+                }
+                if( amp && id < amp->size() && (*amp)[id] > 0 )
+                {
+                    appendf( " amp=\"{}\"", (*amp)[id] );
+                }
+                if( cloneMember && id < cloneMember->size() && (*cloneMember)[id] )
+                {
+                    appendf( " clone=\"1\"" );
+                }
+                if( tested && id < tested->size() && (*tested)[id] )
+                {
+                    appendf( " tested=\"1\"" );
+                }
+            }
+
+            // identity (n=/id=) + descriptive facts (cx=complexity, ccx=cognitive, in=reuse-count, Q3 lens, pure)
+            // d1: rank 0 = non-lens serving — r= (and P7's p=) absent by contract.
+            w.write( sigRowHead( ing, id, SigRowFacts{ metrics, fanIn, qbuf, pure, /*rank=*/0u }, esc, rootArg ) );
+            std::string doc = docCommentBefore( src, a );   // L2: the human-written intent, if any
+            redactInPlace( doc, redact );                    // a doc-comment body can hold a pasted secret
+            if( !doc.empty() ) { w.write( "<doc>" );  w.write( escapeXml( doc, esc ) );  w.write( "</doc>" );  used += doc.size() + 12; }
+            w.write( escapeXml( sig, esc ) );
+            const std::string symNotes = renderNoteChildren( noteIndex, symbolNoteTarget( noteIndex, ing, s ), esc );   // L3/D5
+            w.write( symNotes );
+            w.write( "</d>" );
+            used += sig.size() + 16 + symNotes.size();                                                  // W3-N2: notes are charged, never trimmed
+        }
+        w.write( "</f>" );
+    }
+    w.write( "</sigs>" );
+    w.flush();
+}
+
+// R6 (A4-R6) — --format=candidates: a FLAT, machine-readable top-K export for an EXTERNAL reranker. One
+// <cand> row per candidate carrying exactly (rank, score, name, canonical id, kind, file, line, one-line
+// signature) — NO lens/quality attrs, NO doc bodies, NO nesting. The research doc's division-of-labor thesis:
+// codecortex stays deterministic and offline and hands a reranker precisely the identity + score + signature it
+// needs, nothing to strip. Still XML so the G4 xmllint gate holds; the flatness is what makes it cheap.
+// Deterministic: (score desc, id asc) — the SAME total order packSignatures/serialize select with. `cap`
+// bounds the row count (wired to --top-k); cap<=0 = every symbol. Emits exactly `keep` rows (a symbol whose
+// signature span is unreadable still gets a row with an empty <sig/>) so a consumer can trust row-count==cap.
+//
+// §A4e/§A4f — the RANKING PROVENANCE this export used to carry none of. An external reranker was handed a
+// score column with no way to know which ranker produced it (name-exact and subtoken+body BM25 live on
+// different score scales — 6.66 vs 29.95 on the same corpus), whether the query's literal mentions were
+// anchor-lifted, how much of the corpus the top-k cut away, or that the whole ranking rested on no textual
+// evidence at all (the §P5 weak signal was string-spliced into the XML lens header, structurally out of
+// reach here — for a nonsense query this exported 200 rows of s="0" as a straight-faced candidate set).
+struct CandidateProvenance
+{
+    const char*   route    = nullptr;   // which ranker ran ("name-exact" / "subtoken+body" / "no-route" / "query"); nullptr ⇒ attribute absent
+    std::uint32_t anchored = 0;         // §B8 mention-anchor lifts folded into this rank (0 is a real, emitted value)
+    bool          weak     = false;     // §P5: the top raw lexical score is below the confidence threshold
+    const char*   docTier  = nullptr;   // the QUERY-SHAPE document demotion (filter.h shapeDocTierTag); nullptr ⇒ absent
+};
+
+// The root element's opening tag. §A4f — what each attribute means, once:
+//   count=/total=/capped=  the §P8 shown/total pair: `keep` rows exported out of `corpusCount` ranked
+//             candidates, capped="1" ⇔ the top-k cut dropped some. The §P17 path-tier penalty is
+//             query-independent and needs no per-run attribute.
+//   doc_tier= the one tier that is NOT query-independent, which is exactly why it earns an attribute the
+//             §P17 penalty does not: the query's own shape (a pasted trace, a pasted bug-report form)
+//             scored the DOCUMENT tier down for this run only. Absent ⇒ no demotion happened.
+//   route=    which ranker produced these scores. name-exact and subtoken+body BM25 do NOT share a score
+//             scale (6.66 vs 29.95 on the same corpus), so comparing s= is only meaningful within one route.
+//   anchored= how many query-mention anchor lifts (§B8) reshaped this rank. 0 is EMITTED, not omitted:
+//             "the anchor ran and moved nothing" and "no anchor at all" must not look alike.
+//   weak="1"  §P5: the top raw lexical score is below the confidence threshold — these rows rest on
+//             thin-to-no textual evidence. Absent ⇒ the query cleared it (never a fabricated weak="0").
+inline std::string candidatesRootTag( std::size_t keep, std::size_t corpusCount, const CandidateProvenance& prov )
+{
+    std::string tag = "<candidates count=\"" + std::to_string( keep )
+                    + "\" total=\"" + std::to_string( corpusCount )
+                    + "\" capped=\"" + ( keep < corpusCount ? "1" : "0" ) + "\"";
+    if( prov.route ) { tag += " route=\"";  tag += prov.route;  tag += "\""; }
+    tag += " anchored=\"" + std::to_string( prov.anchored ) + "\"";
+    if( prov.weak )
+    {
+        tag += " weak=\"1\"";
+    }
+    if( prov.docTier ) { tag += " doc_tier=\"";  tag += prov.docTier;  tag += "\""; }
+    return tag + ">";
+}
+
+inline void packCandidates( std::FILE* out, const IngestResult& ing, const std::vector<float>& rank, int cap,
+                            RedactCounts* redact,                 // §B0/W3-N1: REQUIRED — <sig> is emitted text (nullptr = --no-redact)
+                            CandidateProvenance prov = {},
+                            std::string_view rootArg = {} )       // R-R (2026-08-24): same single-root-only root
+                                                                  // argument serialize() takes — see its comment.
+                                                                  // This lens emitted BOTH a raw p= and a raw id=
+                                                                  // and was the densest absolute-path surface of
+                                                                  // any verb (17 occurrences on the 6-file fixture).
+{
+    const std::size_t S = ing.symbols.size();
+    // R-R: same convention serialize()'s pathRel uses.
+    const std::string rootPrefix = rootArg.empty() ? std::string() : rw::sarif::rootPrefixOf( rootArg );
+    const auto        pathRel    = [ & ]( std::uint32_t fileId ) -> std::string_view
+    {
+        return rootArg.empty() ? std::string_view( ing.files[ fileId ] ) : rw::sarif::rootRelativeUri( ing.files[ fileId ], rootPrefix );
+    };
+
+    std::vector<NodeId> order( S );
+    for( NodeId i = 0; i < S; ++i )
+    {
+        order[i] = i;
+    }
+    sortutil::radixSortByScoreDescId( order, rank );
+    const std::size_t keep = std::min<std::size_t>( cap > 0 ? std::size_t( cap ) : S, S );
+
+    // Per-file content cache: emit in RANK order (r=1..K) but read each needed file at most once. A top-K
+    // spanning F files does F file reads, not K.
+    HashMap<std::uint32_t, std::string> contents;
+    const auto contentOf = [ & ]( std::uint32_t fid ) -> const std::string&
+    {
+        const auto it = contents.find( fid );
+        if( it != contents.end() )
+        {
+            return it->second;
+        }
+        std::string s;
+        if( fid < ing.files.size() )
+        {
+            if( std::FILE* in = std::fopen( diskPath( ing, fid ).c_str(), "rb" ) )
+            {
+                char b[4096];
+                std::size_t n;
+                while( ( n = std::fread( b, 1, sizeof( b ), in ) ) > 0 )
+                {
+                    s.append( b, n );
+                }
+                std::fclose( in );
+            }
+        }
+        return contents.emplace( fid, std::move( s ) ).first->second;
+    };
+
+    XmlWriter         w( out );
+    std::vector<char> esc;
+
+    // §P8 collision, documented not renamed: on a <cand> row s= is the SCORE and k= the KIND tag — the exact
+    // inverse of the ranked map. Neither can move (golden.xml pins one, postingscheck.sh's positional
+    // regex pins the other), so the legend states it. G4: no double hyphen inside an XML comment.
+    w.write( "<!-- codecortex candidates: flat top K export for an external reranker. r=rank(1 based) s=SCORE "
+             "n=name id=canonical k=KIND-tag p=path l=line. Note k= is the kind here and the PageRank score in "
+             "the ranked map; on this row the score is s=. Root: count= rows exported of total= RANKED CORPUS "
+             "symbols (total is the corpus size, never a match count), capped=\"1\" means the top-k cut dropped "
+             "some; route= names the ranker (s= is comparable only within one route); anchored= counts "
+             "query-mention lifts (0 = the anchor ran and moved nothing); weak=\"1\" means the top raw lexical "
+             "score is below the confidence bar, so these rows rest on thin textual evidence; doc_tier= names "
+             "the query SHAPE (a pasted trace, a pasted bug-report form) that scored documents down for this "
+             "run, absent when none did. -->" );
+    w.write( candidatesRootTag( keep, S, prov ) );
+    for( std::size_t r = 0; r < keep; ++r )
+    {
+        const NodeId       id  = order[r];
+        const Symbol&      s   = ing.symbols[id];
+        const std::string& src = contentOf( s.fileId );
+
+        std::string sig;
+        if( s.sigStartByte < s.sigEndByte && s.sigEndByte <= src.size() )
+        {
+            sig = cleanSig( src.data(), s.sigStartByte, s.sigEndByte, redact );
+        }
+        const std::string canon = canonicalIdForEmit( ing, s, rootArg );   // R-R
+
+        char hb[ 96 ];  rw::formatTo( hb, sizeof( hb ), "<cand r=\"{}\" s=\"{:.6g}\" n=\"", r + 1, double( rank[id] ) );
+        w.write( hb );  w.write( escapeXml( s.name, esc ) );
+        w.write( "\" id=\"" );  w.write( escapeXml( canon, esc ) );
+        w.write( "\" k=\"" );   w.write( symTag( s.kind ) );
+        w.write( "\" p=\"" );   w.write( escapeXml( pathRel( s.fileId ), esc ) );   // R-R
+        char lb[ 24 ];  rw::formatTo( lb, sizeof( lb ), "\" l=\"{}\">", s.line );
+        w.write( lb );
+        w.write( "<sig>" );  w.write( escapeXml( sig, esc ) );  w.write( "</sig></cand>" );
+    }
+    w.write( "</candidates>" );
+    w.flush();
+}
+
+// --expand=SYM:START-END (octocode's partial-file idea): pull a SLICE
+// of a large def's body instead of the whole thing. Lines are 1-based, relative to the symbol's OWN
+// first line (Symbol::line), matching what an agent already sees in --outline/--pack-signatures l=
+// output — never a whole-file line number. hasRange=false ⇒ the pre-existing whole-body path (byte-
+// identical; this struct's default is inert).
+struct LineRange
+{
+    std::uint32_t startLine = 0;       // 1-based, relative to the symbol's first line; 0 ⇒ unset
+    std::uint32_t endLine   = 0;       // 1-based, inclusive; 0 ⇒ unset
+    bool          hasRange  = false;   // true ⇒ a --expand=SYM:START-END slice was requested for this node
+};
+
+// Slice `body` (the def's full text, [sigStartByte,endByte)) down to 1-based lines [startLine,endLine]
+// relative to its own first line. Clamps out-of-range bounds to the def's actual span (never OOB, never
+// throws) and UTF-8-safe (never splits a codepoint — same back-off rule as packSource/cleanSig). Returns
+// the sliced text plus the CLAMPED [loLine,hiLine] (1-based) and the def's total line count, so the
+// caller can emit an honest lines="lo-hi/total" marker. A reversed/malformed range (caught by the CLI
+// parse below) never reaches here — but startLine>endLine is still handled defensively by swapping.
+struct SlicedBody
+{
+    std::string   text;
+    std::uint32_t loLine = 1;
+    std::uint32_t hiLine = 1;
+    std::uint32_t total  = 1;
+};
+
+inline SlicedBody sliceBodyLines( std::string_view body, std::uint32_t startLine, std::uint32_t endLine )
+{
+    // split into line spans [begin,end) (end excludes the trailing '\n', if any) — one pass, no copies yet.
+    std::vector<std::pair<std::size_t, std::size_t>> lines;
+    std::size_t                                      lineStart = 0;
+    for( std::size_t i = 0; i < body.size(); ++i )
+    {
+        if( body[i] == '\n' ) { lines.emplace_back( lineStart, i ); lineStart = i + 1; }
+    }
+    lines.emplace_back( lineStart, body.size() );   // final line (no trailing '\n', or the text after the last one)
+
+    const std::uint32_t total = std::uint32_t( lines.size() );
+    if( startLine > endLine )
+    {
+        std::swap( startLine, endLine ); // defensive: never emit an inverted slice
+    }
+    std::uint32_t lo = startLine < 1 ? 1 : startLine;
+    std::uint32_t hi = endLine   < 1 ? 1 : endLine;
+    if( lo > total )
+    {
+        lo = total; // clamp — never index past the def's span
+    }
+    if( hi > total )
+    {
+        hi = total;
+    }
+    if( lo > hi )
+    {
+        lo = hi; // degenerate (empty def) — 1 line, both ends equal
+    }
+
+    const std::size_t byteStart = lines[ lo - 1 ].first;
+    std::size_t       byteEnd   = lines[ hi - 1 ].second;
+
+    // UTF-8-safe: neither cut point may land mid-codepoint (a continuation byte is 10xxxxxx). Line splits
+    // are on '\n' (always a codepoint boundary) so this is normally a no-op; kept as the same defensive
+    // back-off used elsewhere (packSource/cleanSig/docCommentBefore) in case of a corrupt/binary body.
+    std::size_t bs = byteStart;
+    while( bs < body.size() && ( static_cast<unsigned char>( body[bs] ) & 0xC0 ) == 0x80 )
+    {
+        ++bs;
+    }
+    while( byteEnd > bs && byteEnd < body.size() && ( static_cast<unsigned char>( body[byteEnd] ) & 0xC0 ) == 0x80 )
+    {
+        --byteEnd;
+    }
+
+    SlicedBody out;
+    out.text   = std::string( body.substr( bs, byteEnd - bs ) );
+    out.loLine = lo;
+    out.hiLine = hi;
+    out.total  = total;
+    return out;
+}
+
+// ── §H5: THE RECORD OF WHAT packBodies ACTUALLY EMITTED ─────────────────────────────────────────────────
+// `--pack-task --json` used to answer "which bodies?" a SECOND time, in a second place, from the same inputs:
+// the XML pass handed every candidate to packBodies (which groups by FILE and stops on a BYTE budget), counted
+// the resulting <b> elements as bodies_kept, and the JSON tail then re-sliced the first bodies_kept ids in
+// RANK order and emitted each one WHOLE. Two answers, one number over both: MEASURED on this repo at
+// --token-budget=8000, XML kept {redactInPlace, redactSecrets} while JSON emitted {redactInPlace,
+// loadRecallBody} under bodies_kept=2; on `--pack-task="serializeJson runDefaultMap" --token-budget=5000` the
+// XML truncated its single body to fit 11 800 B while the JSON shipped 42 200 B against the SAME stated
+// ceiling — packBodiesJson had no budgetBytes parameter, no `used`, and no truncation vocabulary at all.
+//
+// The fix is not a second budget in the JSON emitter (that is how the divergence was born). packBodies is the
+// ONE place the decisions live, and it now REPORTS them: which ids it emitted, the exact post-slice /
+// post-compress / post-redact bytes it emitted for each, whether it truncated, and the callee rows it showed.
+// The JSON dialect renders that record. Same SET, same SELECTION, same TRUNCATION, by construction — a future
+// third dialect gets those for free, because there is nothing to keep in step.
+//
+// NOT the same BYTES, and this comment said otherwise until the wave-2 verifier caught it (F-MED-1). The
+// record is taken at the push_back below, i.e. BEFORE `appendCdataSafe`, and that is not an escape — it is a
+// LOSSY SCRUB: `xmlSafeByte` maps every C0 byte except \t \n \r to a space, and invalid UTF-8 becomes '?'.
+// So a body containing ESC or Latin-1 bytes reaches XML scrubbed and JSON raw (measured: 140 B vs 148 B on a
+// fixture whose def holds ESC + Latin-1, at every budget and under --compress/--no-redact). The divergence is
+// PRE-EXISTING and base-byte-identical — the wave regressed nothing — but it is real, it is the §B12.7 C0
+// dialect divergence appearing in the body payload rather than the task echo, and `bodydialectcheck` cannot
+// see it because that gate asserts sets, truncations and omissions, never body bytes. Routed to the wave-3
+// lane that owns this file together with §B12.7. Do not restore the unqualified claim without closing it.
+//
+// The record also removes a latent counting bug: bodies_kept was `countSub( bodiesStr, "<b " )`, and body text
+// rides in CDATA verbatim, so any corpus body containing the literal `<b ` (HTML, a markdown table, this
+// comment) inflated the count.
+struct EmittedBodyCall
+{
+    std::string   name;
+    std::uint32_t line = 0;
+    std::string   sig;    // already cleaned + redacted; NOT yet XML/JSON-escaped (each dialect escapes its own way)
+};
+
+struct EmittedBody
+{
+    NodeId                       id          = 0;
+    std::string                  text;         // post-slice/compress/redact bytes, taken BEFORE appendCdataSafe's
+                                               // xmlSafeByte scrub — so NOT byte-equal to the XML CDATA when the
+                                               // body carries C0 or invalid UTF-8 (see the header note, §B12.7)
+    std::string                  lineSpan;     // octocode partial-fetch marker value "lo-hi/total"; empty ⇒ whole body
+    bool                         isTruncated = false;
+    bool                         isXmlScrubbed = false;   // §B12.7/F-MED-1: `text` (this dialect's bytes) differs from
+                                                          // the XML CDATA's. Decided from the two byte strings at the
+                                                          // emission, carried here so BOTH dialects can disclose it.
+    std::vector<EmittedBodyCall> calls;
+    std::uint32_t                callsTotal  = 0;   // outOff[id+1]-outOff[id] — the denominator behind calls.size()
+};
+
+struct EmittedBodies
+{
+    std::vector<EmittedBody> kept;
+    std::vector<NodeId>      omitted;      // exactly the ids the XML named in a `<!-- body omitted (over budget) -->`
+                                           // marker, so the JSON dialect can name the SAME set and no more. A body
+                                           // dropped after the budget was fully spent is silent in BOTH dialects and
+                                           // is covered by total=/capped= (XML) and bodies_total/bodies_kept (JSON).
+    std::size_t              requested = 0; // valid ids handed in: the denominator for total=/capped=
+};
+
+// §H5: record an over-budget skip. A free function rather than an inline `if( outEmitted )`, because the one
+// call site is packBodies' DEEPEST block (inside for/for/if/else) and a null-check there is the single
+// statement that pushed that function's nesting metric over the bar — measured by bisection, not guessed.
+inline void noteOmittedBody( EmittedBodies* out, NodeId id )
+{
+    if( out )
+    {
+        out->omitted.push_back( id );
+    }
+}
+
+// The two sinks emitCalleeCallsBlock writes through. A struct rather than two more parameters: the function
+// already carries nine, and W3-N1's "REQUIRED redact, no default" discipline survives because this aggregate
+// has NO default member initialisers — a caller must spell both fields, including a deliberate `nullptr`.
+struct CalleeCallsSink
+{
+    RedactCounts*                 redact;     // §B0/W3-N1: REQUIRED — the <c> callee sigs are emitted text
+    std::vector<EmittedBodyCall>* recorded;   // §H5: nullptr ⇒ do not record (every caller that wants XML only)
+    // COMPACT conceptual serving (docs/EVALS.md, the T3 route-narrowing round): render each callee as
+    // `<c n= l=/>` — the NAME and the line, no signature text. Defaulted false, so every pre-existing
+    // caller is byte-identical; only packHops passes true.
+    //
+    // WHY A NAMES-ONLY RENDERING EXISTS AT ALL, since a signature is strictly more information: it is 3-4x
+    // cheaper (~30 B against ~110 B), and the compact bundle's whole allowance is smaller than one body's.
+    // Measured on the 15-query class-B set: at the registered allowance the signature form bought 32 callee
+    // rows across all 15 queries and lost the one marker the section exists to keep (`build_filter`, which
+    // is reachable in the whole corpus only through another symbol's callee list); the names-only form buys
+    // several times that at the same bytes. A name plus a line is also exactly what the continuation needs —
+    // you expand a NAME — so the denser form is not a lesser answer for this section's actual job.
+    //
+    // It also reads no files: a name and a line come from the symbol table, where the signature has to be
+    // sliced out of the callee's own source. Nothing is silently dropped for an unreadable span here.
+    bool                          namesOnly = false;
+    // Optional query relevance for ORDERING a callee listing that has to be CUT. nullptr ⇒ the CSR's own
+    // node-id order, which is what a caller with NO query in scope keeps (--expand, --around, --exemplar).
+    //
+    // A callee listing was node-id order everywhere because it is OFTEN complete, and the order of a
+    // complete listing carries no claim. But both routes that render one cut it routinely — the compact
+    // bundle's whole allowance is smaller than one body, and a body's own listing stops at kCalleeRowCap
+    // — and an arbitrary cut of a listing is a real defect however it is disclosed: `shown="4"
+    // capped="1"` is honest about the fact and silent about the choice. Every other listing in this tool
+    // that can be cut is ordered by something (the ranked map by score, the caller list
+    // source-before-test); this one had nothing. With a rank vector it keeps the callees the QUERY is
+    // about, which is the only ordering a task lens can defend.
+    //
+    // Found by measurement, and worth saying so: on the class-B query about turning a filter call into
+    // SQL, `split_exclude`'s nine callees were cut to the first four by node id and dropped
+    // `build_filter` — the one callee the query was actually about.
+    //
+    // 2026-09-10: that fix reached the compact route ONLY. It was conditioned on `namesOnly && rank`, and
+    // the one caller passing a rank was packHops — so packBodies' <calls> under every emitted body kept
+    // the sixteen LOWEST node ids on --for, --pack-task and --from-trace, the three verbs that always
+    // have a query. The ordering is a property of a CUT listing, not of a rendering, so the condition is
+    // now the rank alone and packBodies threads one in (`calleeRank`); gate test/callsrankordercheck.sh.
+    const std::vector<float>*     rank = nullptr;
+};
+
+// The <calls> wrapper, written in front of the rows it describes (they have to be walked before `shown`
+// is known). pageview.h THE TRUNCATION VOCABULARY rule 3: shown=/capped= are added ONLY when the 16-row
+// cap or the byte budget actually cut the list, and they are added TOGETHER — never shown="T" capped="0"
+// on a complete listing.
+inline void appendCallsBlock( std::string& out, std::uint32_t total, int shown, const std::string& rows )
+{
+    char callsHdr[ 64 ];
+    if( static_cast<std::uint32_t>( shown ) < total )
+    {
+        rw::formatTo( callsHdr, sizeof( callsHdr ), "<calls total=\"{}\" shown=\"{}\" capped=\"1\">", total, shown );
+    }
+    else
+    {
+        rw::formatTo( callsHdr, sizeof( callsHdr ), "<calls total=\"{}\">", total );
+    }
+    out += callsHdr;
+    out += rows;
+    out += "</calls>";
+}
+
+// The walk order for one symbol's callee listing: the CSR's own (node-id ascending) by default, or query
+// relevance whenever the caller supplied a rank — see CalleeCallsSink::rank for why an arbitrarily-ordered
+// CUT listing is a defect worth a sort, and for why the rendering (names-only vs signature) has no say in
+// it. The tie-break is node id, so the order is TOTAL and the output stays deterministic whatever the
+// scores do — a partial order here would make the bytes depend on the sort implementation, which
+// CONTRIBUTING #2 rules out even when the ranking still "looks right".
+//
+// Extracted rather than inlined because emitCalleeCallsBlock is a budget walk with a disclosure contract
+// and this is a comparator — two different things, and folding them together is what pushed that
+// function's complexity from 15 to 33 in one edit. It MATERIALIZES the CSR's own order too, rather than
+// signalling "walk in place" with an empty return: that saves a bounded copy (out-degree, and the listing
+// is capped at 16 rows anyway) and pays for it with a branch on every emitted row.
+inline std::vector<NodeId> calleeWalkOrder( NodeId id, const std::vector<std::uint32_t>& outOff,
+                                            const std::vector<NodeId>& outTargets, const CalleeCallsSink& sink )
+{
+    std::vector<NodeId> walk( outTargets.begin() + outOff[id], outTargets.begin() + outOff[id + 1] );
+    if( sink.rank == nullptr )
+    {
+        return walk;                                   // the CSR's own order, materialized (see below)
+    }
+    const std::vector<float>& rk = *sink.rank;
+    std::sort( walk.begin(), walk.end(), [ & ]( NodeId a, NodeId b )
+    {
+        const float ra = a < rk.size() ? rk[a] : 0.0f;
+        const float rb = b < rk.size() ? rk[b] : 0.0f;
+        if( ra != rb )
+        {
+            return ra > rb;
+        }
+        return a < b;
+    } );
+    return walk;
+}
+
+// One callee of the names-only rendering (`<c n= l=/>`), COLLECTED rather than written: row 6 (2026-09-12)
+// merges the same-named callees of ONE block into one row whose l= comma-joins their definition lines
+// (`<c n="pick" l="203,206"/>` — two overloads, or a declaration and its definition, that used to cost a
+// full row each: 716 B over the twelve --for answers of the 2026-09-12 re-measure). Walk order is kept:
+// a merged row sits where its FIRST callee sat. shown= still counts callees, never rows — the legend says
+// so. No file read, no signature slice, and no redaction seam: a bare identifier is not a credential shape,
+// which is why this path does not take a RedactCounts the way the signature row below does.
+//
+// CHARGED AT WHAT IT PRINTS (PR #215 review item 8). This used to charge every callee `name + 16` whether it
+// opened a row or merged into one, on the reasoning that "the merge only ever saves bytes past that charge".
+// It does not: the charge is what the BLOCK'S CAP spends, so a block of overloads was billed a full row for
+// each `,203` it actually printed — about 4 B charged as 20-30 — and the cap then fired early and wrote
+// `capped="1"` over a listing that would have fit whole. A cap that cuts an answer it did not need to cut is
+// the class METHODOLOGY §9 forbids outright: the disclosure is honest about a cut that should never have
+// happened. A merge is charged the comma and the digits it appends, and nothing else.
+//
+// l= IS ASCENDING (same item). The list was appended in WALK order, which is the lens's RANK order, so the two
+// definition lines of one overloaded name came out `l="70,69"` on one query and `l="69,70"` on another — the
+// same fact in two spellings, from a document that promises determinism. Line numbers have a natural order and
+// it is not the ranker's; they are sorted ascending, so a row's content depends on the row and not on how the
+// walk reached it. Row ORDER is unchanged: a merged row still sits where its first callee sat.
+struct MergedCalleeNameRow
+{
+    std::string_view           name;    // a view into ing.symbols — stable for the emitter's lifetime
+    std::vector<std::uint32_t> lines;   // every definition line of that name; joined ascending at append time
+};
+
+inline void collectCalleeNameRow( std::vector<MergedCalleeNameRow>& rows, const Symbol& cs,
+                                  std::size_t& used, const CalleeCallsSink& sink )
+{
+    char lb[ 16 ];
+    rw::formatTo( lb, sizeof( lb ), "{}", cs.line );
+    bool merged = false;
+    for( MergedCalleeNameRow& r : rows )
+    {
+        if( r.name == cs.name )
+        {
+            r.lines.push_back( cs.line );  merged = true;
+            break;
+        }
+    }
+    if( !merged )
+    {
+        rows.push_back( MergedCalleeNameRow { cs.name, { cs.line } } );
+    }
+    // the comma and the digits a merge appends, or the whole row it opens
+    used += merged ? std::strlen( lb ) + 1 : cs.name.size() + 16;
+    if( sink.recorded )
+    {
+        sink.recorded->push_back( EmittedBodyCall { cs.name, cs.line, std::string() } );   // §H5: no sig to record
+    }
+}
+
+// …and the rows written out, once the block's walk is complete.
+inline void appendMergedCalleeNameRows( std::string& callsBody, std::vector<MergedCalleeNameRow>& rows, std::vector<char>& esc )
+{
+    for( MergedCalleeNameRow& r : rows )
+    {
+        std::sort( r.lines.begin(), r.lines.end() );   // ascending, so the row reads the same whatever the walk order was
+        callsBody += "<c n=\"";
+        callsBody += escapeXml( r.name, esc );
+        callsBody += "\" l=\"";
+        for( std::size_t i = 0; i < r.lines.size(); ++i )
+        {
+            if( i > 0 )
+            {
+                callsBody += ',';
+            }
+            char lb[ 16 ];
+            rw::formatTo( lb, sizeof( lb ), "{}", r.lines[i] );
+            callsBody += lb;
+        }
+        callsBody += "\"/>";
+    }
+}
+
+// §P10.1: the disclosed <calls total=... [shown=... capped="1"]> block
+// for one body's 1-hop callee signatures — extracted out of packBodies so the disclosure logic doesn't
+// inflate packBodies' own complexity/LOC. `total` is outOff[id+1]-outOff[id] — outTargets is deduped-per-
+// source (graph.h:37), so this is exactly what a standalone `--callees=SYM` reports as count= for an
+// unambiguous symbol. shown=/capped="1" are added ONLY when the 16-per-body cap or the byte budget
+// actually cuts the list (pageview.h THE TRUNCATION VOCABULARY rule 3: capped= always accompanies
+// shown=, and both are omitted — never shown="T" capped="0" — when the listing is complete).
+template <typename ContentOfFn>
+inline void emitCalleeCallsBlock( std::string& out, NodeId id, const std::vector<std::uint32_t>& outOff,
+                                  const std::vector<NodeId>& outTargets, const IngestResult& ing,
+                                  ContentOfFn&& contentOf, std::vector<char>& esc, std::size_t& used, std::size_t budgetBytes,
+                                  const CalleeCallsSink& sink )
+{
+    RedactCounts* const redact = sink.redact;
+    if( id + 1 >= outOff.size() )
+    {
+        return;
+    }
+    const std::uint32_t total = outOff[id + 1] - outOff[id];
+    if( total == 0 )
+    {
+        return;
+    }
+
+    const std::vector<NodeId> walk = calleeWalkOrder( id, outOff, outTargets, sink );   // see it for the order
+
+    std::string                      callsBody;
+    std::vector<MergedCalleeNameRow> nameRows;   // names-only rendering: collected, merged by name, written after the walk
+    int                              shown = 0;
+    for( std::uint32_t k = outOff[id]; k < outOff[id + 1] && shown < 16 && used < budgetBytes; ++k )
+    {
+        const NodeId cid = walk[ k - outOff[id] ];
+        if( cid >= ing.symbols.size() )
+        {
+            continue;
+        }
+        const Symbol& cs = ing.symbols[cid];
+
+        // COMPACT: the names-only rendering — see collectCalleeNameRow above for what it does and does not do.
+        if( sink.namesOnly )
+        {
+            collectCalleeNameRow( nameRows, cs, used, sink );
+            ++shown;
+            continue;
+        }
+
+        const std::string& csrc = contentOf( cs.fileId );
+        if( cs.sigStartByte >= cs.sigEndByte || cs.sigEndByte > csrc.size() )
+        {
+            continue;
+        }
+        const std::string  sig  = cleanSig( csrc.data(), cs.sigStartByte, cs.sigEndByte, redact );
+        if( sig.empty() )
+        {
+            continue;
+        }
+        char hb[ 32 ];  rw::formatTo( hb, sizeof( hb ), "\" l=\"{}\">", cs.line );
+        callsBody += "<c n=\"";  callsBody += escapeXml( cs.name, esc );  callsBody += hb;
+        callsBody += escapeXml( sig, esc );  callsBody += "</c>";
+        used += sig.size() + 24;
+        ++shown;
+        if( sink.recorded )
+        {
+            sink.recorded->push_back( EmittedBodyCall { cs.name, cs.line, sig } ); // §H5
+        }
+    }
+    appendMergedCalleeNameRows( callsBody, nameRows, esc );   // no-op on the signature rendering (nameRows stays empty)
+    appendCallsBlock( out, total, shown, callsBody );
+}
+
+// THE <bodies> DISCLOSURE (§B8.3). This was the one budgeted section element carrying NO attributes at all:
+// "kept N of M" lived in the --pack-task header's comment prose while the JSON twin emitted
+// bodies_total/bodies_kept, so the two dialects disclosed different amounts of one fact — and
+// `truncvocabcheck`'s universal sweep could not even see the element, because every rule it applies is of the
+// form "if shown= then …". It now carries the pageview.h rule-1/2/3 triple. `shown` is a RESULT of the budget
+// walk rather than an input to it, so the open tag cannot be written until the walk has finished: the children
+// are composed into a buffer and the tag is written in front of them. A second, non-emitting decision pass to
+// pre-count `shown` was rejected — it would re-run redactInPlace over every body and double the redaction
+// tally, which is §B10.2 recreated one file over.
+//
+// THE BUDGET WALK (§H5 sub-finding, RE-DIAGNOSED BY MEASUREMENT). The audit reported bodies_kept as
+// non-monotonic in the budget and named the cause: "packBodies `break`s rather than skipping". It does not.
+// The loops already skip-and-continue for a body that does not fit while budget REMAINS (the marker path
+// below); the `break` fires only once `used` has reached the budget, when nothing further can fit anyway.
+// Converting both breaks to skips and sweeping 8 tasks x 27 budgets (3000..16000 step 500) gives the
+// IDENTICAL 5 descending steps at the IDENTICAL budgets — exactly count-neutral.
+// CA4 verifier F-LOW-2: count-neutral is NOT marker-neutral, and the sentence above used to stop one word
+// short. The two forms disagree on how many `<!-- body omitted (over budget): NAME -->` markers are printed
+// for the SAME set of dropped bodies, because a `break` stops writing them while a skip keeps going:
+// measured `--token-budget=7000` -> shown=2/6 with ZERO markers, `=8000` -> shown=2/6 with FOUR markers for
+// the same four bodies. Nothing is hidden by it — the aggregate `capped="1"` plus shown=/total= carry the
+// fact either way, and the JSON `bodies_omitted` key is built from the same set — but a reader diffing two
+// budgets sees a marker count move without the body count moving, and is owed the reason here.
+//
+// The real cause is RANK PRIORITY, and it is not a defect: bodies fill top-rank-first, so a larger budget can
+// newly admit a large high-rank body that then consumes the room several smaller low-rank ones had. MEASURED
+// `--pack-task="redact secrets from emitted text"`: 5 bodies at --token-budget=6500, 2 at 7000, while the
+// delivered bytes went UP (8 687 -> 11 461). Making the count monotone means filling smallest-first, i.e.
+// handing an agent four small bodies it did not ask for instead of the one it did. Rank priority is the
+// retrieval contract; the count is not a quality measure, and the --pack-task header now SAYS so rather than
+// leaving a reader to infer a regression from a falling number.
+//
+// What the re-diagnosis DID fix: `budgetBytes - used` underflows a size_t whenever `used` has passed the
+// budget (appendCdataSafe grows on a `]]>` split, and the callee block and notes are charged after the fit
+// test), turning the fit test into "everything fits". The guard happens to mask it today, so the floored form
+// is a latent trap defused, not an output change.
+//
+// ── V1 (octocode F2, 2026-08-15): per-file context for a --expand body ─────────────────────────────────
+// The gap: --expand's body bundle carried no import list or sibling-symbol summary, so an agent reading
+// one body had to spend a SECOND call (--outline on the same file, or a re-run with a bigger --top-k) just
+// to learn what else lives there. codecortex already indexes both facts (ing.symbols grouped by fileId,
+// ing.includes filtered by fileId) — this is a lookup, not a new extraction pass.
+// A NEW per-file table, not a corpus-wide persistent index (the owner's multiple-views latitude for this
+// round): an --expand call only ever touches the handful of files its requested symbols live in, so
+// building a table for EVERY file in the corpus up front would price a scan `--expand` never needs. Built
+// ONCE per packBodies call — one pass over ing.symbols, one over ing.includes, both filtered to just the
+// files in `fileOrder` — not once per body, so a two-body file and a two-hundred-body file pay the same.
+// Deterministic (source/definition order, the same order ing.symbols/ing.includes already hold); G2:
+// HashMap<>, never std::map, reserved to fileOrder.size().
+struct FileExpandContext
+{
+    // (id, name) pairs for EVERY symbol in the file, in ing.symbols order, self NOT pre-excluded (which
+    // entry is "self" differs per body when a file contributes more than one requested symbol, so exclusion
+    // happens at emission time, per body, against a table built once).
+    std::vector<std::pair<NodeId, std::string_view>> siblings;
+    std::vector<std::string_view>                     includes;   // this file's #include/import targets, source order
+};
+
+inline constexpr std::size_t kMaxExpandSibs     = 100;  // sibs= cap — a BLOW-UP GUARD, set above the tail, not a trim of the
+                                                       // typical case. Symbols-per-file on this repo: median 4, p90 18, p99 85,
+                                                       // max 562, so 100 clears p99 and fires on 15.8% of bodies. The previous 8
+                                                       // fired on 68.5% of them and hid 89.3% of all sibling names — and its stated
+                                                       // cost, "~3.5 KB per --pack-task bundle", is not reproducible: --pack-task
+                                                       // emits NO sibs= at all, before P16 or after (measured 2026-09-09 against the
+                                                       // pre-P16 binary). sibs= reaches exactly one verb, --expand, where 100 costs
+                                                       // +36% on a single-symbol answer; --for and --pack-task are byte-identical.
+                                                       // sibs_total= keeps the true count either way.
+inline constexpr std::size_t kMaxExpandIncludes = 24;   // inc= cap
+
+inline HashMap<std::uint32_t, FileExpandContext> buildFileExpandContexts(
+    const IngestResult& ing, const std::vector<std::uint32_t>& fileOrder )
+{
+    HashMap<std::uint32_t, FileExpandContext> table;
+    table.reserve( fileOrder.size() );
+    for( std::uint32_t f : fileOrder )
+    {
+        table[f];   // ensure an entry exists even for a file with zero includes (still worth an inc-total="0" fact)
+    }
+    for( const Symbol& s : ing.symbols )
+    {
+        if( const auto it = table.find( s.fileId ); it != table.end() )
+        {
+            it->second.siblings.emplace_back( s.id, std::string_view( s.name ) );
+        }
+    }
+    for( const Include& inc : ing.includes )
+    {
+        if( const auto it = table.find( inc.fileId ); it != table.end() )
+        {
+            it->second.includes.emplace_back( inc.target );
+        }
+    }
+    return table;
+}
+
+// sibs=/inc= for ONE body — extracted out of packBodies for the SAME reason emitCalleeCallsBlock was
+// (its own comment above): the disclosure logic must not inflate packBodies' own complexity/LOC. Appends
+// directly to `children` (the same accumulator packBodies streams the rest of the tag through), mirroring
+// emitCalleeCallsBlock's own append-to-caller-buffer shape rather than returning a string to splice.
+inline void appendFileExpandContextAttrs( std::string& children, const FileExpandContext& fc, NodeId id, std::vector<char>& esc )
+{
+    // sibs="..." — every OTHER symbol defined in this file (this body's own id excluded), source order,
+    // capped at kMaxExpandSibs; sibs_total= is the count EXCLUDING self (never affected by the cap) so a
+    // truncated list still says how much was left out — the same disclosure spirit as
+    // <calls total=/shown=/capped=> above, flattened onto attributes since sibs/inc describe the FILE, not
+    // a child listing of their own.
+    std::string sibsList;
+    std::size_t sibsShown = 0, sibsTotal = 0;
+    for( const auto& [ sibId, sibName ] : fc.siblings )
+    {
+        if( sibId == id )
+        {
+            continue; // this body's own definition is not its own sibling
+        }
+        ++sibsTotal;
+        if( sibsShown < kMaxExpandSibs )
+        {
+            if( !sibsList.empty() )
+            {
+                sibsList += ",";
+            }
+            sibsList += escapeXml( sibName, esc );
+            ++sibsShown;
+        }
+    }
+    if( sibsTotal > 0 )
+    {
+        children += " sibs=\"" + sibsList + "\" sibs_total=\"" + std::to_string( sibsTotal ) + "\"";
+        if( sibsShown < sibsTotal )
+        {
+            children += " sibs_capped=\"1\"";
+        }
+    }
+
+    // inc="..." — this file's own #include/import targets, source order, capped at kMaxExpandIncludes;
+    // inc_total= is the TRUE count. Absent when the file has none (a documented zero, not a degrade — see
+    // buildFileExpandContexts).
+    if( !fc.includes.empty() )
+    {
+        std::string incList;
+        const std::size_t incShown = std::min( fc.includes.size(), kMaxExpandIncludes );
+        for( std::size_t k = 0; k < incShown; ++k )
+        {
+            if( k > 0 )
+            {
+                incList += ",";
+            }
+            incList += escapeXml( fc.includes[k], esc );
+        }
+        children += " inc=\"" + incList + "\" inc_total=\"" + std::to_string( fc.includes.size() ) + "\"";
+        if( incShown < fc.includes.size() )
+        {
+            children += " inc_capped=\"1\"";
+        }
+    }
+}
+
+// --expand (L4 middle ground): emit the FULL definition source [sigStartByte, endByte) for each
+// requested symbol — "give me this def's body, not the whole file" (Agentless rung-3 / Serena
+// include_body). Grouped under <bodies>, CDATA-safe, budget-capped, self-describing (truncation
+// marker). Reads each file once (nodes grouped by file). Emitted AFTER </r>.
+// compress=true → strip comments and collapse blank runs (P2-B) before CDATA encoding.
+// ranges: optional NodeId→LineRange map (octocode partial-fetch). A node absent from `ranges`, or
+// present with hasRange=false, takes the ORIGINAL whole-body path byte-for-byte — no ranges map at
+// all (nullptr, the default) is the pre-existing call signature, unchanged.
+// withFileContext (V1, default false — every existing caller stays byte-identical): adds sibs=/inc= to
+// each <b> — see FileExpandContext above. Opt-in because most packBodies callers (--for auto-body,
+// --pack-task, --detail, --around, MCP `exemplar`) already answer a DIFFERENT question ("show me this
+// symbol") where a file-context summary is not what was asked; --expand's contract IS "orient me on this
+// symbol", so it turns this on (main.cpp's two --expand call sites).
+inline void packBodies( std::FILE* out, const IngestResult& ing, const std::vector<NodeId>& nodes,
+                        std::size_t budgetBytes,
+                        const std::vector<std::uint32_t>& outOff, const std::vector<NodeId>& outTargets,
+                        bool compress = false, RedactCounts* redact = nullptr,
+                        const HashMap<NodeId, LineRange>* ranges = nullptr,
+                        const notes::NoteIndex* noteIndex = nullptr,    // L3: field notes — surfaces <note> children on each
+                                                                        //   <b> body (canonical-id target). nullptr ⇒ INERT (byte-identical).
+                        EmittedBodies* outEmitted = nullptr,            // §H5: what this call actually emitted — see EmittedBodies.
+                                                                        //   nullptr ⇒ not recorded (every XML-only caller).
+                        bool truncateOversizedFirst = true,            // T3: false ⇒ whole-body-or-not-at-all — a first body larger
+                                                                        //   than the WHOLE budget takes the omission-marker path instead
+                                                                        //   of the head-truncation below. The auto --for bundle passes
+                                                                        //   false (its contract is "the FULL body if it fits, else
+                                                                        //   dropped and disclosed"); every pre-existing caller keeps the
+                                                                        //   default and is byte-identical.
+                        bool withFileContext = false,                  // V1: sibs=/inc= on each <b> — see FileExpandContext above.
+                                                                        //   false (every caller but --expand) ⇒ byte-identical.
+                        std::string_view rootArg = {},   // R-E (2026-08-17): same single-root-only root
+                                                          // argument serialize() takes — see its comment.
+                        const std::vector<float>* calleeRank = nullptr )   // orders each body's CUT <calls> listing; nullptr (a verb with
+                                                                            //   no query: --expand/--around/--exemplar) ⇒ node-id order,
+                                                                            //   byte-identical. See CalleeCallsSink::rank.
+{
+    // budgetBytes == 0 ⇒ UNLIMITED (A3-F2): the MCP `exemplar` verb has no byte budget, and 0 must never
+    // mean "cap at zero bytes" (the cap fired before the first body and emitted a bare <bodies></bodies>).
+    // Matches buildRecall's "0 = no cap" convention; the CLI always passes a real budget (default 64 KB).
+    if( budgetBytes == 0 )
+    {
+        budgetBytes = SIZE_MAX;
+    }
+
+    XmlWriter         w( out );
+    std::vector<char> esc;
+    std::size_t       used = 0;
+    const std::string rootPrefix = rootArg.empty() ? std::string() : rw::sarif::rootPrefixOf( rootArg );
+    const auto         pathRel   = [ & ]( std::uint32_t fileId ) -> std::string_view
+    {
+        return rootArg.empty() ? std::string_view( ing.files[ fileId ] ) : rw::sarif::rootRelativeUri( ing.files[ fileId ], rootPrefix );
+    };
+
+    // file content cache: each file read once, reused for both the bodies and their callees' signatures.
+    HashMap<std::uint32_t, std::string> contents;
+    const auto contentOf = [ & ]( std::uint32_t fid ) -> const std::string&
+    {
+        const auto it = contents.find( fid );
+        if( it != contents.end() )
+        {
+            return it->second;
+        }
+        std::string s;
+        if( fid < ing.files.size() )
+        {
+            if( std::FILE* in = std::fopen( diskPath( ing, fid ).c_str(), "rb" ) )
+            {
+                char b[4096];
+                std::size_t n;
+                while( ( n = std::fread( b, 1, sizeof( b ), in ) ) > 0 )
+                {
+                    s.append( b, n );
+                }
+                std::fclose( in );
+            }
+        }
+        return contents.emplace( fid, std::move( s ) ).first->second;
+    };
+
+    // group requested nodes by file so each file is read once; keep id order within a file
+    HashMap<std::uint32_t, std::vector<NodeId>> byFile;
+    std::vector<std::uint32_t>                             fileOrder;
+    std::size_t                                            requestedCount = 0;
+    // #60: a module-scope owner is BODYLESS BY CONSTRUCTION — its Symbol extent is empty, which is what
+    // every legend naming the kind promises. It is not a body the budget cut, so it must not raise
+    // capped="1" ("1 = cut" is that attribute's whole definition, and a false _capped is a wrong answer).
+    // It is counted and named instead, the same shape --callees' bodyless_defs= already uses.
+    std::size_t                                            bodylessCount  = 0;
+    for( NodeId id : nodes )
+    {
+        if( id >= ing.symbols.size() )
+        {
+            continue;
+        }
+        ++requestedCount;
+        if( ing.symbols[id].kind == SymKind::ModuleScope )
+        {
+            ++bodylessCount;
+            continue;   // never reaches a file read: there is no span to slice
+        }
+        const std::uint32_t f = ing.symbols[id].fileId;
+        if( byFile.find( f ) == byFile.end() )
+        {
+            fileOrder.push_back( f );
+        }
+        byFile[f].push_back( id );
+    }
+    if( outEmitted )
+    {
+        outEmitted->requested = requestedCount;
+    }
+
+    // V1: built ONCE here (not per body) — see FileExpandContext's own comment for why this is a per-call
+    // table over fileOrder rather than a corpus-wide index. Empty map, zero extra passes, when the caller
+    // did not ask (the common case for every packBodies caller except --expand).
+    const HashMap<std::uint32_t, FileExpandContext> fileCtx =
+        withFileContext ? buildFileExpandContexts( ing, fileOrder ) : HashMap<std::uint32_t, FileExpandContext>{};
+
+    std::string children;         // see THE <bodies> DISCLOSURE in the header for why this is buffered, not streamed
+    std::size_t shownCount = 0;   // counted at the emission, never by substring-matching `children`
+    for( std::uint32_t f : fileOrder )
+    {
+        if( used >= budgetBytes )
+        {
+            break;
+        }
+
+        if( contentOf( f ).empty() )
+        {
+            continue; // graceful: file gone / empty
+        }
+
+        for( NodeId id : byFile[f] )
+        {
+            if( used >= budgetBytes )
+            {
+                break;
+            }
+
+            // re-fetch the content EVERY iteration: `contents` is a flat HashMap (values stored
+            // contiguously), so the cross-file callee-signature contentOf() below can reallocate the
+            // table and dangle any reference held across it — never cache `src` past an insert.
+            const std::string& src = contentOf( f );
+            const Symbol&      s = ing.symbols[id];
+            const std::size_t  a = s.sigStartByte, b = s.endByte;
+            if( a >= b || b > src.size() )
+            {
+                continue;
+            }
+
+            std::string body( src.data() + a, b - a );
+
+            // octocode partial-fetch (--expand=SYM:START-END): slice to the requested 1-based lines,
+            // relative to the def's own first line, BEFORE the budget/compress/redact pipeline below —
+            // everything downstream (truncation, compress, redact, CDATA-escape) then operates on the
+            // already-sliced text exactly as it would on a whole small body, so no other code path needs
+            // to know a slice happened. A node absent from `ranges` (or hasRange=false) is untouched:
+            // `body` is exactly what the pre-range code produced — the whole-body path is byte-identical.
+            // §B14 — was `char partAttr[40]`, the third latent site: ` lines=""` is 9 literal bytes and
+            // "lo-hi/total" is 3×10 digits + 2 separators = 32 at the u32 ceiling, so 41 B + NUL against a
+            // 40-byte buffer. Unreachable (it needs a 10^9-line file) but off by exactly the margin the class
+            // is about, so it is composed on std::string rather than left as an arithmetic claim to re-audit.
+            std::string partAttr;
+            std::string lineSpanValue;   // §H5: the same "lo-hi/total" the XML attribute carries, for the record
+            if( ranges )
+            {
+                if( const auto it = ranges->find( id ); it != ranges->end() && it->second.hasRange )
+                {
+                    const SlicedBody sliced = sliceBodyLines( body, it->second.startLine, it->second.endLine );
+                    body = sliced.text;
+                    // lines="lo-hi/total" — an explicit marker so the agent knows this is a SLICE, not the
+                    // whole def (octocode's ask: never let a partial fetch masquerade as the complete body).
+                    lineSpanValue = std::to_string( sliced.loLine ) + "-" + std::to_string( sliced.hiLine ) + "/" + std::to_string( sliced.total );
+                    partAttr = " lines=\"" + lineSpanValue + "\"";
+                }
+            }
+
+            // the floored remaining budget — see THE BUDGET WALK in this function's header for why it is not
+            // `budgetBytes - used`, and for the re-diagnosed non-monotonicity the walk is NOT the cause of.
+            const std::size_t remainingBytes = used < budgetBytes ? budgetBytes - used : 0;
+            bool              truncated      = false;
+            if( body.size() > remainingBytes )                     // doesn't fit the remaining budget
+            {
+                // a single def larger than the WHOLE budget → truncate it (UTF-8 safe) — unless the caller
+                // asked for whole-body-or-not-at-all (T3 auto bundle), in which case it takes the marker path.
+                if( used == 0 && body.size() > budgetBytes && truncateOversizedFirst )
+                {
+                    std::size_t cut = body.rfind( '\n', budgetBytes );
+                    if( cut == std::string::npos )
+                    {
+                        cut = budgetBytes;
+                    }
+                    while( cut > 0 && ( static_cast<unsigned char>( body[cut] ) & 0xC0 ) == 0x80 )
+                    {
+                        --cut;
+                    }
+                    body.resize( cut );
+                    truncated = true;
+                }
+                else                                                // never cut mid-def: skip whole, leave a visible marker
+                {
+                    // A4-F9: the name rides inside an XML COMMENT, where "--" is ill-formed (and "-->" would
+                    // terminate it early). A `--`-bearing name (C++ operator--, a markdown "-- heading") would
+                    // break the G4 xmllint gate. W3FIX M3: xmlCommentText above is that collapse plus the two
+                    // scrubs a comment also needs (control bytes, invalid UTF-8) — a name is corpus-derived, so
+                    // a mis-parse can hand this site any byte sequence at all. Byte-identical on clean names.
+                    children += "<!-- body omitted (over budget): ";
+                    children += escapeXml( xmlCommentText( s.name ), esc );
+                    children += " -->";
+                    noteOmittedBody( outEmitted, id );   // §H5: the JSON dialect names the same ones
+                    continue;
+                }
+            }
+
+            // --compress (P2-B): strip comments + collapse blank runs from the body text.
+            // Applied AFTER truncation so the budget check above sees the un-compressed size
+            // (conservative — compression only makes the output smaller, never larger).
+            //
+            // anti-growth guard (octocode's rule, Wave 4 #3): compressBody only ever REMOVES bytes
+            // (comment spans, excess blank lines), so it cannot grow the payload — but the guard is kept
+            // here anyway as the general contract's enforcement point: compare the reduced payload against
+            // the pre-compress original (not the wrapper tags) and never emit a "reduction" that lost.
+            // Deterministic pure size comparison; compression must never cost tokens.
+            if( compress )
+            {
+                std::string compressed = compressBody( body );
+                if( compressed.size() < body.size() )
+                {
+                    body = std::move( compressed );
+                }
+            }
+
+            // Redact credential shapes from the def body (a full-body emission seam). After compress /
+            // truncation so those size-based decisions see the un-redacted bytes; no-op under --no-redact.
+            const bool bodyRedacted = redactBodyDisclosed( body, redact );
+
+            std::string safe;  safe.reserve( body.size() );        // split ]]>; scrub C0 controls (G4) + invalid UTF-8 (A4-F20)
+            appendCdataSafe( body, safe );
+
+            // §B12.7 / F-MED-1: appendCdataSafe is not an escape, it is a LOSSY SCRUB — C0 (bar \t\n\r) to a
+            // space, invalid UTF-8 to '?'. `body` is what the JSON twin carries, `safe` is what this CDATA
+            // carries, and until now nothing said when they differed. Decided from the bytes, not from a
+            // predicate re-derivation, so the flag cannot disagree with the scrub that produced them.
+            const bool bodyScrubbed = ( safe.size() != body.size() ) || xmlScrubIsLossy( body );
+
+            char hdr[ 64 ];  rw::formatTo( hdr, sizeof( hdr ), "<b t=\"{}\" l=\"{}\" p=\"", symTag( s.kind ), s.line );
+            children += hdr;  children += escapeXml( pathRel( f ), esc );
+            children += "\" n=\"";  children += escapeXml( s.name, esc );  children += "\"";
+            children += partAttr;                                 // octocode partial-fetch: lines="lo-hi/total" (empty on the whole-body path)
+            appendBodyFidelityAttrs( children, bodyScrubbed, bodyRedacted );
+            appendExtentSuspectAttr( children, s );   // extent honesty: this body's span may be a recovery artifact
+            // V1 (octocode F2): sibs=/inc= — the file-context lookup an --expand caller used to need a
+            // second --outline call for. `fileCtx` is empty when withFileContext is false, so this is a
+            // single failed HashMap::find per body (no-op) on every other packBodies caller. The actual
+            // attribute-building lives in appendFileExpandContextAttrs above, out of this function's own
+            // complexity count — same rationale as emitCalleeCallsBlock's own extraction.
+            if( withFileContext )
+            {
+                if( const auto fcIt = fileCtx.find( f ); fcIt != fileCtx.end() )
+                {
+                    appendFileExpandContextAttrs( children, fcIt->second, id, esc );
+                }
+            }
+            children += "><![CDATA[";
+            children += safe;
+            if( truncated )
+            {
+                children += "\n<!-- truncated -->";
+            }
+            children += "]]>";
+            used += safe.size();
+
+            ++shownCount;
+
+            // §H5: the record IS the emission — same id, same post-pipeline bytes, same truncation bit, and
+            // (filled by emitCalleeCallsBlock below) the same callee rows this body actually showed.
+            EmittedBody* record = nullptr;
+            if( outEmitted )
+            {
+                outEmitted->kept.push_back( EmittedBody{ id, body, lineSpanValue, truncated, bodyScrubbed, {},
+                                                         ( id + 1 < outOff.size() ) ? outOff[id + 1] - outOff[id] : 0u } );
+                record = &outEmitted->kept.back();
+            }
+
+            // L4+: the 1-hop callee signatures — a body in isolation is the worst context unit (cAST);
+            // its callees' shapes make it a self-contained, composable bundle. §P10.1: the disclosed
+            // total=/shown=/capped= block — see emitCalleeCallsBlock above; `calleeRank` decides which
+            // rows survive when it CUTS one, which is far from rare here (CalleeCallsSink::rank).
+            emitCalleeCallsBlock( children, id, outOff, outTargets, ing, contentOf, esc, used, budgetBytes,
+                                  CalleeCallsSink{ redact, record ? &record->calls : nullptr, /*namesOnly=*/false, calleeRank } );
+            const std::string bodyNotes = renderNoteChildren( noteIndex, symbolNoteTarget( noteIndex, ing, s ), esc );   // L3/D5
+            children += bodyNotes;
+            used += bodyNotes.size();                                                                   // W3-N2: same charge-never-trim rule
+            children += "</b>";
+        }
+    }
+
+    // §B8.3 / pageview.h THE TRUNCATION VOCABULARY rules 1+2+3: shown= rows printed, total= rows requested,
+    // capped= the bit that always rides with shown=. `total` counts the ids the CALLER handed in (invalid ids
+    // excluded — they were never a request this function could answer), so capped="1" covers every reason a
+    // requested body is absent: the byte budget, an unreadable span, a file that vanished.
+    // compress="1" (paper-shape lane): the per-bundle disclosure that the bodies above went through the
+    // compressBody pass — a MODE fact, so it rides the flag on every emitter (shown="0" included), and its
+    // absence is the flagless byte-identity contract (test/forcompresscheck.sh arm 6). The two hand-formatted
+    // <bodies> wrappers in packtask.h restate it for the same reason they restate shown=/total=.
+    char open[ 160 ];
+    // 40, not 32: ' bodyless="' + '"' is 12 B and bodylessCount is a std::size_t, 20 digits at absolute most,
+    // so 32 B of text needs 33 with the NUL. formatTo truncates rather than overruns, but a cut here drops
+    // the closing quote and the document stops being well-formed — 39 usable leaves 7 B of margin and no
+    // arithmetic to re-check (test/fixedbufsweep.sh's TABLE states it, for this site and its packtask.h twin).
+    char bodylessAttr[ 40 ] = { 0 };
+    if( bodylessCount > 0 )
+    {
+        rw::formatTo( bodylessAttr, sizeof( bodylessAttr ), " bodyless=\"{}\"", bodylessCount );   // #60, absent at zero
+    }
+    rw::formatTo( open, sizeof( open ), "<bodies shown=\"{}\" total=\"{}\" capped=\"{}\"{}{}>",
+                   shownCount, requestedCount, shownCount + bodylessCount < requestedCount ? 1 : 0,
+                   rw::cstr( bodylessAttr ), compress ? " compress=\"1\"" : "" );
+    // §L10: sibs=/inc=/<calls> are only ever emitted when withFileContext is on (--expand's own call sites),
+    // so the legend that defines them rides the SAME gate — every other packBodies caller (--for auto-body,
+    // --pack-task, --detail, --around, MCP exemplar) stays byte-identical, as withFileContext's own contract
+    // already promises. Written through the same XmlWriter as everything else here, so it is priced by the
+    // one rw::chargeSection call the caller already makes — no separate byte count to keep in sync.
+    if( withFileContext )
+    {
+        w.write( kBodiesLegend );
+    }
+    if( bodylessCount > 0 )
+    {
+        w.write( kBodylessBodiesLegend );   // #60: exactly when the attribute is emitted, on every caller
+    }
+    // extent honesty: the row reading rides whenever a requested body is flagged — a superset of the rows written
+    // (defining an absent attribute costs bytes, never truth) — and is priced by the caller's one chargeSection.
+    if( std::any_of( nodes.begin(), nodes.end(), [ & ]( NodeId n ) { return n < ing.symbols.size() && ing.symbols[ n ].extentSuspect != 0; } ) )
+    {
+        w.write( kExtentSuspectRowLegend );
+    }
+    w.write( open );
+    w.write( children );
+    w.write( "</bodies>" );
+    w.flush();
+}
+
+// ── THE <hops> SECTION: one-hop edge context without the body text ────────────────────────────────────
+// (pre-registered: docs/EVALS.md, the T3 route-narrowing round; the allowance is
+// kForCompactHopBudgetBytes above, with its derivation.)
+//
+// The compact --for bundle's answer to "what does this reach", WITHOUT paying for the source. Each
+// requested node gets one <h> row carrying the SAME t=/l=/p=/n= identity <b> carries — a reader who can
+// read one row shape can read the other — and that row's only child is the <calls> block packBodies
+// already attaches to every body: emitCalleeCallsBlock, the same 16-per-symbol cap, the same
+// total=/shown=/capped= disclosure, in its NAMES-ONLY rendering (`<c n= l=/>`; see CalleeCallsSink for the
+// measurement that chose it over the signature form). Nothing else rides along. No CDATA, and no notes: the <d> signature
+// row that ranked this symbol already surfaced its field notes, which is the same reason the auto body
+// walk passes noteIndex=nullptr rather than duplicating them.
+//
+// RANK ORDER, not file order, and that is a real difference from packBodies rather than an oversight.
+// packBodies groups its requests by file so each file is read exactly once for the body text; an <h>
+// row needs no file bytes at all (a name and a line come from the symbol table) — so there is nothing to
+// group for, and walking `nodes` in the order the caller ranked them spends the budget on the
+// best-ranked symbols first.
+//
+// A candidate with no resolved out-edges gets NO row and is counted in `noedge=` instead — see the loop
+// for why that is the honest form rather than the cheap one. Call edges are name-based, so dynamic
+// dispatch, callbacks and macros can be missing: `noedge=` means none FOUND, never none exists
+// (CONTRIBUTING #3), and it is deliberately a separate number from `capped=`, which says only that the
+// byte budget stopped before the remaining candidates.
+inline void packHops( std::FILE* out, const IngestResult& ing, const std::vector<NodeId>& nodes,
+                      std::size_t budgetBytes,
+                      const std::vector<std::uint32_t>& outOff, const std::vector<NodeId>& outTargets,
+                      RedactCounts* redact = nullptr,
+                      std::size_t* outShown = nullptr,          // rows actually emitted; nullptr ⇒ not recorded
+                      const std::vector<float>* rank = nullptr, // query relevance, for ordering a CUT callee listing
+                      std::string_view rootArg = {} )           // R-E: same single-root-only root= every verb takes
+{
+    if( budgetBytes == 0 )                                      // 0 ⇒ UNLIMITED, packBodies' own convention
+    {
+        budgetBytes = SIZE_MAX;
+    }
+
+    XmlWriter         w( out );
+    std::vector<char> esc;
+    std::size_t       used = 0;
+    const std::string rootPrefix = rootArg.empty() ? std::string() : rw::sarif::rootPrefixOf( rootArg );
+    const auto        pathRel    = [ & ]( std::uint32_t fileId ) -> std::string_view
+    {
+        return rootArg.empty() ? std::string_view( ing.files[ fileId ] ) : rw::sarif::rootRelativeUri( ing.files[ fileId ], rootPrefix );
+    };
+
+    // callee-signature file cache: each callee's file read once, shared across every row (the <h> rows'
+    // own files are never read — there is no body to take from them).
+    HashMap<std::uint32_t, std::string> contents;
+    const auto contentOf = [ & ]( std::uint32_t fid ) -> const std::string&
+    {
+        const auto it = contents.find( fid );
+        if( it != contents.end() )
+        {
+            return it->second;
+        }
+        std::string s;
+        if( fid < ing.files.size() )
+        {
+            if( std::FILE* in = std::fopen( diskPath( ing, fid ).c_str(), "rb" ) )
+            {
+                char        b[ 4096 ];
+                std::size_t n;
+                while( ( n = std::fread( b, 1, sizeof( b ), in ) ) > 0 )
+                {
+                    s.append( b, n );
+                }
+                std::fclose( in );
+            }
+        }
+        return contents.emplace( fid, std::move( s ) ).first->second;
+    };
+
+    std::string children;
+    std::size_t requestedCount = 0;
+    std::size_t shownCount     = 0;
+    std::size_t noEdgeCount    = 0;
+    for( NodeId id : nodes )
+    {
+        if( id >= ing.symbols.size() )
+        {
+            continue;                                           // never a request this function could answer
+        }
+        ++requestedCount;
+
+        // NO RESOLVED CALLEES: counted, not printed, and told apart from the budget cut by its own
+        // attribute. A row for such a candidate costs ~90 B to carry nothing — up to six of them would
+        // spend the whole allowance saying "none" before a single real edge is served, which is exactly
+        // what the first measurement of this section showed happening. So the row goes and `noedge="N"`
+        // stays, and that is the HONEST trade rather than the cheap one: `capped="1"` alone cannot say
+        // WHY a candidate has no row, and folding "has no edges" into "the budget stopped" would make
+        // a fact about the graph look like a fact about the budget.
+        const std::uint32_t outDeg = ( id + 1 < outOff.size() ) ? outOff[ id + 1 ] - outOff[ id ] : 0u;
+        if( outDeg == 0 )
+        {
+            ++noEdgeCount;
+            continue;
+        }
+        if( used >= budgetBytes )
+        {
+            continue;                                           // counted as requested → capped="1" says so
+        }
+
+        const Symbol& s = ing.symbols[ id ];
+        std::string   row;
+        char          hdr[ 64 ];
+        rw::formatTo( hdr, sizeof( hdr ), "<h l=\"{}\" p=\"", s.line );
+        row += hdr;
+        row += escapeXml( pathRel( s.fileId ), esc );
+        row += "\" n=\"";
+        row += escapeXml( s.name, esc );
+        row += "\">";
+        used += row.size();
+        // the 1-hop callee signatures — the identical block a body carries, charged against the same
+        // running `used` so the row identity bytes and the edge bytes share one budget.
+        emitCalleeCallsBlock( row, id, outOff, outTargets, ing, contentOf, esc, used, budgetBytes,
+                              CalleeCallsSink{ redact, /*recorded=*/nullptr, /*namesOnly=*/true, rank } );
+        row += "</h>";
+        children += row;
+        ++shownCount;
+    }
+
+    // pageview.h THE TRUNCATION VOCABULARY rules 1+2+3, the same triple <bodies> carries: shown= rows
+    // printed, total= rows requested, capped= the bit that always rides with shown=.
+    // capped= is the BUDGET bit only: the candidates neither printed nor accounted by noedge=. Emitted
+    // as the 0|1 boolean the vocabulary requires either way; noedge= follows the house silence rule and
+    // appears only when it is non-zero.
+    char open[ 128 ];
+    if( noEdgeCount > 0 )
+    {
+        rw::formatTo( open, sizeof( open ), "<hops shown=\"{}\" total=\"{}\" capped=\"{}\" noedge=\"{}\">",
+                       shownCount, requestedCount, shownCount + noEdgeCount < requestedCount ? 1 : 0, noEdgeCount );
+    }
+    else
+    {
+        rw::formatTo( open, sizeof( open ), "<hops shown=\"{}\" total=\"{}\" capped=\"{}\">",
+                       shownCount, requestedCount, shownCount < requestedCount ? 1 : 0 );
+    }
+    w.write( open );
+    w.write( children );
+    w.write( "</hops>" );
+    w.flush();
+    if( outShown )
+    {
+        *outShown = shownCount;
+    }
+}
+
+// ── M6 (density audit 2026-08-08): the WHOLE-FILE form a bare --expand can serve ─────────────────────
+// When every requested symbol's own FILE is byte-cheaper than the default bundle (ranked map + <bodies>),
+// the cheapest COMPLETE answer is the file itself — measured live at 5.65x bundle-over-file on a small
+// file (--expand=pageRankDouble: 27,890 B bundle vs 4,936 B src/pagerank.cpp). This renders that form:
+// one <src p= sym=> block per DISTINCT file of the requested nodes (first-appearance order — nodes is
+// already deterministic), the file body CDATA-wrapped through the same redact + scrub pipeline
+// packSource uses, sym= carrying every requested symbol's name:line anchor, and each symbol's field
+// notes still surfaced (L3 — the notes must not vanish just because the serving form changed).
+// D2 (audit regressions, 2026-08-08): body-shaping modifiers COMPOSE with this form instead of being
+// silently dropped when the serving mode flips —
+//   * compress=true strips comments through the SAME compressBody + anti-growth guard packBodies uses,
+//     so a --compress caller gets a compressed file, not a silently-uncompressed one (compresscheck);
+//   * each requested symbol whose canonical id ADDS an enclosing scope (the S6-C rule — canon != bare
+//     name) gets an <s n= id= l=/> anchor row before the CDATA, so the canonical-id surface downstream
+//     tooling reads off --expand output (usesselectorcheck resolves NoteIndex::empty through it) does
+//     not vanish with the ranked map.
+// rawBytes is the Σ of the SERVED body bytes — post-compress when compress is on, the raw on-disk
+// bytes otherwise — the number the caller's reason= attribute discloses and compares, so the auto
+// choice always weighs SHAPED candidate against SHAPED candidate. The rendered form differs from it
+// only by the envelope, anchors and CDATA-safety expansion.
+// complete=false (any file unreadable or empty) means this form is NOT a candidate: the caller serves
+// the bundle instead — a degraded read must never masquerade as the complete answer.
+struct WholeFileRender
+{
+    std::string xml;              // the <src ...>...</src> blocks, ready to splice inside <ctx>
+    std::size_t rawBytes = 0;     // Σ raw file bytes of the distinct files (what reason= compares)
+    bool        complete = false; // every file read whole; false => caller falls back to the bundle
+};
+
+inline WholeFileRender renderWholeFiles( const IngestResult& ing, const std::vector<NodeId>& nodes,
+                                         RedactCounts* redact, const notes::NoteIndex* noteIndex,
+                                         bool compress,
+                                         std::string_view rootArg = {} )   // R-R: the <src p=…> + anchor id= root
+{
+    WholeFileRender r;
+    // R-R: same convention serialize()'s pathRel uses.
+    const std::string rootPrefix = rootArg.empty() ? std::string() : rw::sarif::rootPrefixOf( rootArg );
+    const auto        pathRel    = [ & ]( std::uint32_t fileId ) -> std::string_view
+    {
+        return rootArg.empty() ? std::string_view( ing.files[ fileId ] ) : rw::sarif::rootRelativeUri( ing.files[ fileId ], rootPrefix );
+    };
+    std::vector<std::uint32_t> fileOrder;
+    for( NodeId id : nodes )
+    {
+        if( id >= ing.symbols.size() )
+        {
+            continue;
+        }
+        const std::uint32_t f = ing.symbols[id].fileId;
+        if( std::find( fileOrder.begin(), fileOrder.end(), f ) == fileOrder.end() )
+        {
+            fileOrder.push_back( f );
+        }
+    }
+    if( fileOrder.empty() )
+    {
+        return r;
+    }
+
+    std::vector<char> esc;
+    for( std::uint32_t f : fileOrder )
+    {
+        std::FILE* in = std::fopen( diskPath( ing, f ).c_str(), "rb" );
+        if( !in )
+        {
+            return WholeFileRender{};   // unreadable => not a candidate, never a partial "complete" answer
+        }
+        std::string body;
+        char        buf[ 4096 ];
+        std::size_t n = 0;
+        while( ( n = std::fread( buf, 1, sizeof( buf ), in ) ) > 0 )
+        {
+            body.append( buf, n );
+        }
+        std::fclose( in );
+        if( body.empty() )
+        {
+            return WholeFileRender{};   // vanished/empty since ingest => same fallback
+        }
+
+        // D2: --compress composes with whole-file serving — the same compressBody + anti-growth guard
+        // packBodies applies to a bundle body (never grows, deterministic), applied BEFORE rawBytes is
+        // counted so the caller's auto choice compares the compressed file against the compressed bundle.
+        if( compress )
+        {
+            std::string compressed = compressBody( body );
+            if( compressed.size() < body.size() )
+            {
+                body = std::move( compressed );
+            }
+        }
+        r.rawBytes += body.size();
+
+        // sym= anchors (name:line per requested node in this file, request order) + their field notes,
+        // plus (D2) an <s n= sc= l=/> row per symbol whose canonical id adds an enclosing scope — the
+        // exact S6-C emit-only-when-disambiguating rule the map rows follow, so the canonical-id surface
+        // survives the serving-mode flip at zero cost for scope-less symbols.
+        //
+        // ROW 6 REACHED HERE LAST (PR #215 review item 9). These rows kept the full `id="PATH::SCOPE::NAME"`
+        // on the argument that "their path does not repeat on the row" — but it does: the row sits inside
+        // <src p="PATH">, which has just printed it, exactly like the <f p=> wrapper the map dropped id= for.
+        // And this document carried NO LEGEND AT ALL, so id= was an undefined first-screen attribute on top of
+        // being a repetition. sc= here, one presence rule (hasScopeAttr) with every other emitter, and the
+        // whole-file root now states the composition. Gate: test/scroundtripcheck.sh (E).
+        std::string anchors;
+        std::string anchorRows;
+        std::string noteStr;
+        for( NodeId id : nodes )
+        {
+            if( id >= ing.symbols.size() || ing.symbols[id].fileId != f )
+            {
+                continue;
+            }
+            const Symbol& s = ing.symbols[id];
+            if( !anchors.empty() )
+            {
+                anchors += ',';
+            }
+            anchors += s.name;
+            anchors += ':';
+            anchors += std::to_string( s.line );
+            if( hasScopeAttr( s ) )
+            {
+                anchorRows += "<s n=\"";
+                anchorRows += escapeXml( s.name, esc );
+                anchorRows += "\" sc=\"";
+                anchorRows += escapeXml( s.scope, esc );
+                anchorRows += "\" l=\"";
+                anchorRows += std::to_string( s.line );
+                anchorRows += "\"/>";
+            }
+            noteStr += renderNoteChildren( noteIndex, symbolNoteTarget( noteIndex, ing, s ), esc );
+        }
+
+        redactInPlace( body, redact );          // §B10.1: raw file text is the widest credential seam
+        std::string safe;
+        safe.reserve( body.size() );
+        appendCdataSafe( body, safe );          // split ]]>, scrub C0 controls (G4) + invalid UTF-8
+
+        r.xml += "<src p=\"";
+        r.xml += escapeXml( pathRel( f ), esc );   // R-R
+        r.xml += "\" sym=\"";
+        r.xml += escapeXml( anchors, esc );
+        r.xml += "\">";
+        r.xml += anchorRows;
+        r.xml += noteStr;
+        r.xml += "<![CDATA[";
+        r.xml += safe;
+        r.xml += "]]></src>";
+    }
+    r.complete = true;
+    return r;
+}
+
+// --expand est_tokens bugfix: estimate the token cost of the <bodies> block packBodies
+// will emit for `nodes`, so serialize()'s header can report header+body (not map-only). Mirrors the
+// packBodies byte accounting closely enough for an honest ±15% estimate: per node it reads the def span
+// [sigStartByte,endByte), applies the same range slice + optional compress, and adds the 1-hop callee
+// signature bytes, all converted to tokens at each symbol's own language B/tok rate (the same calibration
+// table the map estimate uses). Deterministic (pure function of the corpus + request). Not the hot path
+// (--expand payloads are small vs a warm map), so a second file read here is acceptable.
+inline std::size_t estimateExpandBodyTokens( const IngestResult& ing, const std::vector<NodeId>& nodes,
+                                             std::size_t budgetBytes,
+                                             const std::vector<std::uint32_t>& outOff, const std::vector<NodeId>& outTargets,
+                                             bool compress = false,
+                                             const HashMap<NodeId, LineRange>* ranges = nullptr )
+{
+    if( budgetBytes == 0 )
+    {
+        budgetBytes = SIZE_MAX;
+    }
+
+    // per-file content cache (each def's file read once), mirroring packBodies' contentOf.
+    HashMap<std::uint32_t, std::string> contents;
+    const auto contentOf = [ & ]( std::uint32_t fid ) -> const std::string&
+    {
+        const auto it = contents.find( fid );
+        if( it != contents.end() )
+        {
+            return it->second;
+        }
+        std::string s;
+        if( fid < ing.files.size() )
+        {
+            if( std::FILE* in = std::fopen( diskPath( ing, fid ).c_str(), "rb" ) )
+            {
+                char b[4096];
+                std::size_t n;
+                while( ( n = std::fread( b, 1, sizeof( b ), in ) ) > 0 )
+                {
+                    s.append( b, n );
+                }
+                std::fclose( in );
+            }
+        }
+        return contents.emplace( fid, std::move( s ) ).first->second;
+    };
+
+    // <bodies>…</bodies> envelope + a small per-body markup allowance (<b t= l= p= n=>…</b>), at the
+    // mid-band markup rate — informational, so a few bytes of drift between body variants is immaterial.
+    double tokensF   = double( 17 ) / kBytesPerTokenDefault;   // "<bodies></bodies>"
+    std::size_t used = 0;
+
+    for( NodeId id : nodes )
+    {
+        if( used >= budgetBytes )
+        {
+            break;
+        }
+        if( id >= ing.symbols.size() )
+        {
+            continue;
+        }
+        const Symbol&      s   = ing.symbols[id];
+        const std::string& src = contentOf( s.fileId );
+        const std::size_t  a = s.sigStartByte, b = s.endByte;
+        if( a >= b || b > src.size() )
+        {
+            continue;
+        }
+
+        std::string body( src.data() + a, b - a );
+        if( ranges )
+        {
+            if( const auto it = ranges->find( id ); it != ranges->end() && it->second.hasRange )
+            {
+                body = sliceBodyLines( body, it->second.startLine, it->second.endLine ).text;
+            }
+        }
+        if( compress )
+        {
+            std::string compressed = compressBody( body );
+            if( compressed.size() < body.size() )
+            {
+                body = std::move( compressed );
+            }
+        }
+        if( body.size() > budgetBytes - used )
+        {
+            body.resize( budgetBytes - used ); // budget cap (conservative)
+        }
+        used += body.size();
+
+        // per-body markup (~40 B for the <b …> tag + CDATA wrapper + name/path) at markup rate; body TEXT at
+        // the leaner code-body rate (whitespace/braces merge; measured ~3.8 B/tok, not the ~2.46 signature rate).
+        tokensF += double( 40 + s.name.size() + rootRelPath( ing, s.fileId ).size() ) / kBytesPerTokenDefault;   // p= prints root-relative (#228)
+        tokensF += double( body.size() ) / kBytesPerTokenBody;
+
+        // 1-hop callee signatures packBodies appends (capped 16), estimated from their sig span bytes at
+        // each callee's own language rate + ~24 B markup per <c …> tag — the same cap/markup packBodies uses.
+        if( id + 1 < outOff.size() )
+        {
+            int shown = 0;
+            for( std::uint32_t k = outOff[id]; k < outOff[id + 1] && shown < 16 && used < budgetBytes; ++k )
+            {
+                const NodeId cid = outTargets[k];
+                if( cid >= ing.symbols.size() )
+                {
+                    continue;
+                }
+                const Symbol&      cs   = ing.symbols[cid];
+                const std::string& csrc = contentOf( cs.fileId );
+                if( cs.sigStartByte >= cs.sigEndByte || cs.sigEndByte > csrc.size() )
+                {
+                    continue;
+                }
+                const std::size_t sigBytes = cs.sigEndByte - cs.sigStartByte;
+                tokensF += double( 24 + cs.name.size() ) / kBytesPerTokenDefault + double( sigBytes ) / bytesPerTokenFor( cs.lang );
+                used += sigBytes + 24;
+                ++shown;
+            }
+        }
+    }
+    return std::size_t( tokensF + 0.5 );
+}
+
+// --outline (L3 scoped snippet): the def's control-flow SHAPE — signature + top-level body
+// statements + control headers (brace depth ≤ 1), with nested block bodies (depth ≥ 2) collapsed to
+// "...". Between a signature (L1) and the full body (L4): you see the logic structure, not the leaf
+// code. Depth-based (no AST needed); brace-in-string is a rare, accepted imprecision for a sketch.
+// compress=true → strip comments and collapse blank runs (P2-B) before CDATA encoding.
+// §B10.1: `redact` is REQUIRED — no default (see packSource). `compress` loses its default with it, because
+// C++ defaults must be trailing; both call sites already spell both.
+inline void packOutline( std::FILE* out, const IngestResult& ing, const std::vector<NodeId>& nodes, std::size_t budgetBytes, bool compress, RedactCounts* redact,
+                         std::string_view rootArg = {} )   // R-E (2026-08-17): same single-root-only root
+                                                           // argument serialize() takes — see its comment.
+{
+    XmlWriter         w( out );
+    std::vector<char> esc;
+    std::size_t       used = 0;
+    const std::string rootPrefix = rootArg.empty() ? std::string() : rw::sarif::rootPrefixOf( rootArg );
+    const auto         pathRel   = [ & ]( std::uint32_t fileId ) -> std::string_view
+    {
+        return rootArg.empty() ? std::string_view( ing.files[ fileId ] ) : rw::sarif::rootRelativeUri( ing.files[ fileId ], rootPrefix );
+    };
+
+    HashMap<std::uint32_t, std::vector<NodeId>> byFile;
+    std::vector<std::uint32_t>                  fileOrder;
+    for( NodeId id : nodes )
+    {
+        if( id >= ing.symbols.size() )
+        {
+            continue;
+        }
+        const std::uint32_t f = ing.symbols[id].fileId;
+        if( byFile.find( f ) == byFile.end() )
+        {
+            fileOrder.push_back( f );
+        }
+        byFile[f].push_back( id );
+    }
+
+    w.write( "<outline>" );
+    for( std::uint32_t f : fileOrder )
+    {
+        if( used >= budgetBytes )
+        {
+            break;
+        }
+        std::FILE* in = std::fopen( diskPath( ing, std::uint32_t( f ) ).c_str(), "rb" );
+        if( !in )
+        {
+            continue;
+        }
+        std::string src;  char buf[ 4096 ];  std::size_t n;
+        while( ( n = std::fread( buf, 1, sizeof( buf ), in ) ) > 0 )
+        {
+            src.append( buf, n );
+        }
+        std::fclose( in );
+
+        for( NodeId id : byFile[f] )
+        {
+            if( used >= budgetBytes )
+            {
+                break;
+            }
+            const Symbol&     s = ing.symbols[id];
+            const std::size_t a = s.sigStartByte, b = s.endByte;
+            if( a >= b || b > src.size() )
+            {
+                continue;
+            }
+
+            std::string sk;                                            // build the depth-collapsed skeleton
+            int         depth     = 0;
+            bool        collapsed = false;
+            std::size_t i = a;
+            while( i < b )
+            {
+                std::size_t eol = src.find( '\n', i );
+                if( eol == std::string::npos || eol > b )
+                {
+                    eol = b;
+                }
+                const int startD = depth;
+                for( std::size_t k = i; k < eol; ++k )
+                {
+                    const char c = src[k];
+                    if( c == '{' ) { ++depth; }
+                    else if( c == '}' )
+                    {
+                        --depth;
+                    }
+                }
+                if( std::min( startD, depth ) <= 1 ) { sk.append( src, i, eol - i ); sk.push_back( '\n' ); collapsed = false; }
+                else if( !collapsed ) { sk += "  ...\n"; collapsed = true; }
+                i = ( eol < b ) ? eol + 1 : b;
+            }
+            if( sk.empty() )
+            {
+                continue;
+            }
+
+            // --compress (P2-B): strip comments + collapse blank runs from the skeleton text.
+            if( compress )
+            {
+                sk = compressBody( sk );
+            }
+            if( sk.empty() )
+            {
+                continue;
+            }
+
+            // anti-growth guard (octocode's rule, Wave 4 #3): the whole POINT of an outline is fewer
+            // bytes than the real definition — a "..."-collapse can occasionally cost MORE than the few
+            // short lines it replaces (e.g. a 4-byte "  ;\n" collapsed to a 6-byte "  ...\n"). Compare
+            // the PAYLOAD only (skeleton text vs the original [a,b) def span), never the wrapper tags —
+            // if the reduced form is not strictly smaller, emit the original bytes instead. Deterministic,
+            // pure size comparison: compression must never cost tokens.
+            if( sk.size() >= ( b - a ) )
+            {
+                sk.assign( src, a, b - a );
+            }
+
+            // Redact credential shapes from the control-flow skeleton (a body-emission seam — the
+            // skeleton keeps depth≤1 source lines verbatim, which can include a secret literal). --no-redact = no-op.
+            redactInPlace( sk, redact );
+            if( sk.empty() )
+            {
+                continue;
+            }
+
+            std::string safe;  safe.reserve( sk.size() );              // split ]]>; scrub C0 controls (G4) + invalid UTF-8 (A4-F20)
+            appendCdataSafe( sk, safe );
+            char hdr[ 64 ];  rw::formatTo( hdr, sizeof( hdr ), "<o t=\"{}\" l=\"{}\" p=\"", symTag( s.kind ), s.line );
+            w.write( hdr );  w.write( escapeXml( pathRel( f ), esc ) );
+            w.write( "\" n=\"" );  w.write( escapeXml( s.name, esc ) );  w.write( "\"><![CDATA[" );
+            w.write( safe );  w.write( "]]></o>" );
+            used += safe.size();
+        }
+    }
+    w.write( "</outline>" );
+    w.flush();
+}
+
+// S5-E HAS-A composition view: for a set of relevant symbols, emit the member-variable type edges
+// (owner → member-type, rel="creates"|"uses") as a <compose> block. ONLY called from --for and
+// --around (NOT from the default map). composeEdges are OUTSIDE the call graph (PageRank unchanged).
+// relevantIds: the set of symbol ids in scope (from --for lens or --around ego-graph); we emit
+// compose edges where the ownerSym is in the relevant set OR the typeSym is in the relevant set.
+inline void packCompose( std::FILE* out, const IngestResult& ing,
+                         const std::vector<ComposeEdge>& composeEdges,
+                         const std::vector<NodeId>& relevantIds,
+                         std::size_t* outFieldCount = nullptr )   // L2 (round-1 lever B1): the STUB's total= — the
+                                                        // exact <field> row count this function itself emits (no
+                                                        // cap exists here, so "pre-cap" and "emitted" are the same
+                                                        // count; written whenever non-null)
+{
+    if( outFieldCount != nullptr ) { *outFieldCount = 0; }
+    if( composeEdges.empty() || relevantIds.empty() )
+    {
+        return;
+    }
+
+    // build a quick membership set for O(log N) lookup
+    std::vector<NodeId> relevant( relevantIds );
+    std::sort( relevant.begin(), relevant.end() );
+
+    const auto inSet = [ &relevant ]( NodeId id ) noexcept -> bool
+    {
+        const auto it = std::lower_bound( relevant.begin(), relevant.end(), id );
+        return it != relevant.end() && *it == id;
+    };
+
+    XmlWriter         w( out );
+    std::vector<char> esc;
+    bool              open = false;
+
+    for( const ComposeEdge& ce : composeEdges )
+    {
+        if( !inSet( ce.ownerSym ) && !inSet( ce.typeSym ) )
+        {
+            continue;
+        }
+        if( ce.ownerSym >= ing.symbols.size() )
+        {
+            continue;
+        }
+        if( outFieldCount != nullptr ) { ++*outFieldCount; }
+        if( !open ) { w.write( "<compose>" );  open = true; }
+        w.write( "<field name=\"" );  w.write( escapeXml( ce.fieldName, esc ) );
+        w.write( "\" type=\"" );      w.write( escapeXml( ce.typeName, esc ) );
+        w.write( "\" owner=\"" );     w.write( escapeXml( ce.ownerName, esc ) );
+        w.write( "\" rel=\"" );       w.write( ce.rel );  w.write( "\"/>" );
+    }
+    if( open ) { w.write( "</compose>" );  w.flush(); }
+}
+
+// L2 (round-1 lever B1, §9.3 disclosed cut): does a comma-separated --sections=/`sections` value name this
+// section? Closed set {lego, compose}; validated upstream (cli.h validateSectionsModifier, mcp.h's sections
+// arm) — this reader is permissive on purpose (an already-validated value only), so it never has to refuse.
+inline bool sectionsWant( std::string_view sections, std::string_view name ) noexcept
+{
+    std::string_view rest = sections;
+    while( !rest.empty() )
+    {
+        const std::size_t comma = rest.find( ',' );
+        const std::string_view tok = comma == std::string_view::npos ? rest : rest.substr( 0, comma );
+        if( tok == name )
+        {
+            return true;
+        }
+        rest = comma == std::string_view::npos ? std::string_view() : rest.substr( comma + 1 );
+    }
+    return false;
+}
+
+// L2 (round-1 lever B1): the COUNTED STUB `<lego total="N" shown="0" capped="1" next="…"/>` (or `<compose …/>`) that
+// replaces a ranked --for/`for` section by DEFAULT — a §9.3 disclosed cut, not a silent one: total= is the
+// section's own pre-cap row count (packLego's post-dedup ifaces.size(), or packCompose's matched-edge
+// count — the SAME tally each renderer already computes for its real body, never a second guess), shown="0"
+// discloses that nothing was rendered here, and next= (E41 rule b: nextverb.h's ONE capped composer) carries
+// the restoring spelling that returns BOTH sections byte-identically to the un-stubbed render in ONE call —
+// named once, beside cli.h's --sections= flag: `--sections=lego,compose`. Called only when the section would
+// have been non-empty (an absent section stays absent — no stub invents a row that was never going to exist).
+// The legend clause defining the stub's own attributes, present-only (spliced in only on a run that actually
+// emitted one) so a run with nothing to stub pays nothing — the D2/confidence/tail-legend precedent this file
+// already follows for every other post-render disclosure. Deliberate rather than left to "total="/"shown="
+// happening to already appear elsewhere in the document (legendcoveragecheck arm F's "sole closure" warning,
+// the defect this clause was added to close): a reader meets `<lego total= shown= next=>` or `<compose …>`
+// and this sentence, in the SAME document, whichever dialect it is. No "--" anywhere (G4: a double hyphen is
+// ill-formed inside an XML comment) — named without its dashes, the kForCompactBundleLegend precedent
+// ("the auto-bodies flag", never "--auto-bodies") for exactly the same reason.
+inline constexpr std::string_view kForSectionStubLegend =
+    "; lego/compose collapse to a counted stub by default (a disclosed cut): total= that section's own "
+    "pre-cap row count, shown=\"0\" capped=\"1\" (nothing rendered here), next= names the sections=lego,compose flag "
+    "that restores both sections byte-identically in one call";
+
+// L2 fault-injection fix (independent review, 2026-09-19): packLego/packCompose's out-params give the stub
+// its total= on the buffered (memstream) path, but the ranked --for lens's OPEN_MEMSTREAM DEGRADE PATH
+// (verbs_for.h, legoPreRendered/composePreRendered==false — CODECORTEX_FAULT_CHARGE_BUFFER=1 forces it) never
+// buffers either section at all, so it had no count to build a stub from and fell back to emitting the FULL
+// section regardless of --sections= — a silent bypass of the default cut. These two functions compute the
+// SAME total= WITHOUT rendering or buffering anything (no FILE*, no allocation beyond one HashMap/sort), so
+// the degrade path can build a correct stub even when open_memstream itself is the thing that is failing.
+//
+// legoPreCapRowCount mirrors packLego's own RANKED-mode selection (has a non-empty implementors list, deduped
+// by name) exactly, and is provably interchangeable with it: packLego's dedup keeps the highest-RANKED
+// survivor per name, but the COUNT of distinct names is independent of which survivor is kept or what order
+// they are visited in, so this order-free walk yields the identical total= packLego's own render would have.
+// Focused mode (--lego=TYPE, focusId != kNoNode) is a different shape (exactly one row, even at
+// implementors=0) and is never routed through the ranked degrade path this exists for, so it is out of scope
+// here — callers only reach this from the ranked (--for) lens.
+inline std::size_t legoPreCapRowCount( const IngestResult& ing, const std::vector<std::vector<NodeId>>& implementors ) noexcept
+{
+    HashMap<std::string, char> seenName;
+    std::size_t                count = 0;
+    for( NodeId i = 0; i < implementors.size(); ++i )
+    {
+        if( i < ing.symbols.size() && !implementors[i].empty() && seenName.emplace( ing.symbols[i].name, char( 1 ) ).second )
+        {
+            ++count;
+        }
+    }
+    return count;
+}
+
+// composePreCapRowCount mirrors packCompose's own inSet/ownerSym membership test verbatim (no cap exists on
+// this section, so "pre-cap" and "emitted" are the same count, exactly as packCompose's own out-param
+// documents) — the degrade-path twin of legoPreCapRowCount above, for the same reason.
+inline std::size_t composePreCapRowCount( const IngestResult& ing, const std::vector<ComposeEdge>& composeEdges,
+                                          const std::vector<NodeId>& relevantIds )
+{
+    if( composeEdges.empty() || relevantIds.empty() )
+    {
+        return 0;
+    }
+    std::vector<NodeId> relevant( relevantIds );
+    std::sort( relevant.begin(), relevant.end() );
+    const auto inSet = [ &relevant ]( NodeId id ) noexcept -> bool
+    {
+        const auto it = std::lower_bound( relevant.begin(), relevant.end(), id );
+        return it != relevant.end() && *it == id;
+    };
+    std::size_t count = 0;
+    for( const ComposeEdge& ce : composeEdges )
+    {
+        if( ( inSet( ce.ownerSym ) || inSet( ce.typeSym ) ) && ce.ownerSym < ing.symbols.size() )
+        {
+            ++count;
+        }
+    }
+    return count;
+}
+
+inline std::string sectionStubXml( const char* tag, std::size_t total, std::string_view nextInvocation )
+{
+    // true by construction at every call site: a stub is only ever built in place of a section that just
+    // rendered non-empty (packLego/packCompose return early, with *outPreCapCount == 0, on a genuinely
+    // empty section) — total=0 here would mean the caller is about to assert a stub the section never had.
+    ASSUME( total > 0, "sectionStubXml: called for a section whose own pre-cap count is 0 — the caller should have left it absent instead" );
+    std::string s;
+    s.reserve( 40 + std::string_view( tag ).size() * 2 + nextInvocation.size() );
+    s += '<';  s += tag;
+    s += " total=\"";  s += std::to_string( total );  s += "\" shown=\"0\" capped=\"1\"";
+    s += rw::nextAttrXml( nextInvocation );
+    s += "/>";
+    return s;
+}
+
+// R2-L2' (round-2, priced re-registration of L2/B1): the ONE size-gate decision both call sites (the CLI
+// --for lens, verbs_for.h; its MCP twin, mcpverbs.h) share — pulled out to a standalone function so the
+// price rule lives in exactly one place and neither caller's own (already long) function carries its
+// branching. Builds the candidate stub itself (the caller reuses it verbatim on a collapse, never a second,
+// differently-priced build) and decides: collapse iff the section is SMALLER than what would replace it —
+// stub bytes PLUS the unshared, whole charge for kForSectionStubLegend (never split between lego and
+// compose, even when both collapse in the same answer and the clause itself is spliced once) — the
+// pre-registered simplification (rv-prereg2 Amendment 1, R4). Posture-independent by construction:
+// kForSectionStubLegend is the one string both --legend=full and --legend=compact splice.
+//
+// hasRenderedBytes=false is the open_memstream DEGRADE PATH: no buffered render exists to measure, only a
+// row count (the caller's preCapTotal, computed by legoPreCapRowCount/composePreCapRowCount WITHOUT
+// rendering). Sizing a section this function never measured would be the undisclosed guess §9.3 forbids, and
+// the rule is "collapse ONLY WHEN CHEAPER" — so an unmeasured section never collapses: the caller streams the
+// full section directly, exactly what --sections= would restore (CodeRabbit 4054594306). Collapsing it anyway
+// (round 1's unconditional rule, which this path kept until then) replaced a section like test/hasafix's
+// two-row <compose> with a LARGER stub plus its legend clause, so the section's shape depended on whether an
+// allocation succeeded. That path already omits est_tokens= and says so (ForLensBlockCharge), so a full
+// section there is disclosed as unmeasured, never priced wrong.
+struct SectionStubPricing
+{
+    bool        collapse;
+    std::string stubXml;   // always built for a real candidate, whether or not collapse ends up true —
+                           // the caller's ENSURES prices it either way, and a collapse reuses it as-is.
+};
+
+inline SectionStubPricing priceSectionStub( const char* tag, std::size_t preCapTotal, std::string_view nextInvocation,
+                                            bool hasRenderedBytes, std::size_t renderedBytes )
+{
+    SectionStubPricing p{ .collapse = false, .stubXml = sectionStubXml( tag, preCapTotal, nextInvocation ) };
+    p.collapse = hasRenderedBytes && renderedBytes > p.stubXml.size() + kForSectionStubLegend.size();
+    ENSURES( !p.collapse || ( hasRenderedBytes && p.stubXml.size() < renderedBytes ),
+             "priceSectionStub: a collapse was decided without measured bytes, or the stub is not smaller than the section" );
+    return p;
+}
+
+// B6.3 HTTP-route cross-service view: for a set of relevant symbols, emit the synthesized route USE→DEF
+// edges (client call → server handler) as a <routes> block. ONLY called from --for and --around (NOT the
+// default map) — see model.h RouteEdge / graph.h buildGraph's B6.3 section for how these are matched.
+// relevantIds: the set of symbol ids in scope; we emit a route where fromSym is in the set OR toSym is.
+inline void packRoutes( std::FILE* out, const IngestResult& ing,
+                        const std::vector<RouteEdge>& routeEdges,
+                        const std::vector<NodeId>& relevantIds )
+{
+    if( routeEdges.empty() || relevantIds.empty() )
+    {
+        return;
+    }
+
+    std::vector<NodeId> relevant( relevantIds );
+    std::sort( relevant.begin(), relevant.end() );
+
+    const auto inSet = [ &relevant ]( NodeId id ) noexcept -> bool
+    {
+        const auto it = std::lower_bound( relevant.begin(), relevant.end(), id );
+        return it != relevant.end() && *it == id;
+    };
+
+    XmlWriter         w( out );
+    std::vector<char> esc;
+    bool              open = false;
+
+    for( const RouteEdge& re : routeEdges )
+    {
+        if( !inSet( re.fromSym ) && !inSet( re.toSym ) )
+        {
+            continue;
+        }
+        if( !open ) { w.write( "<routes>" );  open = true; }
+        w.write( "<route method=\"" );  w.write( httpMethodTag( re.method ) );
+        w.write( "\" path=\"" );        w.write( escapeXml( re.path, esc ) );
+        w.write( "\" from=\"" );        w.write( escapeXml( re.fromName, esc ) );
+        w.write( "\" to=\"" );          w.write( escapeXml( re.toName, esc ) );  w.write( "\"/>" );
+    }
+    if( open ) { w.write( "</routes>" );  w.flush(); }
+}
+
+// R8: --with-graph — a compact MERMAID flowchart of the bundle's anchor
+// neighborhood, appended right before </ctx> when passed alongside --for/--pack-task. Reuses the SAME
+// mermaid syntax the --mermaid module-dependency view emits (flowchart direction, quoted labels, `"`→`'`
+// safety) instead of inventing a second emitter. Nodes = the top-N (N<=kWithGraphNodeCap) ranked symbols,
+// labelled "name (file:line)"; edges = 1-hop call edges where BOTH ends are in that same top-N set (the
+// neighborhood, not the whole graph). Deterministic ordering: rank order (rank desc, id asc — the same
+// key every other pack* view sorts by) for nodes, then ascending target id (CSR order) for edges. Callers
+// opt in explicitly (G5: additive) — a rendered diagram costs more tokens than the sigs it sits beside,
+// worth it only when the reading agent renders mermaid natively.
+inline constexpr std::size_t kWithGraphNodeCap = 8;
+
+inline void packGraphBlock( std::FILE* out, const IngestResult& ing, const std::vector<float>& rank,
+                            const std::vector<std::uint32_t>& outOff, const std::vector<NodeId>& outTargets )
+{
+    const std::size_t S = ing.symbols.size();
+    if( S == 0 )
+    {
+        return;
+    }
+
+    std::vector<NodeId> order( S );
+    for( NodeId i = 0; i < S; ++i )
+    {
+        order[i] = i;
+    }
+    sortutil::radixSortByScoreDescId( order, rank );
+    const std::size_t keep = std::min( kWithGraphNodeCap, S );
+    const std::vector<NodeId> nodes( order.begin(), order.begin() + keep );   // rank order, id 0..keep-1 index
+
+    const auto indexOf = [ & ]( NodeId id ) -> std::size_t   // linear scan is fine at keep<=8
+    {
+        for( std::size_t j = 0; j < nodes.size(); ++j )
+        {
+            if( nodes[j] == id )
+            {
+                return j;
+            }
+        }
+        return std::size_t( -1 );
+    };
+    const auto sanitize = []( std::string s ) -> std::string
+    {
+        for( char& ch : s )
+        {
+            if( ch == '"' )
+            {
+                ch = '\''; // mermaid label safety (same rule as --mermaid)
+            }
+        }
+        return s;
+    };
+
+    std::string body = "flowchart LR\n";
+    for( std::size_t i = 0; i < keep; ++i )
+    {
+        const Symbol& s = ing.symbols[ nodes[i] ];
+        const std::string file = s.fileId < ing.files.size() ? ing.files[ s.fileId ] : std::string();
+        // §B14 site 6 — composed on std::string. This one lives inside appendCdataSafe so it never breached
+        // G4; a char[512] instead produced a WELL-FORMED document that says something FALSE: the truncation
+        // deleted the closing `"]` AND the trailing '\n', gluing the next node declaration onto the cut label
+        // (measured on base at a 600-byte path: 8 node lines collapsed into ONE 4097-byte line that also
+        // swallowed the first edge). "sanitize" only swaps '"' for '\'' — a same-width scrub, so the cut still
+        // landed inside markup. See the FIXED-BUFFER RULE above escapeXml.
+        body += "n";  body += std::to_string( i );
+        body += "[\"";
+        body += sanitize( s.name );
+        body += " (";  body += sanitize( file );
+        body += ":";   body += std::to_string( s.line );
+        body += ")\"]\n";
+    }
+    for( std::size_t i = 0; i < keep; ++i )
+    {
+        const NodeId u = nodes[i];
+        if( outOff.empty() || u + 1 >= outOff.size() )
+        {
+            continue;
+        }
+        for( std::uint32_t k = outOff[u]; k < outOff[u + 1]; ++k )     // outTargets is deduped, ascending per source (CSR order)
+        {
+            const std::size_t j = indexOf( outTargets[k] );
+            if( j == std::size_t( -1 ) )
+            {
+                continue; // 1-hop among the top-N only — not the whole graph
+            }
+            char eb[ 32 ];
+            rw::formatTo( eb, sizeof( eb ), "n{} --> n{}\n", i, j );
+            body += eb;
+        }
+    }
+
+    std::string safe;  safe.reserve( body.size() );
+    appendCdataSafe( body, safe );   // splits any "]]>" so hostile names/paths can't break the CDATA (G4)
+
+    XmlWriter w( out );
+    w.write( "<graph fmt=\"mermaid\"><![CDATA[" );
+    w.write( safe );
+    w.write( "]]></graph>" );
+    w.flush();
+}
+
+// The interface method-CONTRACT (<m>) is only emitted where the language captures interface members
+// as real method symbols with a signature span the tags query pins correctly. Measured: C++/ObjC in-class
+// methods are captured soundly (SymKind::Method, correct sigStartByte/sigEndByte). For TS/Java/Rust the
+// interface's OWN members are NOT captured as method symbols the same way — scanning the iface span there
+// grabs the interface's own declaration line and emits garbage (`<m>interface Animal</m>`). Declarative
+// allow-list (not a scattered if): emit <m> only for langs where the surface is correct; suppress it (emit
+// the <impl> list alone) elsewhere. A correct empty contract beats a broad wrong one.
+inline bool legoMethodContractSound( Lang lang ) noexcept
+{
+    return lang == Lang::Cpp || lang == Lang::ObjC;
+}
+
+// §A9.4 — the suppression above, SAID OUT LOUD on the targeted verb. A Rust `trait Vehicle` with two
+// methods emitted nothing while the C++ `Shape` beside it emitted its contract, so a caller who named ONE
+// type read the silence as "this interface declares no methods" — a false zero. Suppression stays (a
+// correct empty contract beats a broad wrong one); it now carries a tell. RANKED (--for) mode is left
+// byte-identical: it emits a taste of many interfaces rather than an answer about one, so there is no
+// single absence for a reader to misread.
+//
+// The returned literal is spliced INSIDE the <iface> attribute list, between the still-open n=/p= quote and
+// the `" implementors="` tail — hence the leading quote and the missing trailing one.
+inline const char* legoContractCaveat( bool isContractExtracted, bool isTargeted ) noexcept
+{
+    return ( isTargeted && !isContractExtracted ) ? "\" methods=\"0\" caveat=\"not-extracted-for-lang" : "";
+}
+
+// §P3 SCOPE (bundle embeddings only). packLego's ranked mode treats "has implementors" as "is an interface",
+// so scoping THAT map is the filter: this returns a view of `implementors` in which every interface the task
+// did not reach has an EMPTY implementor list — packLego then ranks and emits only what is left, and emits no
+// <lego> element at all when nothing is (its own ifaces.empty() early return). Reached = the interface, or one
+// of its implementors, is on the caller's RESOLVED SURFACE: the top-N ranked ids the bundle already selected,
+// plus the files those ids live in (an interface declared in a file the task actually opened is on-topic even
+// when the interface symbol itself missed the cut).
+//
+// Why it exists: ranking alone never REMOVED anything, so `--for="cache invalidation"` answered with ten
+// unrelated test-fixture interfaces (Shape, Animal, IGreeter, …). Ten irrelevant interfaces are worse than
+// none, and absence is the honest shape — there is nothing to disclose. The standalone --lego=TYPE verb is
+// never scoped: the caller named the type.
+inline std::vector<std::vector<NodeId>> legoImplementorsOnSurface( const IngestResult& ing,
+                                                                   const std::vector<std::vector<NodeId>>& implementors,
+                                                                   const std::vector<NodeId>& surfaceIds )
+{
+    std::vector<char>            onSurface( ing.symbols.size(), 0 );
+    HashMap<std::uint32_t, char> surfaceFiles;
+    for( NodeId s : surfaceIds )
+    {
+        if( s < onSurface.size() ) { onSurface[s] = 1;  surfaceFiles.emplace( ing.symbols[s].fileId, char( 1 ) ); }
+    }
+
+    const auto isOnSurface = [ & ]( NodeId n ) { return n < onSurface.size() && ( onSurface[n] || surfaceFiles.find( ing.symbols[n].fileId ) != surfaceFiles.end() ); };
+
+    std::vector<std::vector<NodeId>> scoped( implementors.size() );          // empty lists = "not an interface" to packLego
+    for( NodeId id = 0; id < implementors.size(); ++id )
+    {
+        if( implementors[id].empty() )
+        {
+            continue;
+        }
+        bool isReached = isOnSurface( id );
+        for( NodeId im : implementors[id] )
+        {
+            isReached = isReached || isOnSurface( im );
+        }
+        if( isReached )
+        {
+            scoped[id] = implementors[id];
+        }
+    }
+    return scoped;
+}
+
+// §P3 follow-through, exposed by §P4's tier down-weight: <sigs> is budget-TRIMMED after the lego scope was
+// computed from the cap-N lens surface, so a lego row could carry a p= the rendered sigs no longer shows —
+// an identity the reader cannot tie back to the bundle's own surface (legobundlecheck rule 2; latent before
+// §P4 because the fixture files that host most interfaces also used to dominate the sigs head). Narrow
+// `legoScoped` to files literally present in the RENDERED sigs (its rows' ` p="…"`, compared in escaped
+// form exactly as serialized — the same naive scan the gate applies, so the two always agree): an interface
+// whose own file was trimmed is dropped (packLego's name-dedup then falls to the next-ranked same-named
+// interface, if any survives), and an implementor row in a trimmed file leaves its list. Returns true when
+// anything narrowed — the caller re-renders the lego block, a byte-SUBSET of what the sigs budget already
+// accounted for, so the bundle can only shrink.
+// R-E (2026-08-17 harvest) fix: `rootPrefix` MUST match what packSignatures() rendered `sigsRendered`'s own
+// <f p=…> rows with (empty ⇒ ing.files[] unchanged, same convention every other pathRel uses) — this scan
+// compares its OWN escaped ing.files[f] spelling against what it scraped out of sigsRendered's TEXT, and
+// those two must be the SAME relativization or every comparison silently fails: before this parameter
+// existed, sigsRendered's rows were already root-relative (packSignatures' own pathRel fix) while this
+// function's `escaped` was still the raw absolute ing.files[f] — nothing ever matched, isRenderedFile()
+// returned false for every file including ones that WERE rendered, and legoScoped narrowed to nothing on
+// every --for run whose rendered sigs happened to hit this path at all. Caught by legobundlecheck.sh going
+// red for the wrong reason (an empty lego, not a mis-narrowed one) rather than by a dedicated assertion —
+// worth a gate of its own if this class recurs.
+inline bool narrowLegoToRenderedSigs( const IngestResult& ing, std::vector<std::vector<NodeId>>& legoScoped,
+                                      std::string_view sigsRendered, std::string_view rootPrefix = {} )
+{
+    // P7 (terminality round A, lane R, 2026-09-05): the lens <sigs> is flat — every <d> row (and a file note's
+    // <note p=>) carries its own ` p="…"`; there is no <f p=> wrapper to scan. Attribute values are entity-
+    // escaped, so ` p="` can only open an attribute (and " amp=\"" does not match: it is preceded by 'm').
+    HashMap<std::string, char> renderedFilePaths;
+    for( std::size_t at = sigsRendered.find( " p=\"" ); at != std::string_view::npos; at = sigsRendered.find( " p=\"", at + 4 ) )
+    {
+        const std::size_t open  = at + 4;
+        const std::size_t close = sigsRendered.find( '"', open );
+        if( close == std::string_view::npos )
+        {
+            break; // torn attribute at end-of-buffer → stop scanning
+        }
+        renderedFilePaths.emplace( std::string( sigsRendered.substr( open, close - open ) ), char( 1 ) );
+        at = close;
+    }
+
+    // per-file verdict memo: escape each candidate file once, not once per row
+    std::vector<signed char> fileVerdict( ing.files.size(), -1 );        // -1 unknown, 0 trimmed, 1 rendered
+    std::vector<char>        esc;
+    const auto isRenderedFile = [ & ]( std::uint32_t f ) -> bool
+    {
+        if( f >= ing.files.size() )
+        {
+            return false;
+        }
+        if( fileVerdict[f] < 0 )
+        {
+            const std::string_view rel     = rootPrefix.empty() ? std::string_view( ing.files[f] ) : rw::sarif::rootRelativeUri( ing.files[f], rootPrefix );
+            const std::string_view escaped = escapeXml( rel, esc );
+            fileVerdict[f] = renderedFilePaths.find( std::string( escaped ) ) != renderedFilePaths.end() ? 1 : 0;
+        }
+        return fileVerdict[f] == 1;
+    };
+
+    bool narrowed = false;
+    for( NodeId id = 0; id < legoScoped.size(); ++id )
+    {
+        if( legoScoped[id].empty() )
+        {
+            continue;
+        }
+        if( !isRenderedFile( ing.symbols[id].fileId ) ) { legoScoped[id].clear();  narrowed = true;  continue; }
+
+        std::vector<NodeId> kept;
+        kept.reserve( legoScoped[id].size() );
+        for( NodeId im : legoScoped[id] )
+        {
+            if( im < ing.symbols.size() && isRenderedFile( ing.symbols[im].fileId ) )
+            {
+                kept.push_back( im );
+            }
+            else
+            {
+                narrowed = true;
+            }
+        }
+        if( kept.size() != legoScoped[id].size() )
+        {
+            legoScoped[id] = std::move( kept ); // empty ⇒ packLego drops the iface
+        }
+    }
+    return narrowed;
+}
+
+// the Lego view: for the top relevant interfaces/base-classes (those with implementors), emit the
+// concrete implementations — the socket → interchangeable bricks. Descriptive (no pattern labels);
+// steers an agent to snap a new brick into the socket instead of reimplementing. Emitted in --for.
+//
+// Two modes, one schema (<lego><iface><m><impl>): the RANKED set (--for) caps interfaces at topN, impls
+// at 16, and omits paths for brevity; the TARGETED variant (--lego=TYPE) passes focusId != kNoNode to emit
+// exactly that ONE interface, uncapped impls, the full contract, and withPaths=true so p= file paths ride
+// along on <iface>/<impl> (the agent can open them). Reuses the same writer + contract logic for both.
+//
+// §P3: the bundle embeddings pass withPaths=true as well — the bundle form of a verb must never carry less
+// identity than its standalone form, and without p= this repo's two different `Circle`s render as one
+// duplicated row. They also pass an implementors map pre-scoped to the task (legoImplementorsOnSurface).
+inline void packLego( std::FILE* out, const IngestResult& ing, const std::vector<std::vector<NodeId>>& implementors,
+                      const std::vector<float>& rank, int topN,
+                      RedactCounts* redact,                       // §B0/W3-N1: REQUIRED — the <m> contract sigs are emitted text
+                      const std::vector<char>* impure = nullptr,
+                      NodeId focusId = kNoNode, bool withPaths = false,
+                      std::string_view rootArg = {},    // R-E (2026-08-17): same single-root-only root
+                                                        // argument serialize() takes — see its comment.
+                      std::string_view graphCountFloorAttr = {},   // M15: the TARGETED root's gauge + marker
+                                                        // (graphCountFloorAttrXml( g ) — the caller owns the graph);
+                                                        // the ranked --for section passes nothing and keeps its shape
+                      std::size_t* outPreCapCount = nullptr )   // L2 (round-1 lever B1): the STUB's total= — this
+                                                        // function's OWN post-dedup ifaces.size(), before the topN
+                                                        // cut below. Written whenever non-null (both modes), so the
+                                                        // stub can never assert a count this function did not itself
+                                                        // compute (no second, drifting tally — the notes_total
+                                                        // precedent this repo already avoids: legoTotal at the JSON
+                                                        // call site is a DIFFERENT, pre-dedup count, on purpose).
+{
+    const std::string rootPrefix = rootArg.empty() ? std::string() : rw::sarif::rootPrefixOf( rootArg );
+    const auto         pathRel   = [ & ]( std::uint32_t fileId ) -> std::string_view
+    {
+        return rootArg.empty() ? std::string_view( ing.files[ fileId ] ) : rw::sarif::rootRelativeUri( ing.files[ fileId ], rootPrefix );
+    };
+    std::vector<NodeId> ifaces;
+    if( focusId != kNoNode )
+    {
+        // targeted: ALWAYS emit the requested interface, even with ZERO implementors (D8 fix). The caller
+        // already resolved a real symbol (resolveFocus succeeded) — a bare `<lego></lego>` here is
+        // indistinguishable from the "type not found" case, so emit the contract with implementors="0"
+        // instead of silently nothing. The RANKED (--for) path below keeps the has-implementors gate: it
+        // exists to select which interfaces are worth surfacing, not to detect "not found".
+        ifaces.push_back( focusId );
+    }
+    else
+    {
+        for( NodeId i = 0; i < ing.symbols.size(); ++i )
+        {
+            if( i < implementors.size() && !implementors[i].empty() )
+            {
+                ifaces.push_back( i );
+            }
+        }
+    }
+    if( ifaces.empty() )
+    {
+        if( outPreCapCount != nullptr ) { *outPreCapCount = 0; }
+        return;
+    }
+
+    sortutil::radixSortByScoreDescId( ifaces, rank );
+
+    // dedup same-named interfaces (fwd-decl + definition collisions), keeping the highest-ranked. In the
+    // targeted (focusId) path there is exactly one entry, so the dedup is a no-op that keeps it.
+    HashMap<std::string, char> seenName;
+    std::vector<NodeId>        uniq;
+    for( NodeId id : ifaces )
+    {
+        if( seenName.emplace( ing.symbols[id].name, char( 1 ) ).second )
+        {
+            uniq.push_back( id );
+        }
+    }
+    ifaces.swap( uniq );
+    if( outPreCapCount != nullptr ) { *outPreCapCount = ifaces.size(); }   // L2: post-dedup, PRE-topN — the stub's total=
+
+    const std::size_t keep = std::min<std::size_t>( topN > 0 ? std::size_t( topN ) : ifaces.size(), ifaces.size() );
+
+    XmlWriter         w( out );
+    std::vector<char> esc;
+    std::string       src;
+    std::uint32_t     loadedFile = 0xFFFFFFFFu;
+    // H5 (capture-audit 2026-09-04): implementors= is read off the name-based extends/implements edges — a
+    // floor. The marker rides on the TARGETED verb root (--lego=TYPE and its MCP twin); the --for bundle's
+    // ranked <lego> section is described by the bundle's own legend and keeps its byte shape.
+    w.write( "<lego" );
+    if( focusId != kNoNode ) { w.write( graphCountFloorAttr ); }   // graphCountFloorAttrXml( g ): gauge + kGraphCountFloorAttrXml
+    w.write( ">" );
+    for( std::size_t k = 0; k < keep; ++k )
+    {
+        const NodeId  id   = ifaces[k];
+        const Symbol& isym = ing.symbols[id];
+
+        const bool  isContractExtracted = legoMethodContractSound( isym.lang );
+        const char* caveatAttr          = legoContractCaveat( isContractExtracted, focusId != kNoNode );   // §A9.4
+        // H6/F2 (capture-audit 2026-09-04): the TARGETED form resolves a bare name through resolveFocus,
+        // which then picked the LOWEST-ID definition. `--lego=size` (6 definitions in 4 files) therefore answered
+        // implementors="0" about ONE of them with nothing on the row to say a pick had happened, so a
+        // genuine "this interface has no implementors" and a wrong-definition zero rendered identically.
+        // defs= is that fact on the row — the same disclosure --owners and --layout already carry for the
+        // same resolver, and the branch the family gate (singledefcheck.sh) accepts in place of a refusal.
+        // Ranked mode (--for) has no selector to be ambiguous ABOUT, so it stays byte-identical.
+        char hdr[ 64 ];
+        if( focusId != kNoNode )
+        {
+            rw::formatTo( hdr, sizeof( hdr ), "\" defs=\"{}\" implementors=\"{}\">",
+                           definitionCountOfName( ing, id ), implementors[id].size() );
+        }
+        else
+        {
+            rw::formatTo( hdr, sizeof( hdr ), "\" implementors=\"{}\">", implementors[id].size() );
+        }
+        w.write( "<iface n=\"" );  w.write( escapeXml( isym.name, esc ) );
+        if( withPaths ) { w.write( "\" p=\"" );  w.write( escapeXml( pathRel( isym.fileId ), esc ) ); }
+        w.write( caveatAttr );
+        w.write( hdr );
+
+        // contract: the interface's own method signatures (what a brick must implement) — only where the
+        // language captures them soundly (see legoMethodContractSound). Read the iface's file once; emit
+        // up to a few method sigs whose span sits inside the class span (or ALL of them for --lego=TYPE).
+        if( isContractExtracted )
+        {
+            if( isym.fileId != loadedFile )
+            {
+                src.clear();  loadedFile = isym.fileId;
+                std::FILE* in = std::fopen( diskPath( ing, isym.fileId ).c_str(), "rb" );
+                if( in )
+                {
+                    char buf[4096];
+                    std::size_t n;
+                    while( ( n = std::fread( buf, 1, sizeof( buf ), in ) ) > 0 )
+                    {
+                        src.append( buf, n );
+                    }
+                    std::fclose( in );
+                }
+            }
+            const int maxMethods = ( focusId != kNoNode ) ? 64 : 6;   // targeted verb = full contract; --for = a taste
+            int shown = 0;
+            for( const Symbol& m : ing.symbols )
+            {
+                if( m.kind != SymKind::Method || m.fileId != isym.fileId || m.id == id )
+                {
+                    continue;
+                }
+                if( m.sigStartByte < isym.sigStartByte || m.sigStartByte >= isym.endByte )
+                {
+                    continue; // inside the class span
+                }
+                // FIX #2 (nested-class over-list): span-containment alone lists a method of a class NESTED
+                // inside the iface (that method's span sits within the iface's span too). Require the method's
+                // OWN nearest class-like scope to BE the iface — Symbol::scope carries exactly that (the nearest
+                // enclosing class/struct name; enclosingScopeOf in ingest). scope==name ⇒ the iface owns it;
+                // Outer::Nested::nestedMethod (scope "Nested") is correctly excluded from Outer's contract.
+                if( m.scope != isym.name )
+                {
+                    continue;
+                }
+                if( m.sigEndByte <= m.sigStartByte || m.sigEndByte > src.size() )
+                {
+                    continue;
+                }
+                if( ++shown > maxMethods ) { w.write( "<!-- +more methods -->" ); break; }
+                const std::string sig = cleanSig( src.data(), m.sigStartByte, m.sigEndByte, redact );
+                if( !sig.empty() )
+                {
+                    const bool mp = pureFromSig( sig, m.lang ) && !( impure && m.id < impure->size() && (*impure)[m.id] );
+                    w.write( mp ? "<m pure=\"1\">" : "<m>" );  w.write( escapeXml( sig, esc ) );  w.write( "</m>" );
+                }
+            }
+        }
+
+        const std::vector<NodeId>& impls = implementors[id];
+        const std::size_t          cap   = ( focusId != kNoNode ) ? impls.size()               // targeted: uncapped
+                                                                  : ( impls.size() < 16 ? impls.size() : 16 );
+        for( std::size_t j = 0; j < cap; ++j )
+        {
+            const Symbol& im = ing.symbols[ impls[j] ];
+            w.write( "<impl n=\"" );  w.write( escapeXml( im.name, esc ) );
+            if( withPaths ) { w.write( "\" p=\"" );  w.write( escapeXml( pathRel( im.fileId ), esc ) ); }
+            w.write( "\"/>" );
+        }
+        if( impls.size() > cap )
+        {
+            w.write( "<!-- +more -->" );
+        }
+        w.write( "</iface>" );
+    }
+    w.write( "</lego>" );
+    w.flush();
+}
+
+// --deps: the file→file physical dependency view. Files ranked by include count (heaviest first =
+// the "pulls in 100 headers to do something simple" detector); each lists its #include/import
+// targets. Descriptive — names the number so the agent can choose a lighter path.
+inline void packDeps( std::FILE* out, const IngestResult& ing, int topN,
+                      const std::vector<std::vector<std::uint32_t>>& cycles,
+                      const std::vector<std::uint32_t>& transitive, const std::vector<std::uint32_t>& afferent,
+                      const std::vector<std::vector<std::uint32_t>>& adj,
+                      std::uint64_t ccd, double acd, double nccd,
+                      // parser version 83: the lazy pairs the load-time structure leaves out — per file (a row's
+                      // lazy_edges=, written only when > 0) and in total (<health lazy_edges=>, same rule). See
+                      // graph.h::resolveStructuralIncludeAdj for the cut and test/rubyrecvcheck.sh §5 for the rule.
+                      const std::vector<std::uint32_t>& lazyEdgesByFile, std::uint64_t lazyEdges,
+                      // T2: pagination of the per-file dependency LIST (the high-cardinality tail). limit<=0 =
+                      // unbounded (the historic topN cap still applies); >0 overrides topN. offset skips the first
+                      // M files of the sorted order. The health/godfiles/stabledeps/cycles PREAMBLE is unpaginated
+                      // (it's a small fixed summary). Default args keep every existing caller byte-identical.
+                      int pageLimit = 0, int pageOffset = 0,
+                      std::string_view rootArg = {} )   // R-E (2026-08-17): same single-root-only root
+                                                        // argument serialize() takes — see its comment.
+{
+    const std::size_t F = ing.files.size();
+    const std::string rootPrefix = rootArg.empty() ? std::string() : rw::sarif::rootPrefixOf( rootArg );
+    const auto         pathRel   = [ & ]( std::uint32_t fileId ) -> std::string_view
+    {
+        return rootArg.empty() ? std::string_view( ing.files[ fileId ] ) : rw::sarif::rootRelativeUri( ing.files[ fileId ], rootPrefix );
+    };
+    // §P9.4: dep_files= denominator (see graph.h::restrictDependencyHealth) — derived from `ing`, already a param.
+    const auto        depCapableMask = dependencyCapableMask( ing );
+    const std::size_t depFiles       = std::size_t( std::count( depCapableMask.begin(), depCapableMask.end(), char( 1 ) ) );
+    std::vector<std::vector<std::uint32_t>> byFile( F );   // file → indices into ing.includes
+    for( std::uint32_t i = 0; i < ing.includes.size(); ++i )
+    {
+        if( ing.includes[i].fileId < F )
+        {
+            byFile[ing.includes[i].fileId].push_back( i );
+        }
+    }
+
+    std::vector<std::uint32_t> order;
+    for( std::uint32_t f = 0; f < F; ++f )
+    {
+        if( !byFile[f].empty() )
+        {
+            order.push_back( f );
+        }
+    }
+    const auto trans = [ & ]( std::uint32_t f ) { return f < transitive.size() ? transitive[f] : std::uint32_t( byFile[f].size() ); };
+    std::sort( order.begin(), order.end(), [ & ]( std::uint32_t a, std::uint32_t b )   // heaviest TRANSITIVE cone first
+    { return trans( a ) != trans( b ) ? trans( a ) > trans( b ) : a < b; } );
+    // T2 + §P8 G1: window the sorted per-file list. --limit overrides the historic topN cap; --offset skips
+    // files; both default to the pre-T2 behavior (offset 0, cap = topN). This block used to hand-roll its own
+    // ` offset= limit=` pair — the SECOND paging vocabulary main.cpp's pageAttr() also spoke, and the reason
+    // a loop over --deps could cut rows correctly and still never terminate (no total=, no has_more=). It
+    // uses pageview's window + disclosure now, like every other paging verb.
+    const int         depLimit = rw::effectiveRowCap( pageLimit, topN > 0 ? topN : int( order.size() ) );
+    const rw::PageWindow depPage = rw::pageWindow( order.size(), depLimit, pageOffset );
+    const std::size_t begin    = depPage.begin;
+    const std::size_t end      = depPage.end;
+
+    XmlWriter         w( out );
+    std::vector<char> esc;
+    // §A10.11: three files=-family counts, one legend (the DEPTH-collision --owners already discloses for
+    // its own files=, same idea here across an element and its child instead of a fold).
+    w.write( "<!-- codecortex deps: file-to-file #include/import view, heaviest transitive cone first. files= (root) = files with "
+             "at least one dependency edge (this listing's own denominator); health files= = the whole indexed corpus; "
+             "health dep_files= = the dependency-CAPABLE subset of it (the ccd/acd/nccd denominator), and health dep_langs= "
+             "names EXACTLY which languages that subset counts — a dep_files=/ccd/acd/nccd number recorded against an "
+             "older build is comparable only when dep_langs= matches, and sh, rb, lua and ex joined the set at parser "
+             "version 81. a per-file target row (inc t=) with no edge behind it is a directive that did not resolve to an indexed file "
+             "(external package, or a specifier this tool declines to guess at, e.g. a shell path built from a variable) "
+             "— it is shown, never silently dropped. a LAZY edge — a pair every one of whose directives is written inside a "
+             "closure (a Ruby method/lambda/block, a TS/JS function body) or is a Ruby autoload or rescue class — is a USE, not a load-time "
+             "dependency: it is in the impact verb's importer tier (lazy=1) and in this row's inc t= list, and it is NOT in "
+             "afferent=/instab=/transitive=/godfiles/stabledeps/cycles/ccd/acd/nccd/shape=; health lazy_edges= counts the "
+             "pairs left out and a row's lazy_edges= its own — both absent when 0. "
+             "raise the default cap with limit=N (offset=M pages; a cut listing carries total=/has_more=/next_offset= so a paging loop can continue from it). -->" );
+
+    // discloseCap=TRUE, and this is the one un-paginated byte-shape change here: --deps caps the listing at
+    // --pack-top-n (default 40) while files= counted every file with an include — 40 rows under files="179"
+    // with nothing saying so is bug 2 verbatim (src/pageview.h, THE TRUNCATION VOCABULARY, rules 1-3). The
+    // paging half still appears only when --limit/--offset is active.
+    {
+        char db[ 64 + rw::kPageDisclosureCap ], pd[ rw::kPageDisclosureCap ];
+        rw::formatTo( db, sizeof( db ), "<deps files=\"{}\"{}", order.size(),
+                       rw::pageDisclosure( pd, sizeof( pd ), end - begin, order.size(), end, pageLimit, pageOffset, true ) );
+        w.write( db );
+        // R-E: root= is unbounded (a deep absolute path), so it is NOT folded into the fixed `db` buffer above
+        // (the V1-1 truncation class main.cpp's own history warns about) — written separately.
+        if( !rootArg.empty() ) { w.write( " root=\"" );  w.write( escapeXml( rootArg, esc ) );  w.write( "\"" ); }
+        w.write( ">" );
+    }
+
+    // whole-codebase dependency health (Lakos): NCCD<1 horizontal/flat/good, >1 vertical, >2 tangled.
+    // §P9.4: files=corpus size, dep_files=the ccd/acd/nccd/shape denominator (dependency-capable only).
+    //
+    // dep_langs= (kParserVer 81) is the DENOMINATOR'S OWN DISCLOSURE, and the reason it exists is that
+    // this line's numbers moved on the day four languages joined the capable set. `dep_files="750"` is
+    // not a comparable quantity across builds unless the set behind it is stated, and until now it was
+    // stated only in a source comment. It is derived from dependencyCapable() + langTag() in one loop
+    // (lintrules.h::dependencyCapableLangTags), so it cannot drift from the predicate it describes, and
+    // it is the SAME predicate --arch's propagation_cost N and --cochange's dep_capable= are built on.
+    const std::string depLangs = rw::dependencyCapableLangTags();
+    char hb[ 176 ];
+    rw::formatTo( hb, sizeof( hb ), "<health files=\"{}\" dep_files=\"{}\" ccd=\"{}\" acd=\"{:.1f}\" nccd=\"{:.2f}\" shape=\"{}\"",
+                   ing.files.size(), depFiles, static_cast<unsigned long long>( ccd ), acd, nccd,
+                   nccd < 1.0 ? "horizontal" : ( nccd > 2.0 ? "tangled" : "vertical" ) );
+    w.write( hb );
+    if( lazyEdges > 0 )   // absent exactly when nothing was left out — never a hidden 0, and byte-identical for every corpus without a lazy directive
+    {
+        char lb[ 40 ];  rw::formatTo( lb, sizeof( lb ), " lazy_edges=\"{}\"", static_cast<unsigned long long>( lazyEdges ) );
+        w.write( lb );
+    }
+    w.write( " dep_langs=\"" );  w.write( escapeXml( depLangs, esc ) );  w.write( "\"/>" );
+
+    // most depended-ON (afferent coupling Ca) = highest blast radius: changing these recompiles the most.
+    // The complement of the transitive-cone ranking below (efferent, "pulls in 100 headers").
+    {
+        std::vector<std::uint32_t> byAff;
+        for( std::uint32_t f = 0; f < F; ++f )
+        {
+            if( f < afferent.size() && afferent[f] > 0 )
+            {
+                byAff.push_back( f );
+            }
+        }
+        std::sort( byAff.begin(), byAff.end(), [ & ]( std::uint32_t a, std::uint32_t b )
+                   { return afferent[a] != afferent[b] ? afferent[a] > afferent[b] : ing.files[a] < ing.files[b]; } );
+        const std::size_t capG = byAff.size() < 12 ? byAff.size() : 12;
+        if( capG )
+        {
+            // §P9 N6: this listing used to emit exactly 12 rows with no total/cap disclosure while
+            // --report's own god-files section (main.cpp) says "showing N of M" for the SAME population —
+            // src/pageview.h, THE TRUNCATION VOCABULARY, rules 1-3, applied here too.
+            char gfb[ 64 ];
+            rw::formatTo( gfb, sizeof( gfb ), "<godfiles total=\"{}\" shown=\"{}\" capped=\"{}\">",
+                           byAff.size(), capG, capG < byAff.size() ? 1 : 0 );
+            w.write( gfb );   // ranked by afferent = # files that #include this one
+            for( std::size_t i = 0; i < capG; ++i )
+            {
+                char gb[ 48 ];  rw::formatTo( gb, sizeof( gb ), "\" afferent=\"{}\"/>", afferent[ byAff[i] ] );
+                w.write( "<f p=\"" );  w.write( escapeXml( pathRel( byAff[i] ), esc ) );  w.write( gb );
+            }
+            w.write( "</godfiles>" );
+        }
+    }
+
+    // Stable-Dependencies Principle (Martin): instability I = Ce/(Ca+Ce) must only DECREASE along an edge.
+    // Ce = efferent (# files this one includes), Ca = afferent. An edge f→g with I(f) < I(g) means you
+    // depend on something MORE volatile than yourself — flag the worst (ranked by the instability gap).
+    {
+        const auto instab = [ & ]( std::uint32_t f ) -> double
+        {
+            const double ce = f < adj.size() ? double( adj[f].size() ) : 0.0;
+            const double ca = f < afferent.size() ? double( afferent[f] ) : 0.0;
+            return ( ca + ce ) > 0.0 ? ce / ( ca + ce ) : 0.0;
+        };
+        struct SV { std::uint32_t from, to; double gap; };
+        std::vector<SV> sv;
+        for( std::uint32_t f = 0; f < adj.size(); ++f )
+        {
+            for( std::uint32_t g : adj[f] )
+            {
+                if( const double gap = instab( g ) - instab( f ); gap > 0.05 )
+                {
+                    sv.push_back( { f, g, gap } );
+                }
+            }
+        }
+        std::sort( sv.begin(), sv.end(), [ & ]( const SV& a, const SV& b )
+                   { return a.gap != b.gap ? a.gap > b.gap
+                            : ( ing.files[a.from] != ing.files[b.from] ? ing.files[a.from] < ing.files[b.from] : ing.files[a.to] < ing.files[b.to] ); } );
+        const std::size_t capS = sv.size() < 12 ? sv.size() : 12;
+        if( capS )
+        {
+            char sh[ 56 ];  rw::formatTo( sh, sizeof( sh ), "<stabledeps violations=\"{}\">", sv.size() );
+            w.write( sh );
+            for( std::size_t i = 0; i < capS; ++i )
+            {
+                char vb[ 32 ];  rw::formatTo( vb, sizeof( vb ), "\" gap=\"{:.2f}\"/>", sv[i].gap );
+                w.write( "<v from=\"" );  w.write( escapeXml( pathRel( sv[i].from ), esc ) );
+                w.write( "\" to=\"" );    w.write( escapeXml( pathRel( sv[i].to ), esc ) );  w.write( vb );
+            }
+            w.write( "</stabledeps>" );
+        }
+    }
+
+    if( !cycles.empty() )   // Lakos's cardinal sin: cyclic physical dependencies (must build/test as one unit)
+    {
+        w.write( "<cycles>" );
+        const std::size_t capC = cycles.size() < 20 ? cycles.size() : 20;
+        for( std::size_t c = 0; c < capC; ++c )
+        {
+            char cb[ 56 ];   // cost = k² = this cycle's contribution to CCD (Lakos: a k-cycle costs k²)
+            rw::formatTo( cb, sizeof( cb ), "<cycle size=\"{}\" cost=\"{}\"", cycles[c].size(), cycles[c].size() * cycles[c].size() );
+            w.write( cb );
+
+            // weakest-link cut suggestion: among the cycle's INTERNAL edges (both endpoints members of
+            // this SCC), pick the one with the fewest crossings — weight = how many times src includes
+            // dst (adj is un-deduped: a repeated #include pushes a duplicate entry, so occurrence count
+            // is an honest, already-available proxy for "how load-bearing is this one dependency"). Any
+            // single edge removed breaks a strongly-connected component's cyclicality along that walk, so
+            // the min-weight edge is the cheapest cut. Ties broken lexicographically by (srcPath,dstPath)
+            // for determinism (adj traversal order is file-id order, not necessarily path order).
+            {
+                HashMap<std::uint64_t, std::uint32_t> weight;                 // (srcIdx<<32|dstIdx) → occurrence count
+                std::vector<std::uint32_t>            memberOf( cycles[c].begin(), cycles[c].end() );
+                std::sort( memberOf.begin(), memberOf.end() );
+                const auto isMember = [ & ]( std::uint32_t f )
+                { return std::binary_search( memberOf.begin(), memberOf.end(), f ); };
+                for( std::uint32_t src : cycles[c] )
+                {
+                    if( src >= adj.size() )
+                    {
+                        continue;
+                    }
+                    for( std::uint32_t dst : adj[src] )
+                    {
+                        if( dst != src && isMember( dst ) )
+                        {
+                            ++weight[ ( std::uint64_t( src ) << 32 ) | dst ];
+                        }
+                    }
+                }
+                bool haveCut = false;  std::uint32_t bestSrc = 0, bestDst = 0, bestW = 0;
+                for( const auto& [ key, w_ ] : weight )
+                {
+                    const std::uint32_t s = std::uint32_t( key >> 32 ), d = std::uint32_t( key );
+                    const bool better = !haveCut || w_ < bestW
+                        || ( w_ == bestW && ( ing.files[s] != ing.files[bestSrc] ? ing.files[s] < ing.files[bestSrc]
+                                                                                  : ing.files[d] < ing.files[bestDst] ) );
+                    if( better ) { haveCut = true;  bestSrc = s;  bestDst = d;  bestW = w_; }
+                }
+                if( haveCut )   // degrade path: an SCC always has >=1 internal edge, but never assert it — just skip the attr
+                {
+                    w.write( " cut=\"" );  w.write( escapeXml( pathRel( bestSrc ), esc ) );
+                    w.write( " -&gt; " );  w.write( escapeXml( pathRel( bestDst ), esc ) );
+                    // §B14 — was `char rb[24]`, correct by EXACTLY one byte (`" cutrefs=""` is 12 literal bytes
+                    // + 10 digits at UINT32_MAX = 22, +NUL = 23 ≤ 24). A one-byte margin on a buffer nobody
+                    // re-derives is the class's own precondition, so it is composed instead.
+                    w.write( "\" cutrefs=\"" );  w.write( std::to_string( bestW ) );  w.write( "\"" );
+                }
+            }
+            w.write( ">" );
+
+            const std::size_t capN = cycles[c].size() < 12 ? cycles[c].size() : 12;
+            for( std::size_t j = 0; j < capN; ++j )
+            { w.write( "<f p=\"" );  w.write( escapeXml( pathRel( cycles[c][j] ), esc ) );  w.write( "\"/>" ); }
+            w.write( "</cycle>" );
+        }
+        w.write( "</cycles>" );
+    }
+
+    for( std::size_t k = begin; k < end; ++k )
+    {
+        const std::uint32_t f = order[k];
+        // §P9.2: Ce here MUST be the same project-only resolved graph (adj) the <stabledeps> violation
+        // scan above uses (its own `instab` lambda, line ~2405) — not byFile[f].size(), which counts every
+        // #include STATEMENT textually found (system/third-party headers included). Martin's I is defined
+        // over component (project) dependencies; using the raw statement count here produced a SECOND,
+        // different number under the same `instab=` name, so recomputing a printed <stabledeps gap=> from
+        // the printed <f instab=> failed (0.52ish claimed vs 0.25ish from project-only Ce). `includes=`
+        // below stays the raw statement count on purpose — that is a corpus fact, not an instability input.
+        const double ce_ = f < adj.size() ? double( adj[f].size() ) : 0.0, ca_ = f < afferent.size() ? double( afferent[f] ) : 0.0;
+        const double inst = ( ce_ + ca_ ) > 0.0 ? ce_ / ( ce_ + ca_ ) : 0.0;   // instability I = Ce/(Ca+Ce), project-only
+        const std::uint32_t lazyHere = f < lazyEdgesByFile.size() ? lazyEdgesByFile[f] : 0u;
+        char hdr[ 144 ];
+        if( lazyHere > 0 )   // the resolved pairs this row's directives make that the structure leaves out (parser version 83)
+        {
+            rw::formatTo( hdr, sizeof( hdr ), "\" includes=\"{}\" lazy_edges=\"{}\" afferent=\"{}\" instab=\"{:.2f}\" transitive=\"{}\">",
+                           byFile[f].size(), lazyHere, f < afferent.size() ? afferent[f] : 0u, inst, trans( f ) );
+        }
+        else
+        {
+            rw::formatTo( hdr, sizeof( hdr ), "\" includes=\"{}\" afferent=\"{}\" instab=\"{:.2f}\" transitive=\"{}\">",
+                           byFile[f].size(), f < afferent.size() ? afferent[f] : 0u, inst, trans( f ) );
+        }
+        w.write( "<f p=\"" );  w.write( escapeXml( pathRel( f ), esc ) );  w.write( hdr );
+        const std::size_t cap = byFile[f].size() < 40 ? byFile[f].size() : 40;
+        for( std::size_t j = 0; j < cap; ++j )
+        { w.write( "<inc t=\"" );  w.write( escapeXml( ing.includes[ byFile[f][j] ].target, esc ) );  w.write( "\"/>" ); }
+        if( byFile[f].size() > cap )
+        {
+            w.write( "<!-- +more -->" );
+        }
+        w.write( "</f>" );
+    }
+    w.write( "</deps>" );
+    w.flush();
+}
+
+// ── L2: --json output mode ──────────────────────────────────────────────────────────────────────────
+// A sibling JSON emitter for the CORE/CI verbs (default map, --for, --pack-task, --callers/--callees/
+// --impact, --quality-delta, --test-gate) — NOT a string-replace over the XML. Keys mirror the XML attr
+// names 1:1 so the two docs (README/--help) transfer without a second vocabulary. Determinism contract
+// is identical to the XML: stable key EMISSION order (== the XML attr order), the same float-formatting
+// path (bytesPerTokenFor / "%.4f" / estimateTokens — never a second counter), 2-run byte-diff clean.
+// Escaping reuses the ONE canonical JSON core (jsonesc.h) at the same posture as mcp.h's stdio JSON-RPC
+// output (escapeMcp): no <>& hardening (this is a CLI stdout stream, never re-embedded in HTML/markup),
+// UTF-8-validated with raw U+FFFD bytes on an invalid sequence — see jsonesc.h's posture rationale.
+//
+// Scope note (documented, not a silent gap): the --for/--pack-task JSON ranking section applies the
+// SAME rank-tier doc/sig trimming as the XML (kForDocFullRankCount/kForDocExcerptRankCount/kForTailSigBytes)
+// but does NOT run the XML's H1 global-budget LADDER (serialize.h kForPayloadBudgetBytes) — that ladder
+// exists to fit an XML-byte budget and re-deriving it against a second (JSON) byte model would be a
+// second source of truth for the same decision. In the ordinary case (result fits under budget without
+// the ladder engaging) the two are byte-for-byte the same SET of entries; only a bundle so large the XML
+// ladder had to trim further can diverge, and only in how AGGRESSIVELY the tail is cut, never in what the
+// top ranks show. --pack-task's callers/notes/tests sections reuse the XML path's OWN kept-count (the
+// packTaskListSection budget decision) so the two outputs report the same truncation, just re-shaped.
+
+// Reused JSON writer: XmlWriter is a generic 64 KB streaming byte buffer (no XML-specific behaviour
+// beyond flush-on-cap) — safe to reuse verbatim for a JSON stream.
+using JsonWriter = XmlWriter;
+
+// Escape `s` into `scratch` (jsonesc.h's canonical core, mcp posture) and write it as a quoted JSON
+// string literal, INCLUDING the surrounding quotes. `scratch` is caller-owned/reused (same pattern as
+// escapeXml's `esc` scratch vector) so a hot loop over many symbols allocates once, not per string.
+inline void writeJsonStr( JsonWriter& w, std::string_view s, std::string& scratch )
+{
+    scratch.clear();
+    jsonesc::escapeInto( s, scratch, /*escapeAngleAmp=*/false, /*validateUtf8=*/true, /*replacementAsTextEscape=*/false );
+    w.write( "\"" );
+    w.write( scratch );
+    w.write( "\"" );
+}
+
+// Same escape, allocating — for the small flat-list verbs (--callers/--callees/--impact/--quality-delta/
+// --test-gate) that already build their rows with std::printf rather than an XmlWriter; returns the
+// escaped text WITHOUT the surrounding quotes (call sites printf `"%s"` around it, mirroring how those
+// verbs already call ex()/escapeXml today). A --quality-delta pass flagged the hand-rolled body this used
+// to have as a clone of jsonesc::escapeMcp (same core, same flags — it IS that posture); delegates now
+// instead of carrying a second copy.
+inline std::string jsonStr( std::string_view s )
+{
+    return jsonesc::escapeMcp( s );
+}
+
+// ── LB-H (r10 GitNexus round) — --impact's IMPORT-TIER rows, one emitter per dialect ─────────────────────
+// The tier itself is MEASURED in graph.h (impactImportTier); these two only RENDER it, which is why they
+// live here and take a plain file-id span rather than the ImportTier struct: serialize.h deliberately
+// never includes graph.h, and rendering is the half three call sites share (the CLI's XML and JSON
+// branches, and the MCP twin's XML). Left at those sites, each carried its own relativize + escape + loop
+// — the clone shape --quality-delta names, and the §B4 drift shape where three copies of one row format
+// end up spelling it two ways.
+//
+// `rootPrefix` empty ⇒ paths stay the raw ing.files spelling (multi-root, or no single root to strip),
+// the same convention every other row emitter in this file follows.
+//
+// `lazy` (kParserVer 72, fnbody-require lane): parallel to `files` (same index, same size) — 1 ⇒ every
+// edge this importer has into the def set is a TS/JS function-body require/import (graph.h::ImportTier),
+// never a top-level one. Disclosed per row rather than folded into via= (a THIRD via= value would silently
+// widen a reader's existing `via="import"` match into two different claims); see
+// graphlegend.h::kImpactImportTierLegend for the definition a reader meets first.
+inline void emitImportRowsXml( std::FILE* out, const IngestResult& ing,
+                               std::span<const std::uint32_t> files, std::string_view rootPrefix, std::span<const char> lazy = {} )
+{
+    std::vector<char> esc;
+    for( std::size_t i = 0; i < files.size(); ++i )
+    {
+        const std::string_view raw = ing.files[ files[i] ];
+        const std::string_view rel = rootPrefix.empty() ? raw : rw::sarif::rootRelativeUri( raw, rootPrefix );
+        const bool              isLazy = i < lazy.size() && lazy[i] != 0;
+        rw::emitTo( out, "<f via=\"import\" p=\"{}\" lazy=\"{}\"/>", std::string( escapeXml( rel, esc ) ).c_str(), isLazy ? "1" : "0" );
+    }
+}
+
+inline void emitImportRowsJson( std::FILE* out, const IngestResult& ing,
+                                std::span<const std::uint32_t> files, std::string_view rootPrefix, std::span<const char> lazy = {} )
+{
+    for( std::size_t i = 0; i < files.size(); ++i )
+    {
+        const std::string_view raw = ing.files[ files[i] ];
+        const std::string_view rel = rootPrefix.empty() ? raw : rw::sarif::rootRelativeUri( raw, rootPrefix );
+        const bool              isLazy = i < lazy.size() && lazy[i] != 0;
+        rw::emitTo( out, "{}{{\"via\":\"import\",\"p\":\"{}\",\"lazy\":{}}}", i ? "," : "", jsonStr( rel ).c_str(), isLazy ? "true" : "false" );
+    }
+}
+
+// The `--metrics` run on one JSON map row (loc/params/nest/cbo/lcom4/amp/tested/in/out/cx/ccx/role). Every
+// member is absent-unless-measured — an omitted key means "not measured", NEVER a fabricated 0 that would
+// read as "nobody calls this". Its own function so serializeJson's row loop stays a list of facts rather
+// than a nest of optional-metric branches.
+struct JsonQMetrics
+{
+    const Symbol&                     sym;
+    NodeId                            id;
+    std::uint32_t                     outDegree;
+    const std::vector<std::uint32_t>* fanIn;
+    const std::vector<std::uint32_t>* cbo;
+    const std::vector<std::uint8_t>*  tested;
+    const std::vector<std::uint32_t>* lcom4;
+    const std::vector<std::uint32_t>* amp;
+};
+
+inline void writeJsonQMetrics( JsonWriter& w, const JsonQMetrics& q )
+{
+    const Symbol& s = q.sym;
+    char          num[ 96 ];
+
+    if( s.loc > 0 ) { rw::formatTo( num, sizeof( num ), ",\"loc\":{}", s.loc );  w.write( num ); }
+    if( s.kind == SymKind::Function || s.kind == SymKind::Method )
+    {
+        rw::formatTo( num, sizeof( num ), ",\"params\":{},\"nest\":{}", unsigned( s.params ), unsigned( s.maxNest ) );
+        w.write( num );
+        // Phase 1 (local-variable-indexing, docs/LOCALS_INDEXING.md): the JSON sibling of the XML
+        // locals=/locals_floor= pair — omitted key (never a fabricated 0) outside model.h's
+        // localsCountedLang (MVP: C/C++ only). "locals_floor" mirrors the XML boolean-flag convention
+        // as JSON `true`, matching how `tested` is spelled two lines below.
+        if( localsCountedLang( s.lang ) )
+        {
+            rw::formatTo( num, sizeof( num ), ",\"locals\":{},\"locals_floor\":true", s.locals );
+            w.write( num );
+        }
+        // ppalt disclosure — the JSON sibling of the XML ppalt= attribute (model.h Symbol::ppAlt):
+        // omitted key when 0, mirroring locals/tested (absent-unless-measured).
+        if( s.ppAlt > 0 )
+        {
+            rw::formatTo( num, sizeof( num ), ",\"ppalt\":{}", unsigned( s.ppAlt ) );
+            w.write( num );
+        }
+        // The JSON sibling of the XML humps=/deep=/deep_floor= triple — same omission rule (absent exactly
+        // when nest < quality::kNestBar), same floor flag spelled as JSON `true`. Unlike locals, this is
+        // NOT language-gated: cc_walk computes nesting for every grammar.
+        if( s.humps > 0 )
+        {
+            rw::formatTo( num, sizeof( num ), ",\"humps\":{},\"deep\":{},\"deep_floor\":true", unsigned( s.humps ), unsigned( s.deepLoc ) );
+            w.write( num );
+        }
+        // The JSON sibling of the XML ev=/ev_floor=/ev_why= triple — same omission rule (absent means
+        // exactly 1 on a cx row; evCountedLang keeps an uncovered language absent, never a fabricated
+        // number), floor spelled as JSON true like deep_floor/locals_floor. Composed on std::string via
+        // the shared evWhyString formatter — no fixed buffer and no new format call for fixedbufsweep to classify.
+        if( evCountedLang( s.lang ) && s.ev >= 2u )
+        {
+            w.write( ",\"ev\":" );
+            w.write( std::to_string( s.ev ) );
+            w.write( ",\"ev_floor\":true,\"ev_why\":\"" );
+            w.write( evWhyString( s ) );
+            w.write( "\"" );
+        }
+    }
+    if( q.cbo && q.id < q.cbo->size() ) { rw::formatTo( num, sizeof( num ), ",\"cbo\":{}", (*q.cbo)[q.id] );  w.write( num ); }
+    if( q.lcom4 && q.id < q.lcom4->size() && (*q.lcom4)[q.id] != 0xFFFFFFFFu )   // 0xFFFFFFFF = kLcom4NA (graph.h) ⇒ omit
+    { rw::formatTo( num, sizeof( num ), ",\"lcom4\":{}", (*q.lcom4)[q.id] );  w.write( num ); }
+    if( q.amp && q.id < q.amp->size() ) { rw::formatTo( num, sizeof( num ), ",\"amp\":{}", (*q.amp)[q.id] );  w.write( num ); }
+    if( q.tested && q.id < q.tested->size() && ( *q.tested )[q.id] )
+    {
+        w.write( ",\"tested\":true" );
+    }
+    if( !q.fanIn )
+    {
+        return;
+    }
+
+    const std::uint32_t in = ( q.id < q.fanIn->size() ) ? (*q.fanIn)[q.id] : 0u;
+    rw::formatTo( num, sizeof( num ), ",\"in\":{},\"out\":{},\"cx\":{},\"ccx\":{}", in, q.outDegree, s.cx, s.ccx );
+    w.write( num );
+    if( in >= 8 )
+    {
+        w.write( ",\"role\":\"hub\"" );
+    }
+}
+
+// The default map's JSON header — the gauge block plus the two prologues that ride on it, in one place so
+// "which gauge, in which order, on which condition" is stated once rather than smeared through the emitter.
+// The XML sibling states the same set through its `stats` snprintf + the <root> prologue in serialize().
+struct JsonMapHeader
+{
+    const IngestResult&              ing;
+    std::size_t                      symbolCount;
+    std::size_t                      edgeCount;
+    std::size_t                      shownCount;
+    std::size_t                      estTokens;
+    std::size_t                      ambiguousCount;
+    std::size_t                      unresolvedCount;
+    const char*                      orderAttr;
+    const std::vector<std::uint8_t>* outProv;      // nullptr ⇒ no precise= (nothing was measured)
+    const MapAnnotations*            ann;          // §B1.2: how THIS map was produced — the same at/rank_by/window
+                                                   // stamp the XML `<r>` element carries. nullptr ⇒ no stamp emitted.
+    std::string_view                 rootArg;      // R-E: the JSON twin of the XML `<r root="…">` — empty for
+                                                    // multi-root (its own roots_count/roots table below already
+                                                    // names every root) or a caller that never passes one.
+    std::size_t                      localityPinnedCount = 0;   // Phase 4: Σ lpin — "locality_pinned":N, absent when 0
+    std::size_t                      externalCount = 0;         // Phase 5: the veto's refusals — "external":N, absent when 0
+    std::size_t                      declinedCount = 0;         // tier 3's declines — "declined":N, absent when 0
+    std::size_t                      extentSuspectCount = 0;    // extent honesty: "extent_suspect_syms":N, absent when 0
+    std::size_t                      macroBlankedCount  = 0;    // member-macro re-parse: "macro_blanked_files":N, absent when 0
+    bool                             isEstModelled      = false;   // MapEstimate: "est_measured":false, absent when measured
+};
+
+// §B1.2: the PROVENANCE stamp — the JSON half of the XML `<r at= rank_by= window=>` attributes. Without it
+// `--rank-by=churn --json` and `--rank-by=pagerank --json` emitted keyset-identical headers while every `k`
+// underneath meant something different (a git change-frequency prior vs call-graph importance), against
+// --help's explicit promise that churn "stamps its own map … so it cannot pass for the structural one".
+// Same absent-unless-produced rule as the XML: a default map passes no annotations ⇒ zero bytes, byte-
+// identical output. `changed` (--map-diff) has no arm here on purpose — see the coverage note above
+// serializeJson: jsonUnsupportedVerb refuses --map-diff before this emitter is ever reached.
+inline void writeJsonMapStamp( JsonWriter& w, std::string& esc, const MapAnnotations* ann )
+{
+    if( !ann )
+    {
+        return;
+    }
+
+    // §B12.6 (CA4): `at`'s ABSENCE had two meanings inside one dialect. Five JSON emitters (quality-delta,
+    // test-gate, cochange, plan-lanes, the MCP quality_delta twin) write `"at":null` when the root has no
+    // HEAD to anchor to — "we tried, there is nothing" — while this one OMITTED the key in the same state,
+    // so `--rank-by=churn --json` on a non-git root produced a stamped map (rank_by=, window=) with no `at`
+    // key at all. A schema-holding consumer breaks on one form; a presence-keying consumer gets opposite
+    // answers from two JSON surfaces of the SAME binary in the SAME state.
+    //
+    // The rule, now uniform across the dialect: the key is PRESENT exactly when the run attempted an anchor,
+    // and `null` means the attempt found no HEAD. A run that anchors nothing (the plain map — no map-diff,
+    // no churn ranking) emits no key, which is also what the XML does, so the 1:1 attr/key correspondence
+    // holds in every state. The windowless rank_by= stamps (authority/hub/rrf) attempt no anchor and are
+    // deliberately outside the predicate, exactly as they are on the XML side.
+    const bool didAttemptAtStamp = ( ann->changedCount != nullptr ) || ( ann->churnWindow != nullptr );
+    if( didAttemptAtStamp )
+    {
+        w.write( ",\"at\":" );
+        if( ann->atStamp != nullptr && !ann->atStamp->empty() )
+        {
+            writeJsonStr( w, *ann->atStamp, esc );
+        }
+        else
+        {
+            w.write( "null" );
+        }
+    }
+    if( ann->churnWindow != nullptr )
+    {
+        w.write( ",\"rank_by\":" );                            // P0-4: which churn ranker — "churn" or "churn-decay"
+        writeJsonStr( w, ann->churnRankLabel, esc );
+        w.write( ",\"window\":" );
+        writeJsonStr( w, *ann->churnWindow, esc );
+    }
+    // §B2.1: authority/hub/rrf carry no window, so they stamp rank_by alone — the JSON half of the XML arm
+    // above, symmetric with it, so the two dialects still cannot disagree about how a map was produced.
+    else if( ann->rankByLabel != nullptr )
+    {
+        w.write( ",\"rank_by\":" );
+        writeJsonStr( w, std::string_view( ann->rankByLabel ), esc );
+    }
+
+    // §C4 — the --max-tokens fit, in the dialect that was missing it. `--max-tokens=N --json` shaped the map and
+    // then said NOTHING about the shaping: no max_tokens=, no fit_bytes=, no over_ceiling — the XML sibling's
+    // three attributes, on a surface whose whole audience is machines. `--help` already described this state
+    // accurately ("XML only: the --json map carries no max_tokens=/fit_bytes= keys yet"), so the choice here was
+    // between a precise description of a gap and closing the gap; the data was already in this function's own
+    // `ann` parameter, so the gap closes.
+    //
+    // fit_measured_in= is the one key with no XML twin, and it is required rather than decorative: the top-K
+    // binary search that chose this map measures the XML rendering (main.cpp's measureMapBytes calls
+    // serialize()), and the JSON encoding of the same map is materially smaller — MEASURED on src/
+    // --max-tokens=1200: fit_bytes=2548, XML 2464 B, JSON 1775 B. Emitting fit_bytes into a JSON document
+    // without naming the dialect it was measured against would replace one silence with a false implication.
+    // The XML needs no such key because the XML is the measured dialect. Fixing the SEARCH to measure the
+    // emitted dialect is a main.cpp change and is recorded as a residual, not smuggled in here.
+    if( ann->maxTokensFit != nullptr )
+    {
+        char fit[ 160 ];
+        rw::formatTo( fit, sizeof( fit ), ",\"max_tokens\":{},\"fit_bytes\":{},\"fit_measured_in\":\"xml\"{}{}",
+                       ann->maxTokensFit->askedTokens, ann->maxTokensFit->ceilingBytes,
+                       ann->maxTokensFit->isOverCeiling || ann->maxTokensFit->isUnmeasured ? ",\"over_ceiling\":true" : "",
+                       ann->maxTokensFit->isUnmeasured ? ",\"fit_unmeasured\":true" : "" );
+        w.write( fit );
+    }
+}
+
+// §L1, JSON lane: the same reasoning as the XML header's buildUnindexedAttr — an MCP client is the
+// audience LEAST able to notice on its own that the repo's primary language has no grammar in this build.
+// Object form ("ml":7231) rather than the XML lane's packed string, because a JSON consumer should not have
+// to re-parse a comma list; `unindexed_exts` appears exactly when the list was capped, so its ABSENCE means
+// the object is complete — the same rule, and the same cap (kUnindexedHeaderExts), as the XML lane.
+// Writes nothing at all when there is nothing unindexed.
+inline void writeJsonUnindexed( JsonWriter& w, std::string& esc, const CrawlSkips& skips )
+{
+    if( skips.unindexedExts.empty() )
+    {
+        return;
+    }
+    char num[ 64 ];
+    w.write( "\"unindexed\":{" );
+    const std::size_t shown = skips.unindexedExts.size() < kUnindexedHeaderExts
+                            ? skips.unindexedExts.size() : kUnindexedHeaderExts;
+    for( std::size_t i = 0; i < shown; ++i )
+    {
+        const UnindexedExt& ue   = skips.unindexedExts[ i ];
+        const std::string   bare = ue.ext.size() > 1 && ue.ext[ 0 ] == '.' ? ue.ext.substr( 1 ) : ue.ext;
+        if( i != 0 )
+        {
+            w.write( "," );
+        }
+        writeJsonStr( w, bare, esc );
+        rw::formatTo( num, sizeof( num ), ":{}", ( unsigned long long ) ue.files );
+        w.write( num );
+    }
+    if( skips.unindexedExts.size() > shown )
+    {
+        rw::formatTo( num, sizeof( num ), "}},\"unindexed_exts\":{},", skips.unindexedExts.size() );
+    }
+    else
+    {
+        rw::formatTo( num, sizeof( num ), "}}," );   // complete list ⇒ no cap to disclose
+    }
+    w.write( num );
+}
+
+inline void writeJsonMapHeader( JsonWriter& w, std::string& esc, const JsonMapHeader& h )
+{
+    char hdr[ 256 ];   // the gauge line has 7 size_t fields — wider than the per-symbol scratch
+    rw::formatTo( hdr, sizeof( hdr ), "{{\"files\":{},\"symbols\":{},\"edges\":{},\"shown\":{},\"est_tokens\":{},\"ambiguous\":{},\"unresolved\":{},",
+                   h.ing.files.size(), h.symbolCount, h.edgeCount, h.shownCount, h.estTokens, h.ambiguousCount, h.unresolvedCount );
+    w.write( hdr );
+    if( h.isEstModelled )
+    {
+        w.write( "\"est_measured\":false," );   // the XML est_measured="0" twin: est_tokens above is the model
+    }
+    // Phase 4: the S6-C locality-pin gauge — same absent-when-zero rule as the XML `locality_pinned=`.
+    if( h.localityPinnedCount > 0 )
+    {
+        rw::formatTo( hdr, sizeof( hdr ), "\"locality_pinned\":{},", h.localityPinnedCount );
+        w.write( hdr );
+    }
+    // Phase 5: the external-name veto gauge — the JSON twin of the XML `external=`, same absent-when-zero rule.
+    if( h.externalCount > 0 )
+    {
+        rw::formatTo( hdr, sizeof( hdr ), "\"external\":{},", h.externalCount );
+        w.write( hdr );
+    }
+    // tier 3's declines — the JSON twin of the XML `declined=`, same absent-when-zero rule.
+    if( h.declinedCount > 0 )
+    {
+        rw::formatTo( hdr, sizeof( hdr ), "\"declined\":{},", h.declinedCount );
+        w.write( hdr );
+    }
+    // extent honesty: the JSON twin of the XML header's extent_suspect_syms=, same absent-when-zero rule and the
+    // XML header's order (after the call-resolution family, declined included).
+    if( h.extentSuspectCount > 0 )
+    {
+        w.write( "\"extent_suspect_syms\":" + std::to_string( h.extentSuspectCount ) + "," );   // composed, not a fixed buffer
+    }
+    // member-macro re-parse: the JSON twin of the XML header's macro_blanked_files=, same absent-when-zero rule.
+    if( h.macroBlankedCount > 0 )
+    {
+        w.write( "\"macro_blanked_files\":" + std::to_string( h.macroBlankedCount ) + "," );
+    }
+
+    // §P0.5d, JSON lane: the size-ceiling disclosure must reach --json consumers too — the XML header
+    // gained skipped_oversize= and a JSON reader (MCP clients most of all) must not be the one audience
+    // still shown the survivors as if they were the corpus. Same absent-when-zero rule as the XML side.
+    if( !h.ing.skippedOversize.empty() )
+    {
+        rw::formatTo( hdr, sizeof( hdr ), "\"skipped_oversize\":{},", h.ing.skippedOversize.size() );
+        w.write( hdr );
+    }
+
+    // §SEC1, JSON lane: the crawl-boundary refusal must reach --json/MCP consumers too, by the same argument
+    // skipped_oversize= makes one paragraph up — the audience most likely to be a model is the one least able
+    // to notice a corpus that shrank. Same absent-when-zero rule as the XML side.
+    if( h.ing.crawlSkips.escapedFiles > 0 )
+    {
+        rw::formatTo( hdr, sizeof( hdr ), "\"escaped_root\":{},", ( unsigned long long ) h.ing.crawlSkips.escapedFiles );
+        w.write( hdr );
+    }
+
+    writeJsonUnindexed( w, esc, h.ing.crawlSkips );   // §L1, JSON lane — see its own header
+    // §A4d: `precise=N` — how many out-edges the SCIP overlay actually pinned. C1 drift fix, the JSON half of
+    // the XML fix above and by the same argument: this counted every NONZERO provenance value, so an FFI
+    // binding (2) and now a k-way split arm (3) were both reported as SCIP-precise. Emitted only when the
+    // count is non-zero (absent ⇒ nothing was pinned, never a fabricated 0 nor a borrowed one).
+    if( h.outProv )
+    {
+        std::size_t preciseTotal = 0;
+        for( std::uint8_t v : *h.outProv )
+        {
+            preciseTotal += ( v == 1u ? 1u : 0u );
+        }
+        if( preciseTotal > 0 )
+        {
+            rw::formatTo( hdr, sizeof( hdr ), "\"precise\":{},", preciseTotal );
+            w.write( hdr );
+        }
+    }
+    w.write( "\"order\":" );
+    writeJsonStr( w, h.orderAttr, esc );
+
+    // R-E (2026-08-17 harvest): the JSON twin of the XML `<r root="…">` — same condition (single-root only,
+    // multi-root's own roots_count/roots table below already names every root), right after order= like the
+    // XML sibling places root= right after its own leading attributes.
+    if( !h.rootArg.empty() )
+    {
+        w.write( ",\"root\":" );
+        writeJsonStr( w, h.rootArg, esc );
+    }
+
+    writeJsonMapStamp( w, esc, h.ann );   // §B1.2 — see its header
+
+    // W2-F: the convergence disclosure, in the dialect's own spelling. §B1.2's rule is that the two dialects'
+    // headers carry the SAME KEYSET for the same run, so this is not an XML-side courtesy — a JSON consumer
+    // (every MCP client) reading a truncated ranking with no key to tell it so is the exact defect the XML
+    // side just closed. Same slot, same absent-means-converged rule.
+    w.write( renderDisclosure( h.ann->prDisclosure, DiscloseAs::JsonKeys ) );
+
+    // §A4b: the multi-root prologue (A13) — `roots_count` joins the header gauges and a
+    // `roots` table maps each label to its root path, ONLY when N≥2 (single-root output byte-unchanged).
+    // Without it every `"p"` in the payload is an unresolvable root-relative fragment.
+    if( h.ing.rootLabels.size() < 2 )
+    {
+        return;
+    }
+
+    rw::formatTo( hdr, sizeof( hdr ), ",\"roots_count\":{},\"roots\":[", h.ing.rootLabels.size() );
+    w.write( hdr );
+    for( std::size_t r = 0; r < h.ing.rootLabels.size(); ++r )
+    {
+        if( r )
+        {
+            w.write( "," );
+        }
+        w.write( "{\"label\":" );  writeJsonStr( w, h.ing.rootLabels[r], esc );
+        // V1-6: "p", not "path" — the XML sibling is <root label= p=/> and --help promises keys mirror attrs 1:1.
+        w.write( ",\"p\":" );      writeJsonStr( w, r < h.ing.rootPaths.size() ? h.ing.rootPaths[r] : std::string(), esc );
+        w.write( "}" );
+    }
+    w.write( "]" );
+}
+
+// The default-map JSON sibling of serialize() — same rank/order/bucket logic (kept a deliberate, mechanical
+// duplication per the L2 seam decision: a sibling emitter, not a shared-emission refactor of the XML path,
+// so the G5 byte-identical-default contract carries zero risk from this addition). Scope: the common single-
+// root invocation (metrics, fan-in, ambiguity, cbo/tested/lcom4/amp Q-metrics, stable/most-important-last/
+// auto-order, bind labels, est_tokens, per-edge provenance, the multi-root prologue, and — §B1.2 — the
+// at/rank_by/window PROVENANCE STAMP a churn-ranked map carries. NOT covered (documented gap, refused
+// upstream by jsonUnsupportedVerb before this is ever reached in those combinations): --map-diff
+// (changed=), --expand's appended <bodies> token math (extraBodyTokens).
+//
+// §B1.2 — churn was the third XML-only honesty fact this sibling dropped, and the enumeration above used to
+// omit it entirely: it read as a complete coverage statement while `--rank-by=churn --json` and
+// `--rank-by=pagerank --json` emitted keyset-identical headers. serializeJson now takes the same
+// `MapAnnotations` the XML path takes and emits `at`/`rank_by`/`window` from it (writeJsonMapHeader).
+//
+// §A4b/§A4d closed three XML-only honesty attributes that this sibling used to drop SILENTLY:
+//   * multi-root: the header comment above claimed the combination was "refused upstream by
+//     jsonUnsupportedVerb" — it never was (no roots-count arm exists there), so a JSON consumer got
+//     `"p":"src/./svector.h"` with no label→path table and no signal the graph spanned several roots.
+//     `"roots"`/`"roots_count"` now mirror the XML `roots=` + `<root label= p=/>` prologue exactly.
+//   * overloads: this emitter never called collapseOverloadRows(), so a const/non-const pair printed TWO
+//     byte-identical rows and a consumer keying on "id" silently lost one. Collapsed here as in the XML,
+//     with the same `"overloads":N` (>1 only) discriminator.
+//   * prov/precise: an edge the SCIP overlay or an FFI binding actually PINNED read identical to a
+//     name-guessed one. Same absent-unless-present rule as the XML attribute.
+inline void serializeJson( std::FILE* out, const IngestResult& ing, const std::vector<float>& rank,
+                           const std::vector<std::uint32_t>& outOff, const std::vector<NodeId>& outTargets,
+                           int topK, bool mostImportantLast, bool metrics,
+                           const std::vector<std::uint32_t>* fanIn, const std::vector<std::uint32_t>* ambOut,
+                           bool stable,
+                           const std::vector<std::uint32_t>* cbo, const std::vector<std::uint8_t>* tested,
+                           const std::vector<std::uint32_t>* lcom4, const std::vector<std::uint32_t>* amp,
+                           const std::vector<std::uint32_t>* unresolvedOut,
+                           const std::vector<std::string>* bind,
+                           bool autoOrder, std::size_t* outEstTokens,
+                           const std::vector<std::uint8_t>* outProv = nullptr,
+                           const MapAnnotations& ann = {},      // §B1.2: same value the XML serialize() takes;
+                                                                // defaulted ⇒ every field null ⇒ no stamp keys.
+                           std::string_view rootArg = {},      // R-E: same single-root-only root argument the
+                                                                 // XML serialize() takes (see its own comment)
+                           const std::vector<std::uint32_t>* locPinOut = nullptr,   // Phase 4: same as serialize()'s
+                           std::size_t externalCalls = 0,                           // Phase 5: same as serialize()'s
+                           const std::vector<std::uint32_t>* declinedOut = nullptr ) // tier-3 declines: same as serialize()'s
+{
+    const std::size_t S = ing.symbols.size();
+    const std::string rootPrefix = rootArg.empty() ? std::string() : rw::sarif::rootPrefixOf( rootArg );
+    const auto         pathRel   = [ & ]( std::uint32_t fileId ) -> std::string_view
+    {
+        return rootArg.empty() ? std::string_view( ing.files[ fileId ] ) : rw::sarif::rootRelativeUri( ing.files[ fileId ], rootPrefix );
+    };
+
+    std::vector<NodeId> order( S );
+    for( NodeId i = 0; i < S; ++i )
+    {
+        order[i] = i;
+    }
+    sortutil::radixSortByScoreDescId( order, rank );
+
+    const std::size_t keep = std::min<std::size_t>( topK > 0 ? std::size_t( topK ) : S, S );
+
+    std::vector<std::vector<NodeId>> buckets( ing.files.size() );
+    std::vector<std::uint32_t>       fileOrder;
+    std::vector<char>                seen( ing.files.size(), 0 );
+    for( std::size_t k = 0; k < keep; ++k )
+    {
+        const NodeId        id = order[k];
+        const std::uint32_t f  = ing.symbols[id].fileId;
+        if( !seen[f] ) { seen[f] = 1;  fileOrder.push_back( f ); }
+        buckets[f].push_back( id );
+    }
+
+    // T1/§H7: SAME byte-model the XML sibling uses, in the same two roles — the fill-order oracle and the
+    // rate source. The REPORTED est_tokens is measured from the emitted bytes in PHASE 2 below, exactly as
+    // in serialize(): a defect fixed in one serialization and not the other is how the §H5 dialect
+    // divergences are born, and this emitter had the identical --metrics under-report (MEASURED: 1780 B
+    // reported as est_tokens=507, 3.51 B/tok).
+    const TokenEstimate mapEst      = estimateTokens( ing, order, keep, outOff, outTargets );
+    const std::size_t   mapEstTokens = mapEst.tokens;
+
+    const bool autoFlip         = autoOrder && !stable && !mostImportantLast && mapEstTokens > kFillOrderThreshold;
+    const bool effImportantLast = mostImportantLast || autoFlip;
+    if( stable )
+    {
+        std::sort( fileOrder.begin(), fileOrder.end(),
+                   [ & ]( std::uint32_t a, std::uint32_t b ) { return ing.files[a] < ing.files[b]; } );
+        for( std::vector<NodeId>& b : buckets )
+        {
+            std::sort( b.begin(), b.end() );
+        }
+    }
+    else if( effImportantLast )
+    {
+        std::reverse( fileOrder.begin(), fileOrder.end() );
+        for( std::vector<NodeId>& b : buckets )
+        {
+            std::reverse( b.begin(), b.end() );
+        }
+    }
+
+    const std::size_t ambTotal        = counterTotal( ambOut );
+    const std::size_t unresolvedTotal = counterTotal( unresolvedOut );
+    const std::size_t locPinTotal     = counterTotal( locPinOut );   // Phase 4: Σ lpin, the JSON twin of locality_pinned=
+    const std::size_t declinedTotal   = counterTotal( declinedOut ); // Σ declinedOut, the JSON twin of declined=
+    std::size_t       extentSuspectTotal = 0;                          // extent honesty: the JSON twin of extent_suspect_syms=
+    for( const Symbol& sym : ing.symbols )
+    {
+        extentSuspectTotal += sym.extentSuspect != 0 ? 1u : 0u;
+    }
+    const char* orderAttr = stable ? "stable"
+                          : mostImportantLast ? "important-last"
+                          : autoFlip ? "important-last(auto:fill)"
+                          : "important-first";
+
+    // ── PHASE 1: render the "r" array into a buffer (§H7 — see serialize()'s PHASE 1 for the full reasoning:
+    // measure, decide, then write). DEGRADE: an open_memstream failure emits the header FIRST with the
+    // MODELLED estimate (the pre-§H7 number, never a fabricated one) and streams the array behind it.
+    rw::MemoryStream rowsStream;
+    std::FILE* const rowsMem = openChargeStream( rowsStream );
+    MapEstimate      estimate{ ann.payloadUncharged };
+    if( !rowsMem )
+    {
+        DISCLOSE( estimate, MapEstimate::DisclosureWhy::ChargeBufferFailed, "serializeJson: open_memstream failed — est_tokens reports the MODELLED bytes, not the emitted ones" );
+    }
+
+    // ONE header emitter, used by the degrade write, the size probe and the real write, so the three can
+    // never disagree on the header's shape.
+    std::string esc;
+    const auto  emitHeader = [ & ]( std::FILE* dst, std::size_t estTokens )
+    {
+        JsonWriter hw( dst );
+        writeJsonMapHeader( hw, esc, JsonMapHeader{ ing, S, outTargets.size(), keep, estTokens, ambTotal,
+                                                    unresolvedTotal, orderAttr, outProv, &ann, rootArg, locPinTotal, externalCalls, declinedTotal,
+                                                    extentSuspectTotal, macroBlankedFileCount( ing ), estimate.isModelled } );
+        hw.write( ",\"r\":[" );
+    };
+
+    // The "r" array, as ONE renderer both paths call — serialize()'s writeChildren above, for the same reason: a buffer
+    // that opened and then lost a write has already spent the rows, so the fallback must be able to write them again.
+    const auto writeRows = [ & ]( JsonWriter& w )
+    {
+        char       num[ 64 ];
+
+        bool firstFile = true;
+        for( std::uint32_t f : fileOrder )
+        {
+            if( !firstFile )
+            {
+                w.write( "," );
+            }
+            firstFile = false;
+            w.write( "{\"p\":" );  writeJsonStr( w, pathRel( f ), esc );
+            if( const char* fl = builtinLayer( rootRelPath( ing, f ) ); *fl ) { w.write( ",\"layer\":" );  writeJsonStr( w, fl, esc ); }
+            w.write( ",\"s\":[" );
+
+            // §P6.3 / §A4d: const/non-const overloads canonicalize to the SAME id, so a bucket straight from
+            // `order` printed two byte-identical JSON objects and a consumer keying on "id" silently dropped
+            // one. Same collapse the XML path runs (collapseOverloadRows above), same "overloads" count.
+            const OverloadRows rows = collapseOverloadRows( ing, buckets[f] );
+
+            bool firstSym = true;
+            for( std::size_t rowIndex = 0; rowIndex < rows.id.size(); ++rowIndex )
+            {
+                const NodeId id = rows.id[ rowIndex ];
+                if( !firstSym )
+                {
+                    w.write( "," );
+                }
+                firstSym = false;
+                const Symbol&       s   = ing.symbols[id];
+                const std::uint32_t out2= outOff[id + 1] - outOff[id];
+
+                w.write( "{\"t\":" );  writeJsonStr( w, symTag( s.kind ), esc );
+                w.write( ",\"n\":" );  writeJsonStr( w, s.name, esc );
+
+                if( hasScopeAttr( s ) ) { w.write( ",\"sc\":" );  writeJsonStr( w, s.scope, esc ); }   // row 6: the XML sibling's sc=, one presence rule (hasScopeAttr)
+
+                if( rows.overloads[ rowIndex ] > 1 )
+                { rw::formatTo( num, sizeof( num ), ",\"overloads\":{}", rows.overloads[ rowIndex ] );  w.write( num ); }
+
+                if( bind && id < bind->size() && !(*bind)[id].empty() )
+                { w.write( ",\"bind\":" );  writeJsonStr( w, (*bind)[id], esc ); }
+
+                if( const std::uint32_t ambK = counterAt( ambOut, id ); ambK > 0 )
+                { rw::formatTo( num, sizeof( num ), ",\"amb\":{}", ambK );  w.write( num ); }
+
+                if( const std::uint32_t lpinK = counterAt( locPinOut, id ); lpinK > 0 )   // Phase 4: the XML lpin= twin
+                { rw::formatTo( num, sizeof( num ), ",\"lpin\":{}", lpinK );  w.write( num ); }
+
+                if( s.extentSuspect != 0 )   // extent honesty: the XML extent_suspect= twin, same reason spelling
+                { w.write( ",\"extent_suspect\":" );  writeJsonStr( w, extent::extentSuspectReasons( s.extentSuspect ), esc ); }
+
+                if( !stable )
+                { rw::formatTo( num, sizeof( num ), ",\"k\":{:.4f}", double( rank[id] ) );  w.write( num ); }
+
+                if( metrics )
+                {
+                    writeJsonQMetrics( w, JsonQMetrics{ s, id, out2, fanIn, cbo, tested, lcom4, amp } );
+                }
+
+                w.write( ",\"c\":[" );
+                bool firstC = true;
+                for( std::uint32_t e = outOff[id]; e < outOff[id + 1]; ++e )
+                {
+                    if( !firstC )
+                    {
+                        w.write( "," );
+                    }
+                    firstC = false;
+                    w.write( "{\"n\":" );  writeJsonStr( w, ing.symbols[ outTargets[e] ].name, esc );
+                    // §A4d: prov mirrors the XML attribute 1:1 — "scip" for a SCIP-pinned edge, "binding" for a
+                    // decoded FFI binding, "import" for an ES named-import edge, "split" (C1) for one arm of a k-way
+                    // split the resolver could not choose between. outProv parallels outTargets exactly, so index `e`
+                    // is the same edge. The two dialects MUST spell the same vocabulary: test/mcpclidiffcheck.sh is
+                    // the gate that says so.
+                    if( outProv && e < outProv->size() && (*outProv)[e] )
+                    {
+                        w.write( ",\"prov\":" );  writeJsonStr( w, provLabel( (*outProv)[e] ), esc );
+                    }
+                    w.write( "}" );
+                }
+                w.write( "]}" );
+            }
+            w.write( "]}" );
+        }
+        w.write( "]}" );
+    };
+    // DEGRADE, one path for both failures: the header FIRST with the MODELLED estimate, the array streamed behind it.
+    const auto emitModelled = [ & ]()
+    {
+        emitHeader( out, mapEstTokens );
+        JsonWriter direct( out );
+        writeRows( direct );
+        direct.flush();
+        if( outEstTokens )
+        {
+            *outEstTokens = mapEstTokens;
+        }
+    };
+    if( !rowsMem )
+    {
+        emitModelled();
+        return;
+    }
+    {
+        JsonWriter w( rowsMem );
+        writeRows( w );
+        w.flush();
+    }
+
+    // ── PHASE 2: measure, decide, then write ────────────────────────────────────────────────────────────
+    const rw::MemoryStreamBytes rows = rowsStream.finish();
+    if( !rows.isWhole )
+    {
+        // a write was lost inside the rows: never print them — write the whole document again, on the modelled path
+        DISCLOSE( estimate, MapEstimate::DisclosureWhy::ChargeBufferFailed,
+                  "serializeJson: the charge buffer did not finish whole — the map is rendered again, est_tokens reports the MODELLED bytes" );
+        emitModelled();
+        return;
+    }
+    const std::string_view rowsStr = rows.bytes;   // owned by rowsStream, alive to the end of this function
+
+    // The header STATES est_tokens and its own bytes are part of what est_tokens covers, so its size is
+    // probed with the modelled number first. Unlike the XML sibling — whose head is a plain std::string and
+    // can therefore be rebuilt free of charge inside a fixpoint — this header is written through a
+    // JsonWriter to a FILE*, so iterating it would mean a memstream per pass. The ONLY thing a pass changes
+    // is the width of one digit string, so that is priced by a fixed reserve instead (the same technique the
+    // --for lens uses for its own est_tokens attribute): kEstTokensFieldReserve bytes ≈ 3 tokens, well
+    // inside the estimate's own band. A probe failure falls back to the model's envelope allowance rather
+    // than dropping the header's bytes from the charge.
+    std::size_t headerBytes = kEnvelopeBytes;
+    {
+        rw::MemoryStream probe;
+        if( std::FILE* const pm = openChargeStream( probe ) )
+        {
+            emitHeader( pm, mapEstTokens );
+            if( const rw::MemoryStreamBytes header = probe.finish(); header.isWhole )
+            {
+                headerBytes = header.bytes.size();
+            }
+            else
+            {
+                DISCLOSE( estimate, MapEstimate::DisclosureWhy::HeaderProbeFailed,
+                          "serializeJson: the header size probe's buffer did not finish whole — est_tokens charges the modelled envelope instead" );
+            }
+        }
+        else
+        {
+            DISCLOSE( estimate, MapEstimate::DisclosureWhy::HeaderProbeFailed,
+                      "serializeJson: open_memstream failed for the header size probe — est_tokens charges the modelled envelope instead" );
+        }
+    }
+
+    const std::size_t estTokens = tokensForEmittedBytes( headerBytes + kEstTokensFieldReserve + rowsStr.size(),
+                                                         mapEst.bytesPerToken() );
+    if( outEstTokens )
+    {
+        *outEstTokens = estTokens;
+    }
+    emitHeader( out, estTokens );
+    std::fwrite( rowsStr.data(), 1, rowsStr.size(), out );
+}
+
+// ── §A4a: the JSON signature bundle's collected form ────────────────────────────────────────────────────
+// The JSON <sigs> sibling now runs the SAME two-phase collect-then-trim emission the XML path runs, over the
+// SAME ladder (trimSigLadder above — one ladder, two serializations). These are its row structs; the member
+// NAMES are the ladder's duck-typed contract (globalRank/doc/sig/dropped and wrapBytes/entryBegin/entryEnd/
+// liveCount), so they deliberately match the XML path's local structs field for field.
+// P7 (terminality round A, lane R, 2026-09-05): the array is FLAT now — one `{"l":…,"n":…,"p":…,…,"r":N}` object
+// per row in rank order, no `{"p":…,"symbols":[…]}` wrapper (the XML twin's own change; test/forrankordercheck.sh).
+// A file's notes ride its first live row as that row's `"file_notes":[…]` (a key of its own, so they can never be
+// mistaken for the row's `"notes"`), charged once as the file's wrapBytes and released with its last live row.
+struct JsonSigFile
+{
+    std::uint32_t fileId     = 0;
+    std::size_t   wrapBytes  = 0;   // exact emitted bytes of the file's `,"file_notes":[…]` (nothing else is per-file now)
+    std::size_t   liveCount  = 0;   // non-dropped entries (the file notes are dropped when this hits 0)
+    std::string   notes;            // §B1.3: the rendered `,"file_notes":[…]` for FILE-level notes ("" ⇒ none)
+    std::size_t   noteCount = 0;    //         how many notes that array holds (the countable fact)
+};
+struct JsonSigEntry
+{
+    std::uint32_t globalRank = 0;   // 1-based global rank — the ladder's only rank input
+    std::size_t   fileSlot   = 0;   // index into the files vector (P7: the ladder releases the file's notes at liveCount 0)
+    std::string   head;             // the exact `{"l":…,"n":…` prefix through the flag fields
+    std::string   doc;              // RAW doc text after the rank tiers ("" ⇒ no "doc" key)
+    std::string   sig;              // RAW one-line signature after the rank tiers
+    std::string   notes;            // §B1.3: the rendered `,"notes":[…]` for SYMBOL-level notes ("" ⇒ none)
+    std::size_t   noteCount = 0;    //         how many notes that array holds
+    bool          dropped    = false;
+    bool          positive   = false;   // A2: rank[id] > 0 at collection time — the XML sibling's own field
+};
+
+// §B1.3: how many notes this array-emitter matched, and how many survived the ladder — the caller pairs
+// them into the `notes_total`/`notes_kept` keys --pack-task --json already established. Kept as ONE value
+// rather than two out-params so the pair can never be filled in half.
+struct JsonSigNoteCounts
+{
+    std::size_t total = 0;   // notes matching any COLLECTED file/symbol (before the byte ladder)
+    std::size_t kept  = 0;   // notes actually EMITTED (after it)
+};
+
+// §B1.3: the JSON rendering of a note list — the sibling of appendOneNote/renderNoteChildren on the XML
+// side, and shaped like --pack-task --json's note objects (`d` + `text`), with the same absent-unless-
+// recorded rule for the provenance pair (`sha`/`branch` omitted entirely on a legacy unstamped note, never
+// emitted empty). Returns the number of notes rendered; appends NOTHING when there are none, so a tree
+// with no NoteIndex keeps the pre-feature bytes exactly (the L3 inertness contract).
+inline std::size_t appendJsonNoteArray( std::string& out, const notes::NoteIndex* ni, const std::string& target,
+                                        const char* key = ",\"notes\":[" )   // P7: `,"file_notes":[` for a file's notes
+{
+    if( !ni )
+    {
+        return 0;
+    }
+    const std::vector<std::uint32_t>* hits = ni->find( target );
+    if( !hits || hits->empty() )
+    {
+        return 0;
+    }
+
+    out += key;
+    for( std::size_t i = 0; i < hits->size(); ++i )
+    {
+        const notes::Note& n = ni->notes[ (*hits)[i] ];
+        if( i )
+        {
+            out += ",";
+        }
+        appendJsonStrField( out, "{\"d\":", n.date );
+        if( !n.sha.empty() )
+        {
+            appendJsonStrField( out, ",\"sha\":", notes::shortSha( n.sha ) );
+            if( !n.branch.empty() )
+            {
+                appendJsonStrField( out, ",\"branch\":", n.branch );
+            }
+        }
+        appendJsonStrField( out, ",\"text\":", n.text );
+        out += "}";
+    }
+    out += "]";
+    return hits->size();
+}
+
+// The per-symbol quality/identity lens, gathered once so both the collector's signature and its body stay
+// readable (the XML sibling spells the same set as SigRowFacts + the qbuf lens string).
+struct JsonSigLens
+{
+    bool                              metrics             = false;
+    const std::vector<std::uint32_t>* fanIn               = nullptr;
+    const std::vector<char>*          impure              = nullptr;
+    const std::vector<std::uint32_t>* churnPerFile        = nullptr;
+    const std::vector<std::uint8_t>*  cloneMember         = nullptr;
+    const std::vector<std::uint8_t>*  tested              = nullptr;
+    const std::vector<std::uint32_t>* amp                 = nullptr;
+    bool                              rankAdaptivePayload = false;
+    const notes::NoteIndex*           noteIndex           = nullptr;   // §B1.3: L3 field notes — surfaces a
+                                                                       // `notes` array on the row/file the XML
+                                                                       // sibling hangs <note> children on.
+                                                                       // nullptr ⇒ INERT (byte-identical).
+};
+
+// One row's `{"l":…` opening through its flag fields — everything EXCEPT doc/sig, which the ladder mutates
+// and phase 2 appends. Mirrors sigRowHead()'s role on the XML side.
+inline std::string jsonSigRowHead( const IngestResult& ing, NodeId id, std::uint32_t fileId,
+                                   const JsonSigLens& lens, bool pureSig,
+                                   std::string_view rootArg,      // R-R: same root the XML sibling relativizes against
+                                   std::uint32_t globalRank = 0 ) // d1: 1-based lens rank; 0 ⇒ key absent (the XML
+                                                                  //   sibling's SigRowFacts::rank contract, verbatim)
+{
+    const Symbol& s = ing.symbols[id];
+    char          num[ 64 ];
+    std::string   head;
+
+    rw::formatTo( num, sizeof( num ), "{{\"l\":{}", s.line );
+    head += num;
+    // P2.3: the chain key — "n" always, "id" only when the canonical form adds an enclosing scope
+    // (the XML sibling's rule, sigRowHead above), so a JSON consumer can chain onward too.
+    appendJsonStrField( head, ",\"n\":", s.name );
+    if( hasScopeAttr( s ) )   // row 6: the XML sibling's sc=, ONE presence rule — keys mirror attribute names one to one
+    {
+        appendJsonStrField( head, ",\"sc\":", s.scope );
+    }
+    // P7: the row names its file (and its builtin layer) — the XML sibling's p=/layer=, same root-relative spelling
+    appendJsonStrField( head, ",\"p\":", lensRowPath( ing, fileId, rootArg ) );
+    if( const char* fl = builtinLayer( rootRelPath( ing, fileId ) ); *fl )
+    {
+        appendJsonStrField( head, ",\"layer\":", fl );
+    }
+    if( lens.metrics )
+    {
+        appendJsonMetricFields( head, s, id, lens.fanIn );
+    }
+    if( lens.churnPerFile && fileId < lens.churnPerFile->size() && (*lens.churnPerFile)[fileId] > 0 )
+    { rw::formatTo( num, sizeof( num ), ",\"churn\":{}", (*lens.churnPerFile)[fileId] );  head += num; }
+    if( lens.amp && id < lens.amp->size() && (*lens.amp)[id] > 0 )
+    { rw::formatTo( num, sizeof( num ), ",\"amp\":{}", (*lens.amp)[id] );  head += num; }
+    if( lens.cloneMember && id < lens.cloneMember->size() && ( *lens.cloneMember )[id] )
+    {
+        head += ",\"clone\":true";
+    }
+    if( lens.tested && id < lens.tested->size() && ( *lens.tested )[id] )
+    {
+        head += ",\"tested\":true";
+    }
+    if( pureSig )
+    {
+        head += ",\"pure\":true";
+    }
+    // d1: the rank fact closes the head (after pure), mirroring the XML row where r= closes the attribute
+    // run — appended last so every existing key adjacency a text-grep consumer relies on stays byte-stable.
+    if( globalRank > 0 )
+    {
+        rw::formatTo( num, sizeof( num ), ",\"r\":{}", globalRank );
+        head += num;
+    }
+    return head;
+}
+
+// The exact emitted byte cost of one collected row. `,"doc":"` + closing quote = 9 bytes of key framing,
+// likewise `,"sig":"`; +1 for the row's own separating comma (charged to EVERY row, so a file's first row
+// over-reports by one byte — the budget stays conservative, never optimistic).
+inline std::size_t jsonSigEntryCost( const JsonSigEntry& e )
+{
+    if( e.dropped )
+    {
+        return 0;
+    }
+    std::size_t c = 1 + e.head.size() + 1;                                   // `,` … `}`
+    if( !e.doc.empty() )
+    {
+        c += 9 + jsonStr( e.doc ).size();
+    }
+    return c + 9 + jsonStr( e.sig ).size() + e.notes.size();                 // §B1.3: notes are pre-rendered, so
+                                                                             // their EXACT emitted size is known
+}
+
+// §B1.3: the note DENOMINATOR — everything the collector matched, counted BEFORE the ladder runs, so
+// `notes_total` stays a fact about the tree while `notes_kept` is a fact about this budget.
+inline std::size_t collectedJsonNoteTotal( const std::vector<JsonSigFile>& files, const std::vector<JsonSigEntry>& entries )
+{
+    std::size_t total = 0;
+    for( const JsonSigFile& sf : files )
+    {
+        total += sf.noteCount;
+    }
+    for( const JsonSigEntry& e : entries )
+    {
+        total += e.noteCount;
+    }
+    return total;
+}
+
+// Phase 1 — derive every row exactly as the pre-§A4a streaming loop did (same skip gates, same rank tiers,
+// same budgetBytes accounting), into memory. Per-file emission is a variable-skip loop (an unreadable span
+// or an empty cleaned signature drops a symbol entirely), so whether a file contributes anything is only
+// known AFTER walking its symbols — collecting first is what lets phase 2 keep every comma unconditionally
+// correct AND gives the ladder an exact byte total to trim against.
+//
+// §B0: `redact` carries NO default here (nor on packSignaturesJson / packBodiesJson below), unlike the XML
+// siblings — that is the whole lesson of the finding. This emitter and packBodiesJson were written as the
+// JSON twins of packSignatures/packBodies and simply never passed one, so `--for --json` / `--pack-task
+// --json` shipped the raw credentials their XML siblings redact, on the surface most likely to be piped
+// into logs/CI/model context. A REQUIRED parameter turns the next twin's omission into a compile error
+// instead of a silent leak. Pass nullptr for --no-redact (the same convention redactInPlace already has).
+inline void collectJsonSigEntries( const IngestResult& ing, const std::vector<std::uint32_t>& fileOrder,
+                                   std::vector<std::vector<NodeId>>& buckets,
+                                   const std::vector<std::uint32_t>& globalRankOf,
+                                   const JsonSigLens& lens, RedactCounts* redact, std::size_t budgetBytes,
+                                   std::vector<JsonSigFile>& outFiles, std::vector<JsonSigEntry>& outEntries,
+                                   std::string_view rootArg = {},   // R-E (2026-08-17): same single-root-only
+                                                                     // root argument serialize() takes.
+                                   const std::vector<float>* rank = nullptr,          // A2: the score vector, for
+                                                                                       //   the positive/content-skip
+                                                                                       //   split below. nullptr ⇒
+                                                                                       //   the tracking is skipped
+                                                                                       //   (every caller that does
+                                                                                       //   not want droppedPositive).
+                                   std::size_t* positivesContentSkippedOut = nullptr ) // A2: accumulates alongside
+                                                                                       //   `rank` (both null together)
+{
+    std::size_t used = 0;
+    for( std::uint32_t f : fileOrder )
+    {
+        if( used >= budgetBytes )
+        {
+            break;
+        }
+
+        std::FILE* in = std::fopen( diskPath( ing, f ).c_str(), "rb" );
+        if( !in )
+        {
+            if( rank && positivesContentSkippedOut )   // A2: content reason (the file is gone), not the budget
+            {
+                for( NodeId missed : buckets[f] )
+                {
+                    if( (*rank)[missed] > 0.0f ) { ++*positivesContentSkippedOut; }
+                }
+            }
+            continue; // graceful: file gone
+        }
+        std::string src;
+        char        buf[ 4096 ];
+        std::size_t n;
+        while( ( n = std::fread( buf, 1, sizeof( buf ), in ) ) > 0 )
+        {
+            src.append( buf, n );
+        }
+        std::fclose( in );
+
+        std::vector<NodeId>& syms = buckets[f];
+        std::sort( syms.begin(), syms.end(), [ & ]( NodeId a, NodeId b )
+        { return ing.symbols[a].sigStartByte < ing.symbols[b].sigStartByte; } );
+
+        JsonSigFile sf;
+        sf.fileId     = f;
+        // §B1.3 + P7: FILE-level notes ride the file's first live row as its `file_notes` — rendered here so the
+        // byte cost stays EXACT (the ladder trims against these numbers); the file has no wrapper of its own now.
+        sf.noteCount  = appendJsonNoteArray( sf.notes, lens.noteIndex, fileNoteTarget( lens.noteIndex, ing.files[f] ), ",\"file_notes\":[" );
+        sf.wrapBytes  = sf.notes.size();
+        const std::size_t fileSlot = outFiles.size();
+
+        for( NodeId id : syms )
+        {
+            if( used >= budgetBytes )
+            {
+                break;
+            }
+            const Symbol&     s = ing.symbols[id];
+            const std::size_t a = s.sigStartByte, b = s.sigEndByte;
+            if( a >= src.size() || b > src.size() || a >= b )
+            {
+                if( rank && positivesContentSkippedOut && (*rank)[id] > 0.0f ) { ++*positivesContentSkippedOut; }
+                continue;
+            }
+            std::string sig = cleanSig( src.data(), a, b, redact );
+            if( sig.empty() )
+            {
+                if( rank && positivesContentSkippedOut && (*rank)[id] > 0.0f ) { ++*positivesContentSkippedOut; }
+                continue;
+            }
+
+            const std::uint32_t globalRank = lens.rankAdaptivePayload ? globalRankOf[ id ] : 0u;
+            if( lens.rankAdaptivePayload && globalRank > kForDocExcerptRankCount )
+            {
+                truncateUtf8WithEllipsis( sig, kForTailSigBytes );
+            }
+            const bool pureSig = pureFromSig( sig, s.lang ) && !( lens.impure && id < lens.impure->size() && (*lens.impure)[id] );
+
+            std::string doc = docCommentBefore( src, a );
+            redactInPlace( doc, redact );                   // §B0: same seam, same order as the XML sibling (:1586)
+            if( lens.rankAdaptivePayload )
+            {
+                if( globalRank > kForDocExcerptRankCount )
+                {
+                    doc.clear();
+                }
+                else if( globalRank > kForDocFullRankCount )
+                {
+                    truncateUtf8WithEllipsis( doc, kForDocExcerptBytes );
+                }
+            }
+
+            if( !doc.empty() )
+            {
+                used += doc.size() + 12; // the same budgetBytes accounting as the XML path
+            }
+            used += sig.size() + 16;
+
+            JsonSigEntry e;
+            e.globalRank = globalRank;
+            e.fileSlot   = fileSlot;
+            e.head       = jsonSigRowHead( ing, id, f, lens, pureSig, rootArg, globalRank );   // d1: rank fact rides the row
+            e.doc        = std::move( doc );
+            e.sig        = std::move( sig );
+            e.noteCount  = appendJsonNoteArray( e.notes, lens.noteIndex, symbolNoteTarget( lens.noteIndex, ing, s ) );   // §B1.3
+            e.positive   = rank && (*rank)[id] > 0.0f;   // A2: the XML sibling's own field, same definition
+            outEntries.push_back( std::move( e ) );
+            ++sf.liveCount;
+        }
+        outFiles.push_back( std::move( sf ) );
+    }
+    // P7: rank order — the emission order AND the ladder's drop order (the XML twin's own sort)
+    std::stable_sort( outEntries.begin(), outEntries.end(), []( const JsonSigEntry& a, const JsonSigEntry& b ) { return a.globalRank < b.globalRank; } );
+}
+
+// The --for/--pack-task JSON ranking sibling of packSignatures. Writes JUST the array value
+// `[ {...}, ... ]` (the caller supplies the key name, e.g. `"sigs":` or `"ranking":`, so the same array
+// shape composes into either bundle).
+//
+// §A4a: it used to run NO budget at all — `--for --json` was byte-identical at --token-budget=1000 and
+// 20000 while the XML sibling shrank 12,780 → 2,707 bytes, so the audience that most needs a size control
+// (MCP/JSON consumers) had none, and the old comment here ("never claims capped, since it never runs the
+// ladder") documented the hole instead of closing it. It reports the outcome through `outCapped` so the
+// caller can emit the `"capped"` key next to its own `"est_tokens"`. budgetBytes/payloadBudgetBytes are 0
+// (⇒ unlimited / no ladder) for callers that supply no budget, which keeps their bytes identical.
+// The eight per-symbol lens pointers travel as ONE `JsonSigLens` rather than eight positional parameters:
+// they are one cohesive thing (the quality lens the row carries), the old flat form was a 12-parameter
+// signature where three adjacent `const std::vector<std::uint8_t>*` arguments could be transposed with no
+// diagnostic, and adding the budget as three more would have made it fifteen.
+inline void packSignaturesJson( std::FILE* out, const IngestResult& ing, const std::vector<float>& rank,
+                                int topN, const JsonSigLens& lens,
+                                RedactCounts* redact,                      // §B0: REQUIRED (no default) — see collectJsonSigEntries; nullptr = --no-redact
+                                std::size_t budgetBytes        = 0,        // per-entry streaming budget (cfg.packBudgetBytes); 0 = unlimited
+                                std::size_t payloadBudgetBytes = 0,        // H1 global payload budget for this array; 0 = no ladder
+                                bool*       outCapped          = nullptr,  // set true iff the ladder trimmed something
+                                JsonSigNoteCounts* outNotes    = nullptr,  // §B1.3: matched vs emitted note counts
+                                std::string_view rootArg       = {},       // R-E (2026-08-17): same single-root-only
+                                                                           // root argument serialize() takes.
+                                bool hasRelevanceFloor = false,            // LB-A: the XML sibling's own admission rule,
+                                                                           //   shared through relevanceFlooredKeep so the
+                                                                           //   two dialects cannot select differently.
+                                std::size_t* droppedPositiveOut = nullptr, // A2: the XML sibling's own out-param —
+                                                                           //   see packSignatures for the full contract.
+                                std::vector<NodeId>* shownIdsOut = nullptr ) // lane 2: the emitted rows' ids — see packSignatures
+{
+    const bool rankAdaptivePayload = lens.rankAdaptivePayload;
+    if( outCapped )
+    {
+        *outCapped = false;
+    }
+    if( droppedPositiveOut )
+    {
+        *droppedPositiveOut = 0;
+    }
+    resetShownSigIds( shownIdsOut );
+    if( outNotes )
+    {
+        *outNotes = JsonSigNoteCounts {};
+    }
+    if( budgetBytes == 0 )
+    {
+        budgetBytes = SIZE_MAX; // A3-F1 convention, same as packSignatures
+    }
+
+    const std::size_t S = ing.symbols.size();
+    std::vector<NodeId> order( S );
+    for( NodeId i = 0; i < S; ++i )
+    {
+        order[i] = i;
+    }
+    sortutil::radixSortByScoreDescId( order, rank );
+    std::size_t keep = std::min<std::size_t>( topN > 0 ? std::size_t( topN ) : S, S );
+    if( hasRelevanceFloor )
+    {
+        keep = relevanceFlooredKeep( order, rank, keep );   // LB-A: the XML sibling's rule, verbatim
+    }
+
+    std::vector<std::vector<NodeId>> buckets( ing.files.size() );
+    std::vector<std::uint32_t>       fileOrder;
+    std::vector<char>                seen( ing.files.size(), 0 );
+    std::vector<std::uint32_t>       globalRankOf;
+    if( rankAdaptivePayload )
+    {
+        globalRankOf.assign( S, 0 );
+    }
+    for( std::size_t k = 0; k < keep; ++k )
+    {
+        const std::uint32_t f = ing.symbols[ order[k] ].fileId;
+        if( !seen[f] ) { seen[f] = 1; fileOrder.push_back( f ); }
+        buckets[f].push_back( order[k] );
+        if( rankAdaptivePayload )
+        {
+            globalRankOf[order[k]] = std::uint32_t( k + 1 );
+        }
+    }
+
+    // A2: the kept head's own positive-score population — see droppedPositiveCount's comment for why this is
+    // computed fresh rather than assumed equal to `keep` (this dialect's callers do not all pre-floor topN).
+    std::size_t candidatePositives = 0;
+    if( droppedPositiveOut )
+    {
+        for( std::size_t k = 0; k < keep; ++k )
+        {
+            if( rank[ order[k] ] > 0.0f ) { ++candidatePositives; }
+        }
+    }
+    std::size_t positivesContentSkipped = 0;
+
+    // phase 1 — collect (collectJsonSigEntries above), then the exact emitted byte total of the array as
+    // collected, then the ladder. Phase 2 splices a file wrapper only when that file still has a live entry.
+    std::vector<JsonSigFile>  sigFiles;
+    std::vector<JsonSigEntry> entries;
+    collectJsonSigEntries( ing, fileOrder, buckets, globalRankOf, lens, redact, budgetBytes, sigFiles, entries, rootArg,
+                           droppedPositiveOut ? &rank : nullptr, droppedPositiveOut ? &positivesContentSkipped : nullptr );
+
+    std::size_t total = 2;                                                       // "[" + "]"
+    for( const JsonSigFile& sf : sigFiles )
+    {
+        total += sf.wrapBytes;
+    }
+    for( const JsonSigEntry& e : entries )
+    {
+        total += jsonSigEntryCost( e );
+    }
+
+    const bool capped = payloadBudgetBytes > 0 && total > payloadBudgetBytes;
+    if( capped )
+    {
+        trimSigLadder( entries, sigFiles, total, payloadBudgetBytes, jsonSigEntryCost );
+    }
+    if( outCapped )
+    {
+        *outCapped = capped;
+    }
+    if( droppedPositiveOut )
+    {
+        std::size_t positivesSurvived = 0;
+        for( const JsonSigEntry& e : entries )
+        {
+            if( e.positive && !e.dropped ) { ++positivesSurvived; }
+        }
+        *droppedPositiveOut = droppedPositiveCount( candidatePositives, positivesContentSkipped, positivesSurvived );
+    }
+
+    if( outNotes )
+    {
+        outNotes->total = collectedJsonNoteTotal( sigFiles, entries ); // §B1.3 — see its header
+    }
+
+    // phase 2 — emit: P7, one flat array of rows in rank order (the XML twin's own shape)
+    JsonWriter  w( out );
+    w.write( "[" );
+    bool              first = true;
+    std::vector<char> fileNotesPending( sigFiles.size(), 1 );   // a file's notes ride its FIRST live row
+    for( const JsonSigEntry& e : entries )
+    {
+        if( e.dropped )
+        {
+            continue;
+        }
+        pushShownSigId( shownIdsOut, order, e.globalRank );   // lane 2: same mapping as the XML twin
+        if( !first )
+        {
+            w.write( "," );
+        }
+        first = false;
+        std::string row = e.head;
+        if( !e.doc.empty() )
+        {
+            appendJsonStrField( row, ",\"doc\":", e.doc );
+        }
+        appendJsonStrField( row, ",\"sig\":", e.sig );
+        row += e.notes;      // §B1.3: pre-rendered, after `sig` — the XML order of <d>'s children
+        std::size_t kept = e.noteCount;
+        if( fileNotesPending[ e.fileSlot ] )
+        {
+            fileNotesPending[ e.fileSlot ] = 0;
+            row  += sigFiles[ e.fileSlot ].notes;       // P7: `"file_notes":[…]`, the XML <note p="FILE"> children
+            kept += sigFiles[ e.fileSlot ].noteCount;
+        }
+        row += "}";
+        w.write( row );
+        if( outNotes )
+        {
+            outNotes->kept += kept;
+        }
+    }
+    w.write( "]" );
+    w.flush();
+}
+
+// The --pack-task JSON sibling of packBodies — now a pure RE-SERIALIZATION of what packBodies emitted, not a
+// second selection pass (§H5). It takes the EmittedBodies record and writes JUST the array value.
+//
+// What this deletes, deliberately: the old form took `nodes` + `outOff`/`outTargets` + `redact` and re-derived
+// everything — it re-read every file, re-sliced every body from source, re-ran redactInPlace (double-charging
+// the shared tally, §B10.2), re-walked the callee edges, and applied NO byte budget of any kind, because it
+// had no budgetBytes parameter to apply. Every one of those was a chance to disagree with the XML, and all of
+// them took it. There is nothing left here that can decide differently, because there is nothing left here
+// that decides.
+//
+// §B0 note: there is no `redact` parameter and that is not an opt-out — `record` holds text packBodies ALREADY
+// redacted, at the one seam packBodies already defines. Adding a second redaction pass here is what created the over-count.
+inline void packBodiesJson( std::FILE* out, const IngestResult& ing, const EmittedBodies& record,
+                            std::string_view rootArg = {} )
+{
+    JsonWriter  w( out );
+    std::string esc;
+    char        num[ 64 ];
+
+    w.write( "[" );
+    bool first = true;
+    for( const EmittedBody& e : record.kept )
+    {
+        if( e.id >= ing.symbols.size() )
+        {
+            continue;
+        }
+        const Symbol& s = ing.symbols[ e.id ];
+
+        if( !first )
+        {
+            w.write( "," );
+        }
+        first = false;
+
+        w.write( "{\"t\":" );  writeJsonStr( w, symTag( s.kind ), esc );
+        rw::formatTo( num, sizeof( num ), ",\"l\":{},", s.line );
+        w.write( num );
+        // R-E follow-up (2026-08-19): the LAST `p` in the pack-task bundle that was still absolute. Every
+        // other row of both dialects had been relativized; this one was invisible because the gate row that
+        // would have caught it was passing on an empty document (see test/rootrelcheck.sh's VERBS header).
+        w.write( "\"p\":" );  writeJsonStr( w, rootArg.empty() ? std::string_view( ing.files[ s.fileId ] )
+                                                                : sarif::rootRelativeUri( ing.files[ s.fileId ], sarif::rootPrefixOf( rootArg ) ), esc );
+        w.write( ",\"n\":" );  writeJsonStr( w, s.name, esc );
+        // the octocode partial-fetch marker, where the XML writes lines="lo-hi/total" — absent on a whole body,
+        // exactly as the attribute is.
+        if( !e.lineSpan.empty() ) { w.write( ",\"lines\":" );  writeJsonStr( w, e.lineSpan, esc ); }
+        w.write( ",\"body\":" );  writeJsonStr( w, e.text, esc );
+        // §H5: the per-body truncation vocabulary this dialect had NONE of. The XML appends
+        // `\n<!-- truncated -->` inside the CDATA; a JSON consumer gets a boolean it can branch on. Emitted
+        // only when true, matching the tool's silence-means-nothing-happened convention.
+        if( e.isTruncated )
+        {
+            w.write( ",\"truncated\":true" );
+        }
+        // §B12.7/F-MED-1: THIS dialect's `body` is the faithful one, and the XML CDATA for the same def is
+        // NOT byte-equal to it — appendCdataSafe's scrub mapped a C0 byte to a space or an invalid UTF-8
+        // sequence to '?'. Emitted here as well as on the XML <b scrubbed="1"> because a consumer diffing the
+        // two dialects must be able to learn it from whichever one it happens to hold. Absent = byte-equal.
+        if( e.isXmlScrubbed )
+        {
+            w.write( ",\"xml_scrubbed\":true" );
+        }
+
+        // calls: the rows the XML <calls> block actually printed, with its own total= as the denominator.
+        // calls_capped is pageview.h rule 3 in this dialect — the bit that always rides with a shown count.
+        rw::formatTo( num, sizeof( num ), ",\"calls_total\":{},\"calls_capped\":{},\"calls\":[",
+                       e.callsTotal, ( e.calls.size() < std::size_t( e.callsTotal ) ) ? "true" : "false" );
+        w.write( num );
+        bool firstC = true;
+        for( const EmittedBodyCall& c : e.calls )
+        {
+            if( !firstC )
+            {
+                w.write( "," );
+            }
+            firstC = false;
+            w.write( "{\"n\":" );  writeJsonStr( w, c.name, esc );
+            rw::formatTo( num, sizeof( num ), ",\"l\":{}", c.line );
+            w.write( num );
+            w.write( ",\"sig\":" );  writeJsonStr( w, c.sig, esc );
+            w.write( "}" );
+        }
+        w.write( "]}" );
+    }
+    w.write( "]" );
+    w.flush();
+}
+
+}   // namespace rw

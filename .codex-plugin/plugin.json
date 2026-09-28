@@ -1,0 +1,11 @@
+{
+  "name": "codecortex",
+  "version": "0.6.2",
+  "description": "CodeCortex engineering intelligence for coding agents",
+  "mcpServers": {
+    "codecortex": {
+      "command": "codecortex",
+      "args": [".", "--mcp", "--mcp-ui"]
+    }
+  }
+}

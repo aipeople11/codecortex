@@ -1,0 +1,640 @@
+#pragma once
+
+// query.h — ABS-5: composable graph-query operators. A FIXED, CLOSED set of node-set operators over the
+// already-built symbol graph — deliberately NOT a Datalog/Prolog engine: no user-defined rules, no
+// recursion beyond a BOUNDED hop depth, no unification, no fixpoint. A `--query=EXPR` is a small functional
+// expression that evaluates to a deterministic, sorted, de-duplicated NodeId set; main.cpp serializes it
+// exactly like --callers. The point is to answer questions the fixed verbs did not pre-anticipate by
+// COMPOSING a handful of primitives, while staying as predictable + bounded as every other codecortex verb.
+//
+// Grammar (recursive-descent; whitespace-insensitive):
+//   EXPR    := SOURCE | FILTER | CLOSURE | JOIN
+//   SOURCE  := name( "STR" )            symbols whose name == STR (unions same-name defs, like --callers)
+//            | all                       every symbol  (parens optional: `all` or `all()`)
+//   FILTER  := kind( EXPR , KIND )       keep nodes of KIND  (fn|method|cls|struct|iface|var|sec|macro|modscope)
+//            | cx(   EXPR , INT )         keep nodes with cyclomatic complexity >= INT
+//            | fanin(EXPR , INT )         keep nodes with in-degree (caller count) >= INT
+//            | file( EXPR , "RE" )        keep nodes whose ROOT-RELATIVE file path (the p= the verb prints) matches the
+//                                         ECMAScript regex RE
+//            | layer(EXPR , NAME )        keep nodes in architecture LAYER (game|infra|render|math|audio|ai|test)
+//   CLOSURE := callers( EXPR [, INT=1] )  nodes that transitively (<= INT hops) CALL any node in EXPR
+//            | callees( EXPR [, INT=1] )  nodes transitively (<= INT hops) CALLED BY any node in EXPR
+//   JOIN    := and( EXPR , EXPR )         set intersection
+//            | or(  EXPR , EXPR )         set union
+//            | not( EXPR , EXPR )         set difference  (left minus right)
+//
+//   e.g.  and( callers( name("parseArchRules"), 2 ), kind( all, fn ) )
+//         — the functions that transitively (<= 2 hops) call parseArchRules.
+//
+// Determinism: every operator returns a SORTED, UNIQUE NodeId vector; the closure BFS visits in
+// ascending-id order. Robustness: a file() regex the guard refuses (malformed, non-portable, or catastrophic —
+// src/regexguard.h), a match the engine abandons, or any parse error sets ok=false and yields the
+// empty set (the CLI then reports err and exits 1) — the evaluator never throws past this seam, and the
+// only recursion into the graph is the hop-bounded closure, so it can neither hang nor blow the stack on a
+// cyclic call graph (a `seen` set caps every node at one visit).
+
+#include "model.h"
+#include "graph.h"
+#include "arch.h"          // P0-5: builtinLayer() — THE layer taxonomy, the same one the map's layer= attribute carries
+#include "regexguard.h"    // file(): the screen, the compile and the guarded match every user-authored pattern takes
+#include "infra/Diagnostics.h"
+
+#include <algorithm>
+#include <cctype>
+#include <functional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace rw
+{
+namespace query
+{
+
+// kind keyword → SymKind; false for an unknown word.
+inline bool kindOfWord( std::string_view w, SymKind& out ) noexcept
+{
+    if( w == "fn"     ) { out = SymKind::Function;  return true; }
+    if( w == "method" ) { out = SymKind::Method;    return true; }
+    if( w == "cls"    ) { out = SymKind::Class;     return true; }
+    if( w == "struct" ) { out = SymKind::Struct;    return true; }
+    if( w == "iface"  ) { out = SymKind::Interface; return true; }
+    if( w == "var"    ) { out = SymKind::Var;       return true; }
+    if( w == "sec"    ) { out = SymKind::Section;   return true; }
+    if( w == "macro"  ) { out = SymKind::Macro;     return true; }   // macro-edges round: t="macro" is queryable like every other kind
+    if( w == "modscope" ) { out = SymKind::ModuleScope; return true; }   // #60: so a query can select the file-scope owners, or not(kind(all,modscope)) them out
+    return false;
+}
+
+// ── P0-5: the layer() vocabulary ─────────────────────────────────────────────────────────────────────
+//
+// layer() reads arch.h's BUILT-IN directory-name taxonomy — deliberately the SAME function
+// (builtinLayer) that puts `layer="render"` on a file node in the default map, so the query language and
+// the map cannot disagree about what a layer is. A second definition here would be the drift that makes
+// `--graph-query 'layer(all,render)'` and the map's own layer= attribute answer differently on one tree.
+//
+// It does NOT read a --arch=FILE rules file: --arch is a VERB that outranks --graph-query in the dispatch
+// chain, so the two never run in the same invocation, and a taxonomy the user could pass but the query
+// could never see would be a worse lie than a documented limit. Stated in --help, not only here.
+//
+// The vocabulary is CLOSED and small, which is what makes the refusal posture below tractable.
+inline constexpr std::string_view kLayerVocabulary = "game|infra|render|math|audio|ai|test";
+
+// Is `w` one of the layer names the built-in table can ever produce? Derived from the table itself, so a
+// new row in kBuiltinLayers widens this automatically instead of drifting from it.
+inline bool isKnownLayerWord( std::string_view w ) noexcept
+{
+    for( const BuiltinLayer& bl : kBuiltinLayers )
+    {
+        if( w == std::string_view( bl.layer ) )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+struct Eval;   // forward — the C3 pushdown helpers below take Eval& only, so the incomplete type is enough here
+
+// C3 — predicate pushdown for and()'s node-predicate-on-`all` arm, kept as FREE functions taking `Eval&`
+// rather than members: Eval's own body length is a tracked verbosity floor (--quality-delta), and this
+// pushdown logic is a self-contained addition that belongs beside Eval, not padding it. EXACT algebraic
+// identity, not a heuristic: X ∩ { n∈all : P(n) } ≡ { n∈X : P(n) } — same sorted-unique vector either way,
+// because filterKind/Cx/Fanin/File erase from a sorted-unique input without reordering it. A kind|cx|fanin|
+// file filter applied to the literal `all` source sweeps every indexed node (file()'s regex sweep is the
+// expensive one) before and()'s intersection narrows it back down — pointless when the OTHER arm is small.
+// Peeks the shape "OP(all,ARG)" at the current parse position; on a match, CONSUMES it (leaves `e.pos` just
+// past the filter's closing ')') and fills `apply` with a closure that runs the same filter against an
+// arbitrary set instead of against sourceAll(). On any mismatch or inner parse failure it fully restores
+// `e.pos`/`e.ok`/`e.err` and returns false, so the caller can fall back to ordinary `e.expr()`.
+bool tryParsePredicateOnAll( Eval& e, std::function<std::vector<NodeId>( std::vector<NodeId> )>& apply );
+
+// and()'s body: try the pushdown shape on the first arg, else parse it as an ordinary set and try the
+// pushdown shape on the second arg, else fall back to evaluate-both-then-intersect. NEVER extend this shape
+// to or()/not(): those need the OTHER arm evaluated in FULL even when THIS arm is empty — a
+// not(name("typo"), X) or or(name("typo"), X) must still walk X so a buried name() literal there records
+// into unresolvedNames (§P0.5b) for the CLI's did-you-mean report. and()'s own such case — one arm
+// legitimately empty, the OTHER arm hiding an unresolved name() — is exactly why every branch below calls
+// e.expr() on the non-pushdown arm unconditionally instead of checking either side's cardinality first (see
+// querycheck.sh's and(∅,X) arms, which a "skip the other side" optimization here would silently defeat).
+std::vector<NodeId> evalAnd( Eval& e );
+
+// The deepest parenthesis nesting --graph-query evaluates. The evaluator recurses once per level, and a
+// `not(not(not(…` of ~50,000 levels (a quarter of a megabyte of argument) overflowed the main thread's stack:
+// SIGSEGV, exit 139, before a word of output. 256 levels is far past any composed query a person or an agent
+// writes; deeper is refused with the reason, before evaluation starts.
+inline constexpr std::size_t kMaxQueryNesting = 256;
+
+// The deepest `(` nesting in `expr`, outside "quoted" literals (quoted() takes no escapes, so a quote always
+// toggles). A pure scan, so the refusal never depends on how far the evaluator got.
+inline std::size_t queryParenNesting( std::string_view expr ) noexcept
+{
+    std::size_t depth = 0, deepest = 0;
+    bool        inQuote = false;
+    for( const char c : expr )
+    {
+        if( c == '"' )
+        {
+            inQuote = !inQuote;
+        }
+        else if( !inQuote && c == '(' )
+        {
+            deepest = std::max( deepest, ++depth );
+        }
+        else if( !inQuote && c == ')' && depth > 0 )
+        {
+            --depth;
+        }
+    }
+    return deepest;
+}
+
+// One-pass recursive-descent parse-and-evaluate. The operator set is small and each node-set is
+// materialized eagerly — the graphs codecortex handles fit comfortably in memory.
+struct Eval
+{
+    const IngestResult& ing;
+    const Graph&        g;
+    std::string_view    src;
+    std::size_t         pos = 0;
+    bool                ok  = true;
+    std::string         err;
+
+    // §P0.5b — every name() literal that resolved to ZERO symbols, in evaluation order. A typo is a user
+    // error, not a measurement: eleven sibling symbol-taking verbs refuse an unknown name with a
+    // did-you-mean while --graph-query returned a silent count="0", and --graph-query is where a typo is
+    // MOST likely because the name is buried inside an expression. Recorded here and refused at the CLI
+    // seam, which owns exit codes and the shared suggester. A name that DOES resolve while the COMPOSED
+    // query legitimately selects nothing still returns count="0" — that one is a measurement.
+    std::vector<std::string> unresolvedNames;
+
+    Eval( const IngestResult& ingest, const Graph& graph, std::string_view expr )
+        : ing( ingest ), g( graph ), src( expr ) {}
+
+    // ── scanner ───────────────────────────────────────────────────────────────────────────────────────
+    void skipWs()
+    {
+        while( pos < src.size() && std::isspace( static_cast<unsigned char>( src[pos] ) ) )
+        {
+            ++pos;
+        }
+    }
+    char peek()           { skipWs(); return pos < src.size() ? src[pos] : '\0'; }
+    bool accept( char c ) { skipWs(); if( pos < src.size() && src[pos] == c ) { ++pos; return true; } return false; }
+    void expect( char c )
+    {
+        if( !accept( c ) )
+        {
+            fail( std::string( "expected '" ) + c + "'" );
+        }
+    }
+
+    // A3-F16b: every parse error gets ONE grammar reminder + a worked example appended, not just the
+    // bare "expected '('" — `if( ok )` makes this a latch (first failure wins), so the reminder is
+    // appended exactly once per query even though fail() may be reached again as the recursive-descent
+    // unwinds after the first error.
+    void fail( std::string m )
+    {
+        if( !ok )
+        {
+            return;
+        }
+        ok = false;
+        err = std::move( m );
+        err += "\n  grammar: and|or|not(...) sources name(\"X\")|all filters kind|cx|fanin|file|layer closure "
+               "callers|callees(SET[,depth])\n"
+               "  e.g. and(callers(name(\"foo\"),2),kind(all,fn))";
+    }
+
+    std::string ident()
+    {
+        skipWs();
+        const std::size_t start = pos;
+        while( pos < src.size() && ( std::isalnum( static_cast<unsigned char>( src[pos] ) ) || src[pos] == '_' ) )
+        {
+            ++pos;
+        }
+        return std::string( src.substr( start, pos - start ) );
+    }
+
+    std::string quoted()
+    {
+        skipWs();
+        if( peek() != '"' ) { fail( "expected a \"quoted\" string" ); return {}; }
+        ++pos;
+        const std::size_t start = pos;
+        while( pos < src.size() && src[pos] != '"' )
+        {
+            ++pos;
+        }
+        std::string out( src.substr( start, pos - start ) );
+        if( pos < src.size() ) { ++pos; }
+        else
+        {
+            fail( "unterminated string" );
+        }
+        return out;
+    }
+
+    long integer()
+    {
+        skipWs();
+        const std::size_t start = pos;
+        while( pos < src.size() && std::isdigit( static_cast<unsigned char>( src[pos] ) ) )
+        {
+            ++pos;
+        }
+        if( pos == start ) { fail( "expected an integer" ); return 0; }
+        if( pos - start > 18 ) { fail( "integer too large" ); return 0; }   // 18 digits fits a long; more is signed-overflow UB
+        long v = 0;
+        for( std::size_t k = start; k < pos; ++k )
+        {
+            v = v * 10 + ( src[k] - '0' );
+        }
+        return v;
+    }
+
+    static void sortUniq( std::vector<NodeId>& v )
+    {
+        std::sort( v.begin(), v.end() );
+        v.erase( std::unique( v.begin(), v.end() ), v.end() );
+    }
+
+    // ── sources ───────────────────────────────────────────────────────────────────────────────────────
+    std::vector<NodeId> sourceAll()
+    {
+        std::vector<NodeId> r( ing.symbols.size() );
+        for( std::size_t i = 0; i < r.size(); ++i )
+        {
+            r[i] = static_cast<NodeId>( i );
+        }
+        return r;   // 0..N-1 is already sorted-unique
+    }
+
+    std::vector<NodeId> sourceName( const std::string& nm )
+    {
+        std::vector<NodeId> r = resolveAllByName( ing, nm );
+        sortUniq( r );
+        if( r.empty() )
+        {
+            unresolvedNames.push_back( nm ); // §P0.5b — a typo, not a measurement; refused at the CLI seam
+        }
+        return r;
+    }
+
+    // ── filters (node predicates) ───────────────────────────────────────────────────────────────────────
+    std::vector<NodeId> filterKind( std::vector<NodeId> set, SymKind k )
+    {
+        set.erase( std::remove_if( set.begin(), set.end(), [ & ]( NodeId id ) { return ing.symbols[id].kind != k; } ), set.end() );
+        return set;
+    }
+
+    std::vector<NodeId> filterCx( std::vector<NodeId> set, long n )
+    {
+        const std::uint32_t thresh = n < 0 ? 0 : static_cast<std::uint32_t>( n );
+        set.erase( std::remove_if( set.begin(), set.end(), [ & ]( NodeId id ) { return ing.symbols[id].cx < thresh; } ), set.end() );
+        return set;
+    }
+
+    std::vector<NodeId> filterFanin( std::vector<NodeId> set, long n )
+    {
+        const std::uint32_t thresh = n < 0 ? 0 : static_cast<std::uint32_t>( n );
+        const auto*         ro     = g.inEdges.rowOffsets();
+        set.erase( std::remove_if( set.begin(), set.end(), [ & ]( NodeId id ) { return ( ro[id + 1] - ro[id] ) < thresh; } ), set.end() );
+        return set;
+    }
+
+    // The regex is compiled ONCE per file() and decided ONCE per distinct FILE (every symbol of a file shares its
+    // path), then applied to the set in order — so the sorted-unique contract above holds. The comment this
+    // replaced said "paths are short, so std::regex_search here cannot meaningfully back-track-blow-up"; a 44-byte
+    // run of 'a' in a directory name aborted the process with `(a+)+z` (rc 134, libc++). A refused pattern and an
+    // abandoned match both refuse the query by name: count="0" would read as "no such file".
+    std::vector<NodeId> filterFile( std::vector<NodeId> set, const std::string& re )
+    {
+        const RegexCompile compiled = compileGuardedRegex( re, kRegexEcmaScript );
+        if( compiled.refusal )
+        {
+            DISCLOSE( Diagnostics::answerRefused, "the query fails by name (file() refused, with the cause); no count is reported",
+                      "query: file() regex refused — empty result" );
+            fail( "file(\"" + re + "\") refused: " + *compiled.refusal );
+            return {};
+        }
+        enum : std::uint8_t { kUndecided, kMiss, kHit };
+        std::vector<std::uint8_t> fileVerdict( ing.files.size(), kUndecided );
+        std::size_t               keptCount = 0;
+        for( const NodeId id : set )
+        {
+            const std::uint32_t fileId = ing.symbols[id].fileId;
+            if( fileVerdict[ fileId ] == kUndecided )
+            {
+                const std::string_view path    = rootRelPath( ing, fileId );   // #253: the root-relative seam, never the typed root spelling
+                const RegexVerdict     verdict = compiled.regex.search( path );
+                if( verdict == RegexVerdict::Exhausted )
+                {
+                    DISCLOSE( Diagnostics::answerRefused, "the query fails by name (the match the engine abandoned); no count is reported",
+                              "query: file() regex match abandoned by the engine — empty result" );
+                    fail( "file(\"" + re + "\") could not be evaluated on " + std::string( path ) + ": " + std::string( kRegexAbandonedReason )
+                          + " — refusing rather than reporting a count the engine did not finish" );
+                    return {};
+                }
+                fileVerdict[ fileId ] = ( verdict == RegexVerdict::Hit ) ? kHit : kMiss;
+            }
+            if( fileVerdict[ fileId ] == kHit )
+            {
+                set[ keptCount++ ] = id;
+            }
+        }
+        set.resize( keptCount );
+        return set;
+    }
+
+    // P0-5 — layer( SET, NAME ). TWO refusal arms, because the two causes are different facts and an agent
+    // acts on them differently:
+    //
+    //   • the word is not in the closed vocabulary at all ⇒ a typo. Refuse and name the vocabulary. This is
+    //     §P0.5b's rule for name() applied to the other literal in the grammar.
+    //   • the word is valid but NOTHING in the indexed tree carries any layer tag ⇒ the tree has no layer
+    //     taxonomy, so the question cannot be asked here. Refusing is the whole point: count="0" would read
+    //     as "there is no render code", and an agent that believes it goes looking somewhere else. A zero
+    //     must mean "none found", and this is not that.
+    //
+    // A valid word against a tree that IS layered but has no members in that layer is a MEASUREMENT and
+    // reports count="0" — the same line query.h already draws for a name() that resolves but selects nothing.
+    std::vector<NodeId> filterLayer( std::vector<NodeId> set, const std::string& name )
+    {
+        if( !isKnownLayerWord( name ) )
+        {
+            fail( "unknown layer '" + name + "' (use " + std::string( kLayerVocabulary ) + " — the built-in directory-name taxonomy "
+                  "the map's layer= attribute carries)" );
+            return {};
+        }
+        // Does ANY indexed file carry a layer at all? Asked over ing.files rather than over `set`, so a
+        // narrowed sub-expression cannot make an unlayered tree look layered or the reverse.
+        bool treeHasLayers = false;
+        for( std::uint32_t f = 0; f < std::uint32_t( ing.files.size() ) && !treeHasLayers; ++f )
+        {
+            treeHasLayers = *builtinLayer( rootRelPath( ing, f ) ) != '\0';
+        }
+        if( !treeHasLayers )
+        {
+            DISCLOSE( Diagnostics::answerRefused, "the query fails by name (no layer taxonomy); no count is reported",
+                      "query: layer() on a tree with no layer taxonomy — refused, not answered 0" );
+            fail( "no layer taxonomy in this tree: no indexed path has a directory component naming a layer, so layer('" + name
+                  + "') cannot be answered. Refusing rather than reporting count=0, which would read as 'no such code'. "
+                    "Layers come from directory names (" + std::string( kLayerVocabulary ) + "); the map's layer= attribute shows which files have one" );
+            return {};
+        }
+        set.erase( std::remove_if( set.begin(), set.end(),
+                   [ & ]( NodeId id ) { return std::string_view( builtinLayer( rootRelPath( ing, ing.symbols[id].fileId ) ) ) != name; } ), set.end() );
+        return set;
+    }
+
+    // ── bounded transitive closure ──────────────────────────────────────────────────────────────────────
+    // <= depth hops over in-edges (callers) or out-edges (callees). Seeds are EXCLUDED from the result
+    // (we report the reached callers/callees, not the seeds). `seen` caps each node at one visit ⇒ a cyclic
+    // call graph terminates.
+    std::vector<NodeId> closure( const std::vector<NodeId>& seeds, bool wantCallers, int depth )
+    {
+        if( depth < 1 )
+        {
+            depth = 1;
+        }
+        const std::size_t   N = ing.symbols.size();
+        std::vector<char>   seen( N, 0 );
+        std::vector<NodeId> frontier;
+        for( NodeId s : seeds )
+        {
+            if( s < N && !seen[s] )
+            {
+                seen[s] = 1;
+                frontier.push_back( s );
+            } // seeds marked → excluded
+        }
+
+        const auto* inRo = g.inEdges.rowOffsets();
+        const auto* inCi = g.inEdges.colIndices();
+
+        std::vector<NodeId> out;
+        for( int hop = 0; hop < depth && !frontier.empty(); ++hop )
+        {
+            std::vector<NodeId> next;
+            for( NodeId u : frontier )
+            {
+                if( wantCallers )
+                {
+                    for( std::uint32_t k = inRo[u]; k < inRo[u + 1]; ++k )
+                    {
+                        const NodeId c = inCi[k];
+                        if( c < N && !seen[c] ) { seen[c] = 1; out.push_back( c ); next.push_back( c ); }
+                    }
+                }
+                else
+                {
+                    for( std::uint32_t k = g.outOff[u]; k < g.outOff[u + 1]; ++k )
+                    {
+                        const NodeId c = g.outTargets[k];
+                        if( c < N && !seen[c] ) { seen[c] = 1; out.push_back( c ); next.push_back( c ); }
+                    }
+                }
+            }
+            frontier = std::move( next );
+        }
+        sortUniq( out );
+        return out;
+    }
+
+    // ── 2-relation joins ──────────────────────────────────────────────────────────────────────────────
+    std::vector<NodeId> join( std::string_view op, std::vector<NodeId> a, std::vector<NodeId> b )
+    {
+        sortUniq( a ); sortUniq( b );
+        std::vector<NodeId> r;
+        if( op == "and" )
+        {
+            std::set_intersection( a.begin(), a.end(), b.begin(), b.end(), std::back_inserter( r ) );
+        }
+        else if( op == "or" )
+        {
+            std::set_union( a.begin(), a.end(), b.begin(), b.end(), std::back_inserter( r ) );
+        }
+        else
+        {
+            std::set_difference( a.begin(), a.end(), b.begin(), b.end(), std::back_inserter( r ) ); // "not"
+        }
+        return r;
+    }
+
+    // ── the one recursive entry: parse + evaluate an expression ──────────────────────────────────────────
+    std::vector<NodeId> expr()
+    {
+        if( !ok )
+        {
+            return {};
+        }
+        const std::string op = ident();
+        if( op.empty() ) { fail( "expected an operator name" ); return {}; }
+
+        if( op == "all" && peek() != '(' )
+        {
+            return sourceAll(); // `all` may appear bare (no parens)
+        }
+
+        expect( '(' );
+        if( !ok )
+        {
+            return {};
+        }
+
+        std::vector<NodeId> result;
+        if( op == "all" )
+        {
+            result = sourceAll();
+        }
+        else if( op == "name" )
+        {
+            result = sourceName( quoted() );
+        }
+        else if( op == "kind" || op == "cx" || op == "fanin" || op == "file" || op == "layer" || op == "callers" || op == "callees" )
+        {
+            std::vector<NodeId> set = expr();                         // first arg is always a SET
+            if( op == "callers" || op == "callees" )
+            {
+                int depth = 1;
+                if( accept( ',' ) )
+                {
+                    depth = static_cast<int>( integer() );
+                }
+                result = closure( set, op == "callers", depth );
+            }
+            else
+            {
+                expect( ',' );
+                if( op == "kind" )
+                {
+                    const std::string kw = ident();
+                    SymKind           k  = SymKind::Other;
+                    if( !kindOfWord( kw, k ) )
+                    {
+                        fail( "unknown kind '" + kw + "' (use fn|method|cls|struct|iface|var|sec|macro|modscope)" );
+                    }
+                    result = filterKind( std::move( set ), k );
+                }
+                else if( op == "cx" )
+                {
+                    result = filterCx( std::move( set ), integer() );
+                }
+                else if( op == "fanin" )
+                {
+                    result = filterFanin( std::move( set ), integer() );
+                }
+                else if( op == "layer" )
+                {
+                    result = filterLayer( std::move( set ), ident() );   // P0-5: a bare word, like kind()'s
+                }
+                else
+                {
+                    result = filterFile( std::move( set ), quoted() ); // "file"
+                }
+            }
+        }
+        else if( op == "and" )
+        {
+            result = evalAnd( *this );   // C3 — kept OUTSIDE Eval; see the free-function block above the class
+        }
+        else if( op == "or" || op == "not" )
+        {
+            std::vector<NodeId> a = expr();
+            expect( ',' );
+            std::vector<NodeId> b = expr();
+            result = join( op, std::move( a ), std::move( b ) );
+        }
+        else
+        {
+            fail( "unknown operator '" + op + "'" );
+        }
+
+        expect( ')' );
+        return ok ? result : std::vector<NodeId>{};
+    }
+
+    // top-level: evaluate the whole expression; require all input consumed.
+    std::vector<NodeId> run()
+    {
+        if( queryParenNesting( src ) > kMaxQueryNesting )
+        {
+            fail( "the expression nests deeper than " + std::to_string( kMaxQueryNesting ) + " levels — refused before evaluating it" );
+            return {};
+        }
+        std::vector<NodeId> r = expr();
+        skipWs();
+        if( ok && pos != src.size() )
+        {
+            fail( "trailing characters after the expression" );
+        }
+        return ok ? r : std::vector<NodeId>{};
+    }
+};
+
+// C3 — definitions for the two forward-declared pushdown helpers (see the doc comments above `struct Eval`).
+inline bool tryParsePredicateOnAll( Eval& e, std::function<std::vector<NodeId>( std::vector<NodeId> )>& apply )
+{
+    const std::size_t save      = e.pos;
+    const bool         wasOk    = e.ok;
+    const std::string  savedErr = e.err;
+    auto giveUp = [ & ]() { e.pos = save; e.ok = wasOk; e.err = savedErr; return false; };
+
+    const std::string opName = e.ident();
+    const bool isFilterOp = opName == "kind" || opName == "cx" || opName == "fanin" || opName == "file";
+    if( !isFilterOp || !e.accept( '(' ) || e.ident() != "all" || !e.accept( ',' ) )
+    {
+        return giveUp();
+    }
+
+    if( opName == "kind" )
+    {
+        SymKind k = SymKind::Other;
+        if( !kindOfWord( e.ident(), k ) ) { return giveUp(); }
+        apply = [ &e, k ]( std::vector<NodeId> s ) { return e.filterKind( std::move( s ), k ); };
+    }
+    else if( opName == "cx" )
+    {
+        const long n = e.integer();
+        if( !e.ok ) { return giveUp(); }
+        apply = [ &e, n ]( std::vector<NodeId> s ) { return e.filterCx( std::move( s ), n ); };
+    }
+    else if( opName == "fanin" )
+    {
+        const long n = e.integer();
+        if( !e.ok ) { return giveUp(); }
+        apply = [ &e, n ]( std::vector<NodeId> s ) { return e.filterFanin( std::move( s ), n ); };
+    }
+    else // "file"
+    {
+        const std::string re = e.quoted();
+        if( !e.ok ) { return giveUp(); }
+        apply = [ &e, re ]( std::vector<NodeId> s ) { return e.filterFile( std::move( s ), re ); };
+    }
+    if( !e.accept( ')' ) ) { return giveUp(); }
+    return true;
+}
+
+inline std::vector<NodeId> evalAnd( Eval& e )
+{
+    std::function<std::vector<NodeId>( std::vector<NodeId> )> pushdown;
+    if( tryParsePredicateOnAll( e, pushdown ) )
+    {
+        e.expect( ',' );
+        std::vector<NodeId> other = e.expr();
+        return e.ok ? pushdown( std::move( other ) ) : std::vector<NodeId>{};
+    }
+    std::vector<NodeId> a = e.expr();
+    e.expect( ',' );
+    if( tryParsePredicateOnAll( e, pushdown ) )
+    {
+        return e.ok ? pushdown( std::move( a ) ) : std::vector<NodeId>{};
+    }
+    std::vector<NodeId> b = e.expr();
+    return e.join( "and", std::move( a ), std::move( b ) );
+}
+
+}   // namespace query
+}   // namespace rw

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "codecortex": {
+      "type": "stdio",
+      "command": "codecortex",
+      "args": [".", "--mcp", "--mcp-ui"]
+    }
+  }
+}

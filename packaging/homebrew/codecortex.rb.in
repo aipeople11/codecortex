@@ -1,0 +1,36 @@
+# Homebrew formula template for a published CodeCortex release.
+# Release automation should replace __VERSION__, __SHA256_ARM64__ and __REPO__.
+class Codecortex < Formula
+  desc "Engineering intelligence MCP for coding agents"
+  homepage "https://github.com/__REPO__"
+  version "__VERSION__"
+
+  on_macos do
+    if Hardware::CPU.arm?
+      url "https://github.com/__REPO__/releases/download/v__VERSION__/codecortex-__VERSION__-macos-arm64.tar.gz"
+      sha256 "__SHA256_ARM64__"
+    else
+      odie "Current CodeCortex releases require Apple silicon on macOS."
+    end
+  end
+
+  def install
+    bin.install "codecortex"
+    pkgshare.install "skills" if File.directory?("skills")
+    pkgshare.install "hooks" if File.directory?("hooks")
+    pkgshare.install "scripts" if File.directory?("scripts")
+  end
+
+  def caveats
+    <<~EOS
+      Connect CodeCortex to the coding CLIs already installed on this machine:
+        #{opt_bin}/codecortex install
+
+      Then open Codex, Claude Code, or Gemini CLI normally.
+    EOS
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/codecortex --version")
+  end
+end

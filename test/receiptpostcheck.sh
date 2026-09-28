@@ -1,0 +1,665 @@
+#!/usr/bin/env bash
+# receiptpostcheck.sh — the gate for "the edit receipt already knows what it tells you to run next".
+#
+# capture-audit 2026-09-04, finding P9 (lens 8 #9 and §(4)).
+#
+# THE DEFECT. Every edit verb printed a receipt and a stderr line saying
+#   codecortex edit: applied atomically; verify with --edit-check=F:S, then --affected=F
+# — two more calls the tool already knows it wants, both milliseconds warm on an index it has just
+# invalidated and is about to rebuild anyway. Claude Code's own policy makes an agent Read before it edits;
+# other agents do not, and the receipt is the one document an editing agent is guaranteed to read. It also
+# reported a BYTE span while every other verb in the tool speaks FILE:LINE.
+#
+# THE PROPERTY. After a successful edit the receipt carries, in the SAME call:
+#   lines        — the post-edit LINE range of the applied text, beside the byte span
+#   edit_check   — status/callers/incompatible/sites, EQUAL to a separate --edit-check on the same target
+#   tests_to_run — EQUAL to --affected=<the receipt's own file> row for row, run recipe included
+# and --no-post-check (MCP post_check:false) opts out, leaving the receipt exactly as it was plus lines.
+# Equality against the standalone verbs is the whole assertion: a receipt that answered the same question
+# differently would be worse than one that stayed silent.
+#
+# The sandbox is a throwaway `git clone --local` under this script's own temp dir. The edit verbs WRITE, so
+# they are never pointed at the checkout that runs the gate.
+#
+# Usage:  test/receiptpostcheck.sh              # uses build/codecortex
+#         CODECORTEX_BIN=asan/codecortex test/receiptpostcheck.sh
+
+set -u
+ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+. "$ROOT/test/lib/clean-env.sh"
+BIN="${1:-${CODECORTEX_BIN:-$ROOT/build/codecortex}}"
+[ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
+fail=0
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
+no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
+
+[ -x "$BIN" ] || { echo "no codecortex binary at $BIN — build first (cmake --build build -j)"; exit 2; }
+command -v git     >/dev/null 2>&1 || { echo "git required"; exit 2; }
+command -v python3 >/dev/null 2>&1 || { echo "python3 required for JSON assertions"; exit 2; }
+
+TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
+echo "receiptpostcheck: BIN=$BIN"
+
+# ── the sandbox ────────────────────────────────────────────────────────────────────────────────────────
+# geo.py holds the edit target and two callers (one with TWO call sites, so sites is not degenerate);
+# test/area_spec.py is a third caller in a test path, and test/area_spec.sh gives it a derivable runner so
+# the tests_to_run rows carry a real run= rather than only the not-derivable disclosure.
+SB="$TMP/sandbox"
+mkdir -p "$SB/test"
+cat > "$SB/geo.py" <<'EOF'
+def area_of_triangle(base, height):
+    return 0.5 * base * height
+
+
+def report():
+    first = area_of_triangle(3, 4)
+    second = area_of_triangle(6, 8)
+    return first + second
+
+
+def summarize():
+    return area_of_triangle(1, 2)
+EOF
+cat > "$SB/test/area_spec.py" <<'EOF'
+from geo import area_of_triangle
+
+
+def test_area():
+    assert area_of_triangle(2, 2) == 2.0
+EOF
+cat > "$SB/test/area_spec.sh" <<'EOF'
+#!/usr/bin/env bash
+python3 -m pytest test/area_spec.py
+EOF
+chmod +x "$SB/test/area_spec.sh"
+( cd "$SB" && git init -q && git config user.email t@t && git config user.name t \
+  && git add -A && git commit -qm init >/dev/null 2>&1 )
+
+# the payload: a WIDENED arity, so the edit is a real contract-change with provably incompatible callers.
+cat > "$TMP/payload.py" <<'EOF'
+def area_of_triangle(base, height, scale):
+    return 0.5 * base * height * scale
+EOF
+
+# a per-run pristine copy (the verbs WRITE — every arm below starts from the committed state).
+fresh(){ rm -rf "$TMP/w"; git clone --local -q "$SB" "$TMP/w" 2>/dev/null; }
+
+jq_field(){ python3 -c '
+import sys, json
+d = json.load(sys.stdin)
+for k in sys.argv[1].split("."):
+    if isinstance(d, list): d = d[int(k)]
+    elif k in d:            d = d[k]
+    else:                   print("__ABSENT__"); sys.exit(0)
+print(json.dumps(d, sort_keys=True, separators=(",",":")))
+' "$1"; }
+
+# ── ARM 1 — the receipt carries the post-edit LINE range beside the byte span ──────────────────────────
+fresh
+R1="$( cd "$TMP/w" && "$BIN" . --replace-symbol-body=area_of_triangle --edit-payload="$TMP/payload.py" 2>/dev/null )"
+printf '%s' "$R1" > "$TMP/r1.json"
+L1="$( jq_field lines < "$TMP/r1.json" )"
+if [ "$L1" = "__ABSENT__" ]; then
+    no "(1) the receipt carries a byte span and no line range — every other verb in the tool speaks FILE:LINE"
+else
+    # the range must actually bracket the applied text in the file on disk, not merely be present.
+    python3 - "$TMP/w/geo.py" "$TMP/r1.json" <<'PY'
+import sys, json
+lines = open(sys.argv[1]).read().split("\n")
+r = json.load(open(sys.argv[2]))["lines"]
+body = "\n".join(lines[r["start"]-1:r["end"]])
+assert "def area_of_triangle(base, height, scale):" in body, "range %r does not bracket the applied text: %r" % (r, body)
+assert "def report():" not in body, "range %r overshoots into the next definition" % (r,)
+print("OK")
+PY
+    [ $? -eq 0 ] \
+        && ok "(1) the receipt's lines={start,end} brackets exactly the applied text ($L1)" \
+        || no "(1) the receipt's line range does not bracket the applied text"
+fi
+
+# ── ARM 2 — edit_check is folded in, and it EQUALS the separate --edit-check ───────────────────────────
+EC_XML="$( cd "$TMP/w" && "$BIN" . --edit-check=geo.py:area_of_triangle 2>/dev/null | sed 's/.*-->//' )"
+# the ROOT tag alone: the document is one line, so a greedy `.*incompatible="` reaches the LAST occurrence,
+# which is a <c> row's per-caller flag ("1") and not the root's count.
+EC_ROOT="$( printf '%s' "$EC_XML" | grep -oE '<edit-check [^>]*>' )"
+EC_STATUS="$( printf '%s' "$EC_ROOT" | sed -nE 's/.* status="([^"]*)".*/\1/p' )"
+EC_CALLERS="$( printf '%s' "$EC_ROOT" | sed -nE 's/.* callers="([0-9]*)".*/\1/p' )"
+EC_INCOMP="$( printf '%s' "$EC_ROOT" | sed -nE 's/.* incompatible="([0-9]*)".*/\1/p' )"
+[ "$EC_STATUS" = "contract-change" ] && [ "${EC_INCOMP:-0}" -ge 2 ] \
+    || no "(2) fixture degenerate: the standalone --edit-check reads status=$EC_STATUS incompatible=$EC_INCOMP"
+GOT_EC="$( jq_field edit_check < "$TMP/r1.json" )"
+if [ "$GOT_EC" = "__ABSENT__" ]; then
+    no "(2) the receipt carries no edit_check — the agent is told to run a second call the tool already ran"
+else
+    python3 - "$TMP/r1.json" "$EC_STATUS" "$EC_CALLERS" "$EC_INCOMP" "$EC_XML" <<'PY'
+import sys, json, re
+r  = json.load(open(sys.argv[1]))["edit_check"]
+st, ca, inc, xml = sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+assert r["status"]       == st,  "receipt status %r != --edit-check %r" % (r["status"], st)
+assert int(r["callers"]) == ca,  "receipt callers %r != --edit-check %r" % (r["callers"], ca)
+assert int(r["incompatible"]) == inc, "receipt incompatible %r != --edit-check %r" % (r["incompatible"], inc)
+# the sites, row for row, against the XML's own flagged rows
+want = {}
+for m in re.finditer(r'<c n="([^"]*)" p="([^"]*)" incompatible="1"(?: sites_l="([^"]*)")?/>', xml):
+    want[m.group(1)] = (m.group(2), [int(x) for x in (m.group(3) or "").split(",") if x])
+got = { s["n"]: (s["p"], [int(x) for x in s["l"]]) for s in r["sites"] }
+assert got == want, "receipt sites %r != --edit-check flagged rows %r" % (got, want)
+assert want, "the fixture flagged no callers — the sites assertion would be vacuous"
+print("OK")
+PY
+    [ $? -eq 0 ] \
+        && ok "(2) receipt edit_check == a separate --edit-check (status, callers, incompatible, and every call site)" \
+        || no "(2) the receipt's edit_check disagrees with the verb it replaces"
+fi
+
+# ── ARM 3 — tests_to_run is folded in, and it EQUALS --affected=<the receipt's own file> ───────────────
+AFF="$( cd "$TMP/w" && "$BIN" . --affected=geo.py 2>/dev/null )"
+GOT_T="$( jq_field tests_to_run < "$TMP/r1.json" )"
+if [ "$GOT_T" = "__ABSENT__" ]; then
+    no "(3) the receipt carries no tests_to_run — the second call the stderr hint asks for"
+else
+    ROOT="$ROOT" python3 - "$TMP/r1.json" "$AFF" <<'PY'
+import sys, os, json, re
+sys.path.insert(0, os.path.join(os.environ["ROOT"], "test"))
+import testrowpaths                                   # THE shared tests_to_run row reader
+rows = json.load(open(sys.argv[1]))["tests_to_run"]
+aff  = sys.argv[2]
+# E1 / review of #214: a row may name SEVERAL files, in either dialect — `<g … p="a,b,c" run_unknown="1"/>`
+# in the XML and a "p" ARRAY in the JSON. This comparison read the XML's single rows only and assumed the
+# JSON's "p" was a string, so on a corpus where the rows group it compared a shorter list to a crashing
+# one. Both sides are now read the same way, through the shared reader: the FILES each names, in order.
+want = testrowpaths.xml_paths(aff)
+got  = testrowpaths.json_paths('{"tests_to_run":' + json.dumps(rows) + '}')
+assert got == want, "receipt tests_to_run %r != --affected rows %r" % (got, want)
+assert want, "the fixture reached no test file — the assertion would be vacuous"
+# the run recipe still has to agree, per SINGLE row (a group row carries run_unknown by construction and
+# has no per-path recipe to compare): key the XML singles by path and check the JSON's singles against them.
+xrun = dict((m.group(1), m.group(2)) for m in re.finditer(r'<test p="([^"]*)"[^>]*?(?: run="([^"]*)")?/>', aff))
+for t in rows:
+    if isinstance(t.get("p"), str) and t["p"] in xrun:
+        assert t.get("run") == xrun[t["p"]], "receipt run recipe for %s: %r != %r" % (t["p"], t.get("run"), xrun[t["p"]])
+print("OK")
+PY
+    [ $? -eq 0 ] \
+        && ok "(3) receipt tests_to_run == --affected=<the receipt's own file>, path and run recipe" \
+        || no "(3) the receipt's tests_to_run disagrees with the verb it replaces"
+fi
+
+# ── ARM 3c / 3d — the two shapes the geo.py sandbox above CANNOT tell apart ────────────────────────────
+#
+# WHY A SECOND SANDBOX. ARM 3's fixture has exactly one test, area_spec.py, which calls the edit target
+# from a NAMED function — so the caller walk reaches it and the receipt's own walk reaches it too. The two
+# sides agree for a reason unrelated to their being the same answer: CONTRIBUTING §2 shape 1, an assertion
+# that cannot fail. It stayed green through both commits that broke the receipt:
+#   015e5a0f (2026-09-05) made --affected=<a test file> list that test on its own evidence
+#                         (seed_kind="test"). The receipt's walk is transitiveCallers MINUS seeds, so a
+#                         test that IS the edit target can never appear -> "tests":0. A false ZERO.
+#   7dae6522 (2026-09-07) added the partner tier: a test NAMED after a changed file, listed even when the
+#                         graph never reaches it. The receipt has no partner tier.
+# Neither touched mcpedit.h. This sandbox adds exactly the two shapes that separate the answers.
+#
+# IT IS TYPESCRIPT, AND THAT IS LOAD-BEARING. Python's partner convention is test_<stem>.py, and
+# `--affected=geo.py` PATH-MATCHES test/test_geo.py by substring — so the partner row arrives carrying
+# seed_kind= and hops= as well, and the arm cannot tell the partner tier from the seed tier. The TS
+# convention <stem>.test.ts does not contain "<stem>.ts" as a substring, so `--affected=src/bounded.ts`
+# isolates the partner row: `<test p="test/bounded.test.ts" partner="1"/>`, no hops, no seed_kind.
+SB2="$TMP/sandbox2"
+mkdir -p "$SB2/src" "$SB2/test"
+cat > "$SB2/src/bounded.ts" <<'S2A'
+export function bounded(t: string): string { return t.slice(0, 8); }
+S2A
+# partner-named, and reached by NO call edge: the call is at module scope, which ingest attributes to no
+# enclosing symbol, so the caller walk has nothing to follow. `probe` gives ARM 3d a symbol to edit.
+cat > "$SB2/test/bounded.test.ts" <<'S2B'
+import { bounded } from "../src/bounded.ts";
+
+export function probe(): string { return "x"; }
+const _v = bounded("y");
+S2B
+# a SECOND test, reached by a NAMED function, so one answer carries TWO rows on DIFFERENT tiers
+# (partner with no hops, and hops=1) — without it every fixture answer is one row and the ORDER the prior
+# design review called required would be asserted by nothing.
+cat > "$SB2/test/reach.test.ts" <<'S2G'
+import { bounded } from "../src/bounded.ts";
+
+export function checkBounded(): string { return bounded("q"); }
+S2G
+( cd "$SB2" && git init -q && git config user.email t@example.com && git config user.name t \
+  && git add -A && git commit -qm init >/dev/null 2>&1 )
+printf 'export function bounded(t: string): string { return t.slice(0, 9); }\n' > "$TMP/payload2.ts"
+printf 'export function probe(): string { return "y"; }\n'                      > "$TMP/payload3.ts"
+
+# The ONE comparison both arms share: the receipt's rows must equal --affected's rows on the same file,
+# INCLUDING the evidence attributes. ARM 3's regex deliberately skips those; here they are the point,
+# because a row that arrives without its evidence is an advisory row wearing an obligation's clothes.
+cmp_receipt_to_affected(){   # $1=receipt json  $2=--affected xml  $3=label
+    python3 - "$1" "$2" "$3" <<'S2F'
+import sys, json, re
+KEYS = ( "seed_kind", "changed", "partner", "hops", "imports" )
+rows = json.load( open( sys.argv[1] ) ).get( "tests_to_run", None )
+aff, label = sys.argv[2], sys.argv[3]
+if rows is None:
+    print( "%s: the receipt carries no tests_to_run at all" % label ); sys.exit( 1 )
+# `[^/]*` cannot match a run= that CONTAINS a slash ("bash test/x.sh"), which is most real recipes; the
+# attribute run is non-greedy up to the self-closing "/>" instead. Values, not just key presence: a row
+# whose hops= differs, or whose run recipe differs, is a different answer.
+want = []
+for m in re.finditer( r'<test ((?:[a-z_]+="[^"]*"\s*)+)/>', aff ):
+    at = dict( re.findall( r'([a-z_]+)="([^"]*)"', m.group( 1 ) ) )
+    ev = tuple( sorted( ( k, at[k] ) for k in KEYS if k in at ) )
+    want.append( ( at.get( "p" ), ev, at.get( "run" ), "run_unknown" in at ) )
+def norm( v ):
+    return "1" if v is True else str( v )
+got = [ ( t.get( "p" ), tuple( sorted( ( k, norm( t[k] ) ) for k in KEYS if k in t ) ),
+          t.get( "run" ), bool( t.get( "run_unknown" ) ) ) for t in rows ]
+if not want:
+    print( "%s: --affected named no test, so the comparison would be vacuous" % label ); sys.exit( 1 )
+if got != want:
+    print( "%s: receipt %r != --affected %r" % ( label, got, want ) ); sys.exit( 1 )
+print( "OK" )
+S2F
+}
+
+# 3c — the PARTNER shape: edit src/bounded.ts, whose partner test the graph cannot reach.
+rm -rf "$TMP/w2"; git clone --local -q "$SB2" "$TMP/w2" 2>/dev/null
+( cd "$TMP/w2" && "$BIN" . --replace-symbol-body=bounded --edit-payload="$TMP/payload2.ts" 2>/dev/null ) > "$TMP/r3c.json"
+AFF3C="$( cd "$TMP/w2" && "$BIN" . --affected=src/bounded.ts 2>/dev/null )"
+OUT3C="$( cmp_receipt_to_affected "$TMP/r3c.json" "$AFF3C" "(3c) partner-named test" )"
+[ "$OUT3C" = "OK" ] && ok "(3c) the receipt names the partner test --affected names, with its evidence" \
+                    || no "${OUT3C:-(3c) comparison produced no output}"
+
+# 3d — the F3 shape: the edit TARGET is itself a test file.
+rm -rf "$TMP/w3"; git clone --local -q "$SB2" "$TMP/w3" 2>/dev/null
+( cd "$TMP/w3" && "$BIN" . --replace-symbol-body=probe --edit-payload="$TMP/payload3.ts" 2>/dev/null ) > "$TMP/r3d.json"
+AFF3D="$( cd "$TMP/w3" && "$BIN" . --affected=test/bounded.test.ts 2>/dev/null )"
+OUT3D="$( cmp_receipt_to_affected "$TMP/r3d.json" "$AFF3D" "(3d) the edit target IS a test" )"
+[ "$OUT3D" = "OK" ] && ok "(3d) editing a test file names that test — not a false zero" \
+                    || no "${OUT3D:-(3d) comparison produced no output}"
+
+# ── ARM 3b — the FOLD carries the COMPLETENESS KEYS its standalone twin carries (verify-wave2 F3) ──────
+# Arms 2 and 3 compare the fields the fold COPIES, and that is exactly where the gap was: the standalone
+# roots carry the resolver gauge and the floor marker, and the folded objects did not.
+#
+#   receipt : "edit_check":{"status":…,"callers":2,"incompatible":2,"sites":[…]}, "tests_to_run":[]
+#   twin    : <edit-check … callers="2" incompatible="2" graph_ambiguous="5923" graph_unresolved="2952" counts_floor="1">
+#   twin    : <affected … tests="0" reached="105" script_gates_unmodelled="558" counts_floor="1" graph_ambiguous=…>
+#
+# So `"tests_to_run":[]` was an UNLABELLED ZERO — the twin says "0 modelled tests, 558 shell gates the walk
+# cannot see, counts are floors"; the fold said `[]`. That is H5/H14's own rule (a CSR-derived count carries
+# counts_floor; a disclosure survives into every sibling surface or is DECLARED) missed on the surface this
+# wave built. THE RULE: a folded sub-result carries the same completeness keys its standalone twin carries.
+#
+# MECHANICAL, not a hand-written list of the four keys we happen to have fixed: the wanted set is read off
+# the TWIN'S OWN ROOT at run time and filtered to the honesty vocabulary below, so a disclosure a future
+# round adds to --edit-check or --affected reds this arm until the fold carries it too.
+DISCLOSURE_VOCAB='counts_floor graph_ambiguous graph_unresolved script_gates_unmodelled tests'
+python3 - "$TMP/r1.json" "$EC_ROOT" "$AFF" "$DISCLOSURE_VOCAB" <<'F3_EOF' >"$TMP/f3.res" 2>&1
+import sys, json, re
+receipt = json.load( open( sys.argv[1] ) )
+vocab   = set( sys.argv[4].split() )
+
+def rootAttrs( tag ):
+    return dict( re.findall( r'([a-z_]+)="([^"]*)"', tag ) )
+
+ecRoot  = rootAttrs( sys.argv[2] )
+affTag  = re.search( r"<affected [^>]*>", sys.argv[3] )
+if not affTag:
+    print( "the --affected root did not parse — this arm has no twin to compare against" ); raise SystemExit( 1 )
+affRoot = rootAttrs( affTag.group( 0 ) )
+
+def agrees( have, want ):
+    return str( have ).lower() == want.lower() or ( want == "1" and str( have ).lower() == "true" )
+
+bad = []
+# (i) edit_check: the fold is an OBJECT, so the keys belong inside it
+ec = receipt.get( "edit_check", {} )
+for k in sorted( set( ecRoot ) & vocab ):
+    if k not in ec:
+        bad.append( "edit_check is missing %s (the standalone --edit-check root carries %s=%r)" % ( k, k, ecRoot[k] ) )
+    elif not agrees( ec[k], ecRoot[k] ):
+        bad.append( "edit_check %s=%r disagrees with the twin's %r" % ( k, ec[k], ecRoot[k] ) )
+# (ii) tests_to_run is an ARRAY and cannot carry attributes, so its completeness keys are its SIBLINGS on
+#      the receipt root — the same place --affected puts them relative to its own <test> rows.
+for k in sorted( set( affRoot ) & vocab ):
+    if k not in receipt:
+        bad.append( "the receipt is missing %s beside tests_to_run (--affected carries %s=%r) — an unlabelled zero"
+                    % ( k, k, affRoot[k] ) )
+    elif not agrees( receipt[k], affRoot[k] ):
+        bad.append( "receipt %s=%r disagrees with --affected's %r" % ( k, receipt[k], affRoot[k] ) )
+if bad:
+    print( "\n".join( "    " + b for b in bad ) ); raise SystemExit( 1 )
+print( "OK: edit_check carries %s; the receipt carries %s beside tests_to_run"
+       % ( ",".join( sorted( set( ecRoot ) & vocab ) ), ",".join( sorted( set( affRoot ) & vocab ) ) ) )
+F3_EOF
+if [ $? -eq 0 ]; then ok "(3b) $( cat "$TMP/f3.res" )"; else no "(3b) the folded sub-results drop disclosures their standalone twins carry:"; cat "$TMP/f3.res"; fi
+
+# ── ARM 4 — the loop is ONE call ───────────────────────────────────────────────────────────────────────
+# The point of the finding, stated as an assertion rather than left implied: edit -> verify -> tests-to-run
+# used to be three invocations, and all three answers must now come out of the first one.
+python3 - "$TMP/r1.json" <<'PY'
+import sys, json
+r = json.load(open(sys.argv[1]))
+missing = [k for k in ("applied","span","lines","edit_check","tests_to_run") if k not in r]
+assert not missing, "the single receipt is missing %r" % (missing,)
+print("OK")
+PY
+[ $? -eq 0 ] \
+    && ok "(4) edit -> verify -> tests-to-run is ONE call: the receipt holds all three answers" \
+    || no "(4) the receipt still does not close the loop in one call"
+
+# ── ARM 5 — --no-post-check opts out, and costs the receipt nothing else ───────────────────────────────
+fresh
+R5="$( cd "$TMP/w" && "$BIN" . --replace-symbol-body=area_of_triangle --edit-payload="$TMP/payload.py" --no-post-check 2>/dev/null )"
+printf '%s' "$R5" > "$TMP/r5.json"
+python3 - "$TMP/r5.json" <<'PY'
+import sys, json
+r = json.load(open(sys.argv[1]))
+assert "edit_check"   not in r, "--no-post-check still ran the contract check"
+assert "tests_to_run" not in r, "--no-post-check still ran the affected-tests lookup"
+for k in ("applied","symbol","file","span","lines","replaced_bytes","stale_index","note"):
+    assert k in r, "--no-post-check dropped %r, which is not part of the post-check" % (k,)
+print("OK")
+PY
+[ $? -eq 0 ] \
+    && ok "(5) --no-post-check omits edit_check and tests_to_run and nothing else (lines stays: it is free)" \
+    || no "(5) --no-post-check is missing, ignored, or drops more than the post-check"
+
+# ── ARM 6 — the family: the two insert verbs carry it too ──────────────────────────────────────────────
+printf 'def area_of_square(side):\n    return side * side\n\n\n' > "$TMP/insert.py"
+fresh
+R6="$( cd "$TMP/w" && "$BIN" . --insert-before-symbol=report --edit-payload="$TMP/insert.py" 2>/dev/null )"
+printf '%s' "$R6" | python3 -c '
+import sys, json
+r = json.load(sys.stdin)
+for k in ("lines","edit_check","tests_to_run"):
+    assert k in r, "insert_before_symbol receipt has no %r" % (k,)
+print("OK")
+' >/dev/null 2>&1 \
+    && ok "(6) --insert-before-symbol carries the same folded receipt (the family, not one verb)" \
+    || { no "(6) an insert verb's receipt does not carry the post-check"; printf '%s\n' "$R6" | head -c 400; echo; }
+
+# ── ARM 7 — MCP parity: the same receipt, and post_check:false opts out ────────────────────────────────
+fresh
+MCP_IN(){ printf '%s\n%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}' \
+  "$1"; }
+M7="$( MCP_IN '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"replace_symbol_body","arguments":{"path":"'"$TMP/w"'","symbol":"area_of_triangle","new_body":"def area_of_triangle(base, height, scale):\n    return 0.5 * base * height * scale\n"}}}' \
+      | "$BIN" --mcp 2>/dev/null | tail -1 )"
+printf '%s' "$M7" | python3 -c '
+import sys, json
+r = json.load(sys.stdin)
+t = json.loads(r["result"]["content"][0]["text"])
+for k in ("lines","edit_check","tests_to_run"):
+    assert k in t, "MCP replace_symbol_body receipt has no %r" % (k,)
+print("OK")
+' >/dev/null 2>&1 \
+    && ok "(7) MCP replace_symbol_body carries the same folded receipt" \
+    || { no "(7) the MCP edit receipt does not carry the post-check"; printf '%s\n' "$M7" | head -c 500; echo; }
+fresh
+M7B="$( MCP_IN '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"replace_symbol_body","arguments":{"path":"'"$TMP/w"'","symbol":"area_of_triangle","post_check":false,"new_body":"def area_of_triangle(base, height, scale):\n    return 0.5 * base * height * scale\n"}}}' \
+      | "$BIN" --mcp 2>/dev/null | tail -1 )"
+printf '%s' "$M7B" | python3 -c '
+import sys, json
+r = json.load(sys.stdin)
+assert "error" not in r, "post_check:false was refused: %r" % (r["error"],)
+t = json.loads(r["result"]["content"][0]["text"])
+assert "edit_check"   not in t, "post_check:false still ran the contract check"
+assert "tests_to_run" not in t, "post_check:false still ran the affected-tests lookup"
+print("OK")
+' >/dev/null 2>&1 \
+    && ok "(7) MCP post_check:false opts out, as --no-post-check does on the CLI" \
+    || { no "(7) MCP post_check:false is unknown or ignored"; printf '%s\n' "$M7B" | head -c 400; echo; }
+
+# ── ARM 8 — --edit-plan: dry-run resolves each op to file:line + its 1-hop callers; apply carries edit_check
+fresh
+mkdir -p "$TMP/w/plans"
+cp "$TMP/payload.py" "$TMP/w/plans/body.py"
+# `file` disambiguates: the payload itself lives under the plan's own directory and is INDEXED, so it
+# defines a second area_of_triangle and a bare target is honestly ambiguous.
+cat > "$TMP/w/plans/p.json" <<'EOF'
+{"version":1,"edits":[{"op":"replace_symbol_body","target":"area_of_triangle","file":"geo.py","payload":"body.py"}]}
+EOF
+DRY="$( cd "$TMP/w" && "$BIN" . --edit-plan=plans/p.json --dry-run 2>/dev/null )"
+printf '%s' "$DRY" | python3 -c '
+import sys, json
+op = json.load(sys.stdin)["operations"][0]
+assert "at" in op, "dry-run op carries no resolved file:line"
+assert ":" in op["at"] and op["at"].split(":")[-1].isdigit(), "at=%r is not file:line" % (op["at"],)
+assert "callers" in op, "dry-run op carries no 1-hop caller union"
+assert int(op["callers"]) >= 2, "callers=%r — the fixture has three callers, this is not the union" % (op["callers"],)
+print("OK")
+' >/dev/null 2>&1 \
+    && ok "(8) --edit-plan --dry-run resolves each op to file:line and names its 1-hop caller union" \
+    || { no "(8) the dry-run receipt still cannot be judged before --apply"; printf '%s\n' "$DRY" | head -c 500; echo; }
+APPLY="$( cd "$TMP/w" && "$BIN" . --edit-plan=plans/p.json --apply 2>/dev/null )"
+printf '%s' "$APPLY" | python3 -c '
+import sys, json
+op = json.load(sys.stdin)["operations"][0]
+assert "edit_check" in op, "apply op carries no per-op edit_check"
+assert op["edit_check"]["status"] == "contract-change", "per-op edit_check says %r" % (op["edit_check"]["status"],)
+print("OK")
+' >/dev/null 2>&1 \
+    && ok "(8) --edit-plan --apply carries the per-op edit_check" \
+    || { no "(8) the apply receipt carries no per-op edit_check"; printf '%s\n' "$APPLY" | head -c 500; echo; }
+
+# (8b) F3, the same rule on the PLAN receipt: callers= and callers_union= are read off the same name-based
+# CSR --edit-check's callers= is, so they carry the same floor and the same gauge. The per-op edit_check
+# object goes through postCheckJson, so it inherits the fold's keys; the root's callers_union= is the plan
+# receipt's OWN CSR-derived count and needs its own.
+for MODE in --dry-run --apply; do
+    fresh
+    mkdir -p "$TMP/w/plans"; cp "$TMP/payload.py" "$TMP/w/plans/body.py"
+    cat > "$TMP/w/plans/p.json" <<'PLAN_EOF'
+{"version":1,"edits":[{"op":"replace_symbol_body","target":"area_of_triangle","file":"geo.py","payload":"body.py"}]}
+PLAN_EOF
+    R="$( cd "$TMP/w" && "$BIN" . --edit-plan=plans/p.json "$MODE" 2>/dev/null )"
+    printf '%s' "$R" | python3 -c '
+import sys, json
+r = json.load( sys.stdin )
+bad = []
+if "callers_union" in r and "counts_floor" not in r:
+    bad.append( "callers_union=%r on the root with no counts_floor — a CSR-derived count read as a total" % ( r[ "callers_union" ], ) )
+for i, op in enumerate( r.get( "operations", [] ) ):
+    if "callers" in op and "counts_floor" not in op and "counts_floor" not in r:
+        bad.append( "operations[%d].callers=%r carries no floor" % ( i, op[ "callers" ] ) )
+    ec = op.get( "edit_check" )
+    if ec is not None and "counts_floor" not in ec:
+        bad.append( "operations[%d].edit_check drops counts_floor its standalone twin carries" % ( i, ) )
+if bad:
+    print( "; ".join( bad ) ); raise SystemExit( 1 )
+print( "OK" )
+' >"$TMP/f3b.res" 2>&1 \
+        && ok "(8b) --edit-plan $MODE: every CSR-derived count on the receipt carries the floor its twin carries" \
+        || { no "(8b) --edit-plan $MODE receipt: $( cat "$TMP/f3b.res" )"; }
+done
+
+# ── ARM 9 — every receipt is still valid JSON, and the write half is untouched ─────────────────────────
+for f in "$TMP/r1.json" "$TMP/r5.json"; do
+    python3 -c 'import sys,json; json.load(open(sys.argv[1]))' "$f" >/dev/null 2>&1 \
+        || no "(9) $( basename "$f" ) is not valid JSON"
+done
+grep -q 'scale' "$TMP/w/geo.py" 2>/dev/null \
+    && ok "(9) the receipts parse as JSON and the edits actually landed on disk" \
+    || no "(9) the edit did not land — every assertion above described a write that did not happen"
+
+# ══ E2 (terminality round A 2026-09-05, lane E) — THE RECEIPT ANSWERS THE READ ═════════════════════════
+# Measured on bench/agentloop/run_editsuite.py: agents on runners without a Read-before-edit policy trust the
+# receipt and stop. So the receipt must carry what a Read would have shown, or a stop is a blind stop:
+#   region    — the post-edit lines with `context` lines each side (default 3), the bytes as they are on disk;
+#               budgeted: over kReceiptRegionBudgetBytes it carries head + tail + elided_lines and capped:true
+#   blob_sha  — the git blob id of the written bytes (== `git hash-object FILE`), so "what is on disk" is a
+#               fact the agent can check against `git ls-files -s` without reading the file
+#   next      — exactly ONE pasteable follow-up (METHODOLOGY §9 #3): contract-change with broken callers → the
+#               uses verb on FILE:SYM; else the first tests_to_run run= recipe; else --test-gate=FILE; under
+#               --no-post-check, --edit-check=FILE:SYM (the one call that shows the state)
+# The stderr line names that ONE next and nothing else. Same keys on the MCP twin (one engine).
+REGION_CTX=3
+fresh
+R10="$( cd "$TMP/w" && "$BIN" . --replace-symbol-body=area_of_triangle --edit-payload="$TMP/payload.py" 2>"$TMP/r10.err" )"
+printf '%s' "$R10" > "$TMP/r10.json"
+python3 - "$TMP/r10.json" "$TMP/w/geo.py" "$REGION_CTX" <<'PY' >"$TMP/e2a.res" 2>&1
+import sys, json
+r = json.load( open( sys.argv[1] ) ); ctx = int( sys.argv[3] )
+assert "region" in r, "the receipt carries no region — the agent still has to Read to see what landed"
+g = r["region"]
+for k in ( "start", "end", "context", "text" ):
+    assert k in g, "region lacks %r (has %r)" % ( k, sorted( g ) )
+assert g["context"] == ctx, "context=%r, default should be %d" % ( g["context"], ctx )
+lines = open( sys.argv[2], newline="" ).read().split( "\n" )
+total = len( lines ) if lines[-1] != "" else len( lines ) - 1
+want_start = max( 1, r["lines"]["start"] - ctx ); want_end = min( total, r["lines"]["end"] + ctx )
+assert ( g["start"], g["end"] ) == ( want_start, want_end ), "region %r..%r, want %r..%r (lines %r, total %r)" % ( g["start"], g["end"], want_start, want_end, r["lines"], total )
+disk = "\n".join( lines[ g["start"] - 1 : g["end"] ] )
+assert g["text"] == disk, "region.text is not the bytes on disk:\n%r\n!=\n%r" % ( g["text"], disk )
+assert g.get( "capped", False ) is False, "a 2-line edit's region must not be capped"
+print( "OK region %d..%d ctx=%d (%d bytes) == disk" % ( g["start"], g["end"], g["context"], len( g["text"] ) ) )
+PY
+if [ $? -eq 0 ]; then ok "(10) $( cat "$TMP/e2a.res" )"; else no "(10) region: $( cat "$TMP/e2a.res" | tail -3 | tr '\n' ' ' )"; fi
+WANT_SHA="$( cd "$TMP/w" && git hash-object geo.py )"
+GOT_SHA="$( jq_field blob_sha < "$TMP/r10.json" | tr -d '"' )"
+[ "$GOT_SHA" = "$WANT_SHA" ] && ok "(11) blob_sha == git hash-object of the written file ($GOT_SHA)" \
+                             || no "(11) blob_sha=$GOT_SHA, git hash-object says $WANT_SHA"
+NEXT="$( jq_field next < "$TMP/r10.json" | tr -d '"' )"
+python3 -c 'import sys,json; r=json.load(open(sys.argv[1])); assert list(r).count("next")==1' "$TMP/r10.json" 2>/dev/null \
+    && [ "$NEXT" != "__ABSENT__" ] && ok "(12) the receipt carries exactly ONE next ($NEXT)" || no "(12) the receipt carries no single next (got $NEXT)"
+case "$NEXT" in --uses=geo.py:area_of_triangle) ok "(12) on a contract-change with broken callers next= is the uses verb on FILE:SYM";;
+                *) no "(12) next=$NEXT — the fixture is a contract-change with $EC_INCOMP incompatible callers; the rule says --uses=geo.py:area_of_triangle";; esac
+if ( cd "$TMP/w" && "$BIN" . $NEXT >/dev/null 2>&1 ); then ok "(12) the receipt's next= runs from the repo root"; else no "(12) the receipt's next= does not run: $NEXT"; fi
+# the stderr line repeats the receipt's next and names NO other command: every --flag on it belongs to next=
+OTHER="$( grep -o -- ' --[a-z-]*' "$TMP/r10.err" | tr -d ' ' | grep -v -x -- "${NEXT%%=*}" | tr '\n' ' ' )"
+grep -q -- "$NEXT" "$TMP/r10.err" && [ -z "$OTHER" ] && ok "(12) the stderr line names that ONE next and no second command" \
+                  || no "(12) the stderr line names other commands (${OTHER:-none}) or not the next: $( head -c 200 "$TMP/r10.err" )"
+# (13) MCP twin — the SAME receipt keys (one engine); compared key set to key set, legend-independent
+fresh
+M13="$( MCP_IN '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"replace_symbol_body","arguments":{"path":"'"$TMP/w"'","symbol":"area_of_triangle","new_body":"def area_of_triangle(base, height, scale):\n    return 0.5 * base * height * scale\n"}}}' \
+      | "$BIN" --mcp 2>/dev/null | tail -1 )"
+printf '%s' "$M13" | python3 -c '
+import sys, json
+r = json.load( sys.stdin ); t = json.loads( r["result"]["content"][0]["text"] ); c = json.load( open( sys.argv[1] ) )
+missing = sorted( set( c ) - set( t ) ); extra = sorted( set( t ) - set( c ) )
+assert not missing and not extra, "MCP receipt keys differ from the CLI receipt: missing %r extra %r" % ( missing, extra )
+assert set( t["region"] ) == set( c["region"] ), "region sub-keys differ"
+print( "OK %d keys" % len( t ) )
+' "$TMP/r10.json" >"$TMP/e2m.res" 2>&1 && ok "(13) MCP replace_symbol_body receipt == CLI receipt, key for key ($( cat "$TMP/e2m.res" ))" \
+    || no "(13) $( cat "$TMP/e2m.res" | tail -1 )"
+# (14) the budget: a 300-line body → head + tail + elided_lines, capped, and the two halves are on disk
+fresh
+python3 -c '
+lines = ["def area_of_triangle(base, height):"] + ["    x%d = base * %d" % (i, i) for i in range(300)] + ["    return 0.5 * base * height"]
+open("'"$TMP"'/big.py", "w").write("\n".join(lines))'
+R14="$( cd "$TMP/w" && "$BIN" . --replace-symbol-body=area_of_triangle --edit-payload="$TMP/big.py" 2>/dev/null )"
+printf '%s' "$R14" | python3 -c '
+import sys, json
+r = json.load( sys.stdin ); g = r["region"]
+assert g.get( "capped" ) is True, "a 302-line region was not capped: %r" % sorted( g )
+for k in ( "head", "tail", "elided_lines" ): assert k in g, "capped region lacks %r" % k
+assert "text" not in g, "a capped region must not also carry text"
+assert g["elided_lines"] > 0
+lines = open( sys.argv[1], newline="" ).read().split( "\n" )
+assert g["head"] == "\n".join( lines[ g["start"] - 1 : g["start"] - 1 + g["head"].count( "\n" ) + 1 ] ), "head is not the bytes on disk"
+assert g["tail"] == "\n".join( lines[ g["end"] - g["tail"].count( "\n" ) - 1 : g["end"] ] ), "tail is not the bytes on disk"
+assert len( g["head"] ) + len( g["tail"] ) <= 2048 + 200, "budget overshot: %d bytes" % ( len( g["head"] ) + len( g["tail"] ) )
+print( "OK head %dB + tail %dB, %d lines elided" % ( len( g["head"] ), len( g["tail"] ), g["elided_lines"] ) )
+' "$TMP/w/geo.py" >"$TMP/e2b.res" 2>&1 && ok "(14) an oversize region is budgeted: $( cat "$TMP/e2b.res" )" || no "(14) region budget: $( tail -1 "$TMP/e2b.res" )"
+# (15) --no-post-check keeps the free half (region, blob_sha) and points at the one call that shows the state
+fresh
+R15="$( cd "$TMP/w" && "$BIN" . --replace-symbol-body=area_of_triangle --edit-payload="$TMP/payload.py" --no-post-check 2>"$TMP/r15.err" )"
+printf '%s' "$R15" | python3 -c '
+import sys, json
+r = json.load( sys.stdin )
+assert "region" in r and "blob_sha" in r, "--no-post-check dropped region/blob_sha — they need no index and are free"
+assert r.get( "next" ) == "--edit-check=geo.py:area_of_triangle", "next=%r under --no-post-check; want --edit-check=geo.py:area_of_triangle" % r.get( "next" )
+print( "OK" )
+' >"$TMP/e2c.res" 2>&1 && ok "(15) --no-post-check keeps region + blob_sha; next= is --edit-check=FILE:SYM" || no "(15) $( tail -1 "$TMP/e2c.res" )"
+# (16) the insert verbs carry the same keys (the family)
+fresh
+R16="$( cd "$TMP/w" && "$BIN" . --insert-before-symbol=report --edit-payload="$TMP/insert.py" 2>/dev/null )"
+printf '%s' "$R16" | python3 -c '
+import sys, json
+r = json.load( sys.stdin )
+for k in ( "region", "blob_sha", "next" ): assert k in r, "insert receipt lacks %r" % k
+print( "OK" )' >/dev/null 2>&1 && ok "(16) --insert-before-symbol carries region, blob_sha and one next=" || no "(16) an insert receipt lacks region/blob_sha/next"
+# (17) the wrap blurb no longer coaches the redundant check
+for agent in opencode codex claude; do
+    "$BIN" wrap "$agent" --force 2>/dev/null | sed -n '/--- paste into/,/--- end paste/p' > "$TMP/blurb.$agent"
+done
+if grep -q 'then `--edit-check' "$TMP"/blurb.*; then
+    no "(17) the wrap blurb still says 'then --edit-check=SYM' after an edit — it coaches the redundant check the receipt already answers"
+else
+    grep -q 'edit_check' "$TMP/blurb.opencode" && ok "(17) the wrap blurb says the receipt carries the post-check instead of prescribing --edit-check" \
+                                               || no "(17) the wrap blurb neither prescribes nor mentions the receipt's edit_check"
+fi
+
+# ── ARM 18 — the receipt's own ROOT, so its root-relative echoes can be resolved ───────────────────────
+# Review of #219 (A3): the receipt's "file", its tests_to_run[].run recipes and its stderr "next:" are all
+# spelled RELATIVE to the crawl root — which is right, and useless on its own: an MCP client runs in its own
+# working directory and the receipt named no root at all. Its JSON siblings (--test-gate --json, the
+# situational_awareness payload) have carried "root" all along; the receipt is the one that hands the caller
+# a command to paste, so it is the one that least afforded to omit it.
+R18="$( cd "$TMP/w" && "$BIN" . --insert-before-symbol=report --edit-payload="$TMP/insert.py" 2>/dev/null )"
+if [ -z "$R18" ]; then
+    no "(18) the edit verb produced no receipt — the arm would be a false green"
+else
+    # Third review of #219: this arm checked `root` and then `file`, but read the file as
+    # `r.get( "file", "" )` — and "" does not start with "/", so an ABSENT or EMPTY file passed. It also
+    # validated none of the things the receipt actually hands a caller to paste: the nested
+    # tests_to_run[].run recipes and the top-level next command. So the arm could pass while exactly the
+    # values it exists to protect were missing or absolute. Every reference the receipt emits is now
+    # checked, each row according to its OWN shape (run or run_unknown, never neither), and the row list is
+    # asserted non-empty first so the per-row loop cannot be vacuous on this fixture.
+    R18OUT="$( printf '%s' "$R18" | python3 -c '
+import sys, json
+
+r     = json.load( sys.stdin )
+fails = []
+
+def need( cond, msg ):
+    if not cond:
+        fails.append( msg )
+
+root = r.get( "root" )
+need( isinstance( root, str ) and root != "", "no non-empty \"root\" key, so nothing relative in the receipt resolves" )
+
+# file: present, non-empty, and RELATIVE. The empty default was the hole — "" is not absolute either.
+f = r.get( "file" )
+need( isinstance( f, str ) and f != "", "\"file\" is absent or empty: %r" % ( f, ) )
+if isinstance( f, str ) and f != "":
+    need( not f.startswith( "/" ), "file=%r is absolute; the root key exists to make it relative" % ( f, ) )
+
+# next: a successful edit always emits one, and it is a COMMAND — no absolute path may ride in it.
+nxt = r.get( "next" )
+need( isinstance( nxt, str ) and nxt != "", "\"next\" is absent or empty: %r" % ( nxt, ) )
+if isinstance( nxt, str ):
+    need( not [ t for t in nxt.split() if t.startswith( "/" ) ],
+          "next=%r carries an absolute path token" % ( nxt, ) )
+
+# tests_to_run: a list, non-empty on THIS fixture (test/area_spec.sh gives a derivable runner), and every
+# row carries p plus exactly one of run / run_unknown.
+rows = r.get( "tests_to_run" )
+need( isinstance( rows, list ), "\"tests_to_run\" is not a list: %r" % ( type( rows ).__name__, ) )
+if isinstance( rows, list ):
+    need( len( rows ) > 0, "tests_to_run is EMPTY on a fixture built to produce a row — the per-row checks would be vacuous" )
+    for i, row in enumerate( rows ):
+        need( isinstance( row, dict ), "tests_to_run[%d] is not an object" % i )
+        if not isinstance( row, dict ):
+            continue
+        p = row.get( "p" )
+        need( isinstance( p, str ) and p != "",       "tests_to_run[%d].p is absent or empty" % i )
+        need( isinstance( p, str ) and not p.startswith( "/" ), "tests_to_run[%d].p=%r is absolute" % ( i, p ) )
+        hasRun     = isinstance( row.get( "run" ), str ) and row.get( "run" ) != ""
+        hasUnknown = row.get( "run_unknown" ) in ( 1, "1", True )
+        need( hasRun != hasUnknown, "tests_to_run[%d] carries %s — a row takes run OR run_unknown, never neither and never both"
+                                    % ( i, "both run and run_unknown" if hasRun and hasUnknown else "neither run nor run_unknown" ) )
+        if hasRun:
+            need( not [ t for t in row[ "run" ].split() if t.startswith( "/" ) ],
+                  "tests_to_run[%d].run=%r carries an absolute path token" % ( i, row[ "run" ] ) )
+
+print( "OK" if not fails else "FAIL " + " | ".join( fails ) )' 2>&1 )"
+    case "$R18OUT" in
+        OK) ok "(18) every reference the receipt emits is present and root-relative: root, non-empty file, each tests_to_run row's p + run/run_unknown, and next" ;;
+        *)  no "(18) the receipt's references do not validate: $R18OUT" ;;
+    esac
+fi
+
+[ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES ABOVE"
+exit "$fail"

@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# jsmetricscheck.sh — does --metrics / --for / --quality-delta actually WORK on JavaScript + Bash, with
+# real hand-computed values, or do they silently stay 0 / degrade to C-family-only? Wave-1 landed JS+Bash
+# ingest (jslangcheck.sh: symbols + call edges) and metricscheck.sh hand-checks metrics on C++/Python —
+# neither gate proves the per-symbol Q-metrics (loc/params/nest/cbo), the --for lens, or --quality-delta
+# actually compute correct NON-ZERO values on the two new languages. This gate closes that gap.
+#
+# Fixture (test/jsmetricsfix/): shapes.js + shapes.sh, each with a leaf fn, a 3-deep-nested/3-param fn, a
+# fn that calls both (cbo=2), and (JS only) an arrow-fn-bound-to-const with 2 params + 1 nesting level.
+# Every loc/params/nest/cbo value below was counted BY HAND from the source and cross-checked once against
+# a real run (see the comment blocks in the fixture files) before being pinned as an assertion.
+#
+# Usage:
+#   test/jsmetricscheck.sh
+#   CODECORTEX_BIN=asan/codecortex test/jsmetricscheck.sh
+#
+# Exits non-zero on any failure; prints PASS/FAIL per check and ALL PASS on success. Does NOT edit
+# regression.sh. All --quality-baseline/--quality-delta work happens in a SCRATCH copy (mktemp), never on
+# the checked-in fixture, since --quality-baseline writes a sidecar file next to the corpus.
+
+set -u
+ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+BIN="${1:-${CODECORTEX_BIN:-$ROOT/build/codecortex}}"
+[ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
+FIX="$ROOT/test/jsmetricsfix"
+TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
+fail=0
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
+no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
+
+[ -x "$BIN" ] || { echo "no codecortex binary at $BIN — build first (cmake --build build -j)"; exit 2; }
+[ -d "$FIX" ] || { echo "no test/jsmetricsfix directory"; exit 2; }
+
+echo "jsmetricscheck: BIN=$BIN  FIX=$FIX"
+
+# ═══════════════════════════════════════════════════════════════════════════
+echo
+echo "=== --metrics: hand-checked loc/params/nest/cbo on JavaScript ==="
+# ═══════════════════════════════════════════════════════════════════════════
+"$BIN" "$FIX" --metrics --no-cache >"$TMP/m1" 2>/dev/null
+"$BIN" "$FIX" --metrics --no-cache >"$TMP/m2" 2>/dev/null
+MAP="$( cat "$TMP/m1" )"
+
+if diff -q "$TMP/m1" "$TMP/m2" >/dev/null; then ok "determinism (--metrics byte-identical run-to-run)"; else no "non-deterministic --metrics output"; fi
+
+sattr(){ printf '%s' "$MAP" | sed 's/>/>\n/g' | grep -E "<s t=\"[^\"]*\" n=\"$1\"" | head -1; }
+assert_attr(){ # name attr val
+    local line; line="$( sattr "$1" )"
+    if printf '%s' "$line" | grep -q " $2=\"$3\""; then ok "$1: $2=$3"; else no "$1: expected $2=$3 — got: $line"; fi
+}
+
+# leaf (JS): 1 param, 0 nesting, 0 calls (cbo=0), loc=4
+assert_attr leaf loc 4;     assert_attr leaf params 1;   assert_attr leaf nest 0;   assert_attr leaf cbo 0
+# deepNest (JS): 3 params, 3-deep nesting (if>for>if), calls nothing in-repo, loc=14
+assert_attr deepNest loc 14; assert_attr deepNest params 3; assert_attr deepNest nest 3; assert_attr deepNest cbo 0
+# callsLeafAndDeep (JS): 1 param, 0 nesting, calls leaf()+deepNest() -> cbo=2
+assert_attr callsLeafAndDeep params 1; assert_attr callsLeafAndDeep nest 0; assert_attr callsLeafAndDeep cbo 2
+# arrowWithParams (JS, arrow-fn bound to const): 2 params, 1-deep nesting (if)
+assert_attr arrowWithParams params 2; assert_attr arrowWithParams nest 1; assert_attr arrowWithParams cbo 0
+
+# REAL-FINDING trap: if JS metrics silently stay 0 (grammar shape not recognized), assert_attr above would
+# have already failed loudly — but double-check explicitly that at least ONE JS symbol has a NON-ZERO
+# nest and NON-ZERO params, so a wholesale "everything defaulted to 0" regression cannot slip past a
+# coincidental single bad assertion.
+NONZERO_NEST_JS="$( printf '%s' "$MAP" | grep -c 'p="test/jsmetricsfix/shapes.js"' )"
+if printf '%s' "$( sattr deepNest )" | grep -qv ' nest="0"'; then ok "sanity: JS nest values are NOT all defaulting to 0"; else no "sanity: JS nest defaulted to 0 across the board — metrics may be silently broken on JS"; fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+echo
+echo "=== --metrics: hand-checked loc/params/nest/cbo on Bash ==="
+# ═══════════════════════════════════════════════════════════════════════════
+# leaf_sh: 0 params (Bash fns take no formal param list), 0 nesting, 0 calls, loc=4
+assert_attr leaf_sh loc 4;     assert_attr leaf_sh params 0;   assert_attr leaf_sh nest 0;   assert_attr leaf_sh cbo 0
+# deep_nest_sh: 3-deep nesting (if>for>if), calls nothing in-repo, loc=10
+assert_attr deep_nest_sh loc 10; assert_attr deep_nest_sh params 0; assert_attr deep_nest_sh nest 3; assert_attr deep_nest_sh cbo 0
+# calls_leaf_and_deep_sh: calls leaf_sh()+deep_nest_sh() -> cbo=2
+assert_attr calls_leaf_and_deep_sh nest 0; assert_attr calls_leaf_and_deep_sh cbo 2
+
+if printf '%s' "$( sattr deep_nest_sh )" | grep -qv ' nest="0"'; then ok "sanity: Bash nest values are NOT all defaulting to 0"; else no "sanity: Bash nest defaulted to 0 across the board — metrics may be silently broken on Bash"; fi
+
+# golden neutrality: the default map (no --metrics) carries none of these attributes on JS/Bash either.
+"$BIN" "$FIX" --no-cache >"$TMP/def" 2>/dev/null
+LEAK="$( grep -oE ' (loc|params|nest|cbo)="[^"]*"' "$TMP/def" | head -1 )"
+if [ -z "$LEAK" ]; then ok "golden-neutral: no Q-metric attribute leaks into the default JS/Bash map"; else no "attribute leaked into default map: $LEAK"; fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+echo
+echo "=== --for: the task lens surfaces cx/ccx on JS/Bash and ranks by relevance ==="
+# ═══════════════════════════════════════════════════════════════════════════
+FOR_OUT="$( "$BIN" "$FIX" --for="deep nesting" --no-cache 2>/dev/null )"
+FOR_RC=$?
+if [ $FOR_RC -eq 0 ]; then ok "--for exits 0 on JS/Bash corpus"; else no "--for failed (rc=$FOR_RC)"; fi
+if printf '%s' "$FOR_OUT" | grep -q 'shapes.js'; then ok "--for includes the JS file"; else no "--for missing the JS file"; fi
+if printf '%s' "$FOR_OUT" | grep -q 'shapes.sh'; then ok "--for includes the Bash file"; else no "--for missing the Bash file"; fi
+if printf '%s' "$FOR_OUT" | grep -q 'function deepNest'; then ok "--for surfaces the deepNest JS signature (matches the query)"; else no "--for did not surface deepNest for a 'deep nesting' query"; fi
+if printf '%s' "$FOR_OUT" | grep -q 'deep_nest_sh'; then ok "--for surfaces the deep_nest_sh Bash signature"; else no "--for did not surface deep_nest_sh"; fi
+# deepNest's cx/ccx in the --for lens must match the --metrics values (cx=4 ccx=6), not be zeroed out.
+printf '%s' "$FOR_OUT" | grep -A0 'function deepNest' | grep -q 'cx="4" ccx="6"' \
+    && ok "--for: deepNest carries the correct cx=4 ccx=6 (matches --metrics, not zeroed)" \
+    || { no "--for: deepNest cx/ccx wrong or missing"; printf '%s' "$FOR_OUT" | grep -o '<d[^>]*>[^<]*deepNest[^<]*' ; }
+
+# determinism of --for on this corpus
+"$BIN" "$FIX" --for="deep nesting" --no-cache >"$TMP/for2" 2>/dev/null
+printf '%s' "$FOR_OUT" >"$TMP/for1"
+if diff -q "$TMP/for1" "$TMP/for2" >/dev/null; then ok "--for deterministic on JS/Bash corpus"; else no "--for non-deterministic"; fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+echo
+echo "=== --quality-baseline / --quality-delta: nesting REGRESSION detected on JavaScript ==="
+# ═══════════════════════════════════════════════════════════════════════════
+# Work in a scratch copy: baseline the CLEAN fixture, then worsen leaf() with 5-deep nesting (over the
+# kNestBar=4 bar) and confirm --quality-delta reports it as a "nesting" regression with exit 2.
+QD="$TMP/qdjs"; mkdir -p "$QD"
+cat > "$QD/a.js" <<'EOF'
+function simple( x )
+{
+    return x + 1;
+}
+EOF
+( cd "$QD" && "$BIN" . --quality-baseline --no-cache >/dev/null 2>&1 )
+if [ -f "$QD/.codecortex_quality_baseline" ]; then ok "--quality-baseline writes a sidecar for a JS-only corpus"; else no "--quality-baseline did not write a sidecar for JS"; fi
+
+cat > "$QD/a.js" <<'EOF'
+function simple( x )
+{
+    if ( x > 0 )
+    {
+        if ( x > 1 )
+        {
+            if ( x > 2 )
+            {
+                if ( x > 3 )
+                {
+                    if ( x > 4 )
+                    {
+                        return x + 100;
+                    }
+                }
+            }
+        }
+    }
+    return x + 1;
+}
+EOF
+QD_OUT="$( cd "$QD" && "$BIN" . --quality-delta --no-cache 2>/dev/null )"
+QD_RC=$?
+if [ $QD_RC -eq 2 ]; then ok "--quality-delta exits 2 on a real JS nesting regression"; else no "--quality-delta exit code wrong (got $QD_RC, want 2)"; fi
+if printf '%s' "$QD_OUT" | grep -q 'regressions="1"'; then ok "--quality-delta reports exactly 1 regression"; else no "--quality-delta regression count wrong: $QD_OUT"; fi
+if printf '%s' "$QD_OUT" | grep -q 'kind="nesting"'; then ok "--quality-delta correctly classifies it as a nesting regression"; else no "--quality-delta did not classify as nesting: $QD_OUT"; fi
+if printf '%s' "$QD_OUT" | grep -q 'sym="simple"'; then ok "--quality-delta names the regressed JS symbol (simple)"; else no "--quality-delta did not name the symbol: $QD_OUT"; fi
+if printf '%s' "$QD_OUT" | grep -q 'now="5"'; then ok "--quality-delta reports the correct now=5 nest depth"; else no "--quality-delta now= value wrong: $QD_OUT"; fi
+
+# negative control: re-running quality-delta with NO further change reports 0 regressions (not sticky).
+QD2_OUT="$( cd "$QD" && "$BIN" . --quality-delta --no-cache 2>/dev/null )"
+# NOTE: baseline was never updated, so the same regression is still reported — this is EXPECTED (delta is
+# vs the fixed baseline, not vs the last run). Re-baselining should clear it.
+( cd "$QD" && "$BIN" . --quality-baseline --no-cache >/dev/null 2>&1 )
+QD3_OUT="$( cd "$QD" && "$BIN" . --quality-delta --no-cache 2>/dev/null )"
+QD3_RC=$?
+printf '%s' "$QD3_OUT" | grep -q 'regressions="0"' && [ $QD3_RC -eq 0 ] \
+    && ok "re-baselining a regressed JS symbol clears it (regressions=0, exit 0)" \
+    || no "re-baseline did not clear the regression: rc=$QD3_RC out=$QD3_OUT"
+
+# ═══════════════════════════════════════════════════════════════════════════
+echo
+echo "=== MUTATION: wrong expected values must be DETECTED as failures (assertion liveness) ==="
+# ═══════════════════════════════════════════════════════════════════════════
+MUT="$( ok(){ :; }; no(){ echo TRIPPED; }
+        line="$( sattr deepNest )"
+        if printf '%s' "$line" | grep -q ' nest="999"'; then ok; else no; fi )"
+[ "$MUT" = "TRIPPED" ] && ok "mutation self-test (a wrong nest=999 assertion is correctly detected as a failure)" \
+                       || no "mutation self-test broke — a wrong value did NOT fail (assertion logic unsound)"
+
+MUT2="$( ok(){ :; }; no(){ echo TRIPPED; }
+        if printf '%s' "$QD_OUT" | grep -q 'regressions="0"'; then ok; else no; fi )"
+[ "$MUT2" = "TRIPPED" ] && ok "mutation self-test (asserting regressions=0 on a REAL regression correctly fails)" \
+                        || no "mutation self-test broke — quality-delta regression assertion is not live"
+
+# well-formed XML on the --metrics / --for output (G4)
+command -v xmllint >/dev/null 2>&1 && {
+    if printf '%s' "$MAP" | xmllint --noout - 2>/dev/null; then ok "xml well-formed (--metrics on JS/Bash)"; else no "xml malformed (--metrics on JS/Bash)"; fi
+    if printf '%s' "$FOR_OUT" | xmllint --noout - 2>/dev/null; then ok "xml well-formed (--for on JS/Bash)"; else no "xml malformed (--for on JS/Bash)"; fi
+}
+
+[ "$fail" -eq 0 ] && echo "ALL PASS" || echo "SOME CHECKS FAILED"
+exit "$fail"

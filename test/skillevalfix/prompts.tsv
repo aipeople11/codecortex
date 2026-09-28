@@ -1,0 +1,368 @@
+# prompts.tsv — labelled corpus for --eval-skills (skill-ROUTING eval).
+# One row per line: prompt<TAB>expected<TAB>provenance<TAB>split
+#   expected   = comma-separated skill dir names (a PERMITTED SET — several moments legitimately map to
+#                2 skills), or `none` (no codecortex skill should fire).
+#   provenance = router  — wording adapted from a skills/codecortex-router/SKILL.md moment row; the label is
+#                          that row's mapped skill (ground truth = the router's own moment map).
+#                desc    — wording taken from a trigger phrase the target skill's OWN description quotes;
+#                          the label is that skill (ground truth = the skill's stated trigger).
+#                judged  — hand-written paraphrase (author-judged wording, 2026-07-24); the LABEL still
+#                          follows the router's moment map, only the words are new. These are the hard set:
+#                          they share no vocabulary with the descriptions by construction.
+#                neg     — hand-written prompt where NO codecortex skill should fire (author-judged).
+#   split      = test | dev — FROZEN HELD-OUT SPLIT (added 2026-07-25, round r26). The n=128 `test` rows
+#                (43 of them `judged` — the hard, vocabulary-free paraphrase set that first made
+#                bm25-desc's win/loss margin measurable, 24/43) are the committed benchmark and are FROZEN:
+#                do NOT edit a description and re-measure against these SAME rows next round — that is
+#                train-on-test with extra steps. Rows meant for iterating on a description change belong in
+#                a NEW row with split=dev instead. 2026-08-08 (audit H1 follow-up): the dev split gained its
+#                first n=20 rows (16 positive + 4 negative), covering the 2026-08-05..08 routing moments
+#                (nest-profile/essential-complexity trust, cache-lint pack, --skipped-vs---doctor,
+#                opt-remarks triage + its hard negatives) — free to grow or be replaced round to round,
+#                unlike the rows above this comment. --eval-skills enforces this split (parses the column,
+#                refuses an unrecognized value, reports test/dev metrics SEPARATELY with their sizes) —
+#                this paragraph is documentation of that behavior, not the enforcement itself. A row with no
+#                4th column defaults to split=test (back-compat for hand-built ad-hoc TSVs in other gates),
+#                but every row actually in this file states it explicitly so the freeze is visible on read,
+#                not inferred.
+#
+# RELABEL log (2026-09-07, description-budget round, docs/EVALS.md "Skill descriptions under a client
+# budget"): the efficient skill folded into codecortex-orient on the owner's decision after three blind rater
+# models (Opus, Sonnet, Fable) routed its rows to orient from the FULL descriptions (6/5/5 of the 8/7/7
+# misses in arms A/B/C1). Every permitted-set member `codecortex-efficient` became `codecortex-orient` by the
+# mechanical map (bench/skilldesc_arms.py --label-map) — 12 rows; prompts, provenance, split untouched;
+# no rows added. The directory is gone; its body is skills/codecortex-orient/map-before-you-read.md.
+# codecortex-router itself is never a legal label: it is the fallback map, not a routing destination.
+# Keep this file ASCII; the harness truncates prompts at a byte boundary when reporting misses.
+#
+# RELABEL log (2026-08-11, consensus content-gaps round): three rows relabeled on the S1
+# ceiling check's two-rater consensus (blind protocol, sealed key; both raters independently
+# contradicted the stored label — the only 3 such rows of 63 audited misses; record: EVALS.md
+# "consensus content gaps" registration). Labels changed; prompts, provenance, split untouched;
+# no rows added. Pre-relabel corpus lines (the sealed answer_key numbering — this comment block
+# shifts later lines by +14):
+#   line 180 (ceiling id M043) codecortex-orient       -> codecortex-mcp       (setup-health / "is my
+#            codecortex setup broken" is the mcp skill's staleness/health surface, per the owner's
+#            2026-08-11 tool-diagnostics fold-in decision)
+#   line 225 (ceiling id M062) codecortex-change-check -> codecortex-find-bug  (a named failing CI test
+#            with no known cause is a symptom-first localization moment, not a diff review)
+#   line 233 (ceiling id M040) codecortex-fresh-eyes   -> codecortex-find-bug  (feature invisible at
+#            runtime is a wrong-output symptom hunt, not a maintenance-risk pass)
+#
+# ── positives: router-map provenance ────────────────────────────────────────────────────────────────
+I just landed in an unfamiliar repo - what is this codebase and what actually matters here?	codecortex-orient	router	test
+How does the request pipeline work in this codebase and where is the retry logic?	codecortex-orient	router	test
+Who calls parseHeader, what does it call, and is it safe to change?	codecortex-navigate	router	test
+My task touches the scheduler, the allocator and the job queue - how do those three symbols relate?	codecortex-navigate	router	test
+I am starting a multi-symbol feature and need an ordered implementation plan and a size estimate first.	codecortex-before-you-build	router	test
+I have to write a class that must satisfy the Codec interface - what is the contract and which implementors exist?	codecortex-before-you-build	router	test
+About to write a quick helper function to normalize paths - should take two minutes.	codecortex-reuse-first	router	test
+I am about to open several files just to learn how one thing works.	codecortex-orient	router	test
+Reviewing my own diff now - am I ready to push and is this safe to merge?	codecortex-change-check,codecortex-quality-bar	router	test
+Which tests should I run for this change, and did I run the right ones?	codecortex-change-check	router	test
+I need to write tests for existing code that has none.	codecortex-write-tests	router	test
+Reviewing a subsystem I did not write - what is gnarly in there?	codecortex-fresh-eyes	router	test
+There is a bug somewhere - wrong output from the exporter - and I do not know where it lives.	codecortex-find-bug	router	test
+I have a sanitizer report with a full stack trace - do not make me hand-translate it.	codecortex-find-bug	router	test
+I just edited one symbol - did I change a contract someone depends on?	codecortex-change-check	router	test
+I am landing several parallel agent worktrees - who conflicts and in what order should they land?	codecortex-change-check	router	test
+That flake was caused by a stale cache file - worth remembering for the next session, tied to that symbol.	codecortex-orient	router	test
+Give me one-call orientation for this task under a token budget - ranking, bodies, callers, tests at once.	codecortex-orient	router	test
+Planning a refactor of a suspected god object - where are the seams and the blast radius?	codecortex-fresh-eyes	router	test
+A profiler sample identifies one slow symbol - investigate the measured surface.	codecortex-perf-target	router	test
+I received a skill file from an external source and want to audit it before activating.	codecortex-security-scan	router	test
+Writing a summary of this repo area for the next agent to pick up.	codecortex-handoff	router	test
+How healthy are the layers here - are there layering violations we should gate in CI?	codecortex-layers	router	test
+Which high-complexity functions can reach commitTxn? One-hop callers cannot phrase that question.	codecortex-graph-query	router	test
+Wire codecortex into Cursor as an MCP server.	codecortex-mcp	router	test
+# ── positives: skill-description provenance ─────────────────────────────────────────────────────────
+Is this approach even viable, what should the boundary API look like, and how big is this change?	codecortex-before-you-build	desc	test
+What does this PR actually touch?	codecortex-change-check	desc	test
+This is untested - add coverage.	codecortex-write-tests	desc	test
+What is missing a test here?	codecortex-write-tests	desc	test
+Review this codebase - where is the rot?	codecortex-fresh-eyes	desc	test
+Is this area safe to touch?	codecortex-fresh-eyes	desc	test
+Is it safe to change resolveTypes?	codecortex-navigate	desc	test
+Is this a dependency mess, and how do I enforce module boundaries in CI?	codecortex-layers	desc	test
+Which codecortex MCP verb should I call mid-task?	codecortex-mcp	desc	test
+What in src/ has ten or more callers?	codecortex-graph-query	desc	test
+Hand this area off to a teammate.	codecortex-handoff	desc	test
+What is gnarly here?	codecortex-fresh-eyes	desc	test
+I have a symptom: a crash, wrong output, a failing test, an error string.	codecortex-find-bug	desc	test
+Before adding a dependency - is the capability already in the tree?	codecortex-reuse-first	desc	test
+I received an .mcp.json server config from an external source - vet it before I install it.	codecortex-security-scan	desc	test
+Sizing up an unfamiliar module before editing it.	codecortex-fresh-eyes,codecortex-orient	desc	test
+I caught myself about to open more than two files to figure something out.	codecortex-orient	desc	test
+Right before I open the PR: report only what my change made worse.	codecortex-quality-bar	desc	test
+I changed X and it broke - trace the regression.	codecortex-find-bug	desc	test
+Investigate a measured performance problem starting from a profiler sample.	codecortex-perf-target	desc	test
+# ── positives: judged paraphrases (author-written wording; labels follow the router map) ────────────
+New on this team as of Monday; give me the lay of the land before I pick up a ticket.	codecortex-orient	judged	test
+Where does input validation actually happen in this service?	codecortex-orient	judged	test
+If I rename the third parameter of buildIndex, what downstream code breaks?	codecortex-navigate	judged	test
+Rough out the work to support incremental compilation - what order, what surface, how much effort?	codecortex-before-you-build	judged	test
+I need a tiny timestamp-formatting utility; do not let me reinvent one we already have.	codecortex-reuse-first	judged	test
+Stop me from reading the whole repo - what is the minimal context to fix the pager?	codecortex-orient	judged	test
+Double-check my working tree before I open the pull request.	codecortex-change-check,codecortex-quality-bar	judged	test
+The nightly job started throwing a null-pointer exception somewhere after Tuesday's deploy.	codecortex-find-bug	judged	test
+Merge my three feature branches with the least pain.	codecortex-change-check	judged	test
+Summarize the storage engine for the teammate taking it over next sprint.	codecortex-handoff	judged	test
+Our imports have become a circular tangle - how bad is it and how do we stop the bleeding?	codecortex-layers	judged	test
+This function parses packets straight off the wire - look it over for danger before I ship.	codecortex-security-scan	judged	test
+The flame graph blames string splitting - dig into that code.	codecortex-perf-target	judged	test
+Which parts of the checkout flow have no safety net at all if I refactor them?	codecortex-write-tests	judged	test
+I fixed the bug; tell me whether my patch made the codebase worse.	codecortex-quality-bar	judged	test
+List every function above complexity twenty that can eventually reach the database layer.	codecortex-graph-query	judged	test
+# ── positives: judged paraphrases, growth pass 2026-07-25 (S5.7.2 follow-up) ─────────────────────────
+# n=16 judged rows resolves +-6pp; grown past 40 so before/after description-rewrite comparisons stop
+# hiding real movement in noise. Same discipline as the rows above: each label follows the ROUTER's own
+# moment-map row (skills/codecortex-router/SKILL.md), the wording is new, and NOTHING here was checked
+# against what the current skill descriptions happen to match (train-on-test would defeat the point).
+We are taking over a service nobody on the team has touched in a year - what should worry us before we start editing it?	codecortex-fresh-eyes	judged	test
+This class has ballooned to two thousand lines and everyone is scared of it - where would a split actually help?	codecortex-fresh-eyes	judged	test
+If the one person who understands this subsystem left tomorrow, how exposed would we be?	codecortex-fresh-eyes	judged	test
+How do I hook this tool up as an MCP server so my coding agent can call it directly?	codecortex-mcp	judged	test
+I am mid-task in my agent with a dozen MCP tools available - which one actually answers what I need right now?	codecortex-mcp	judged	test
+This ticket touches the cache layer, the eviction policy, and the metrics exporter - how do those three actually tie together?	codecortex-navigate	judged	test
+Before I touch this shared utility function, I need to know everything that currently calls it.	codecortex-navigate	judged	test
+I need to find every place we retry a network call the old way, not just grep the word retry.	codecortex-navigate	judged	test
+I need to add a new backend that implements the StorageDriver interface - what does an existing one look like so I do not guess the shape?	codecortex-before-you-build	judged	test
+Before we commit a sprint to this, is the approach even workable given how the code is actually structured?	codecortex-before-you-build	judged	test
+We just lost an hour to a stale lockfile causing a flaky build - I want that written down somewhere it will resurface next time this file comes up.	codecortex-orient	judged	test
+Draw me the shape of this codebase - the modules and how they are organized, not a file listing.	codecortex-orient	judged	test
+I just changed the signature on this helper function - does anything downstream actually depend on the old shape?	codecortex-change-check	judged	test
+Three people have feature branches off the same module and we need to land them this week without a mess - what order should they go in?	codecortex-change-check	judged	test
+We have a graveyard of old branches nobody remembers the status of - is any of that actually still unmerged and worth rescuing?	codecortex-change-check	judged	test
+Give me everything I would need for this ticket in one shot - ranking, the actual code, who calls it, what to test - I do not want to run five separate commands.	codecortex-orient	judged	test
+I keep tab-hopping between a dozen files trying to understand one code path - there has to be a faster way to see the shape of this.	codecortex-orient	judged	test
+Before I pull in a new library for retry-with-backoff, is there already something like that in this codebase?	codecortex-reuse-first	judged	test
+Nobody has ever written a single test for this billing module - I want to close that gap, not just poke at it randomly.	codecortex-write-tests	judged	test
+I need every function that is both high-complexity and eventually reaches the billing code - a simple caller list cannot express that.	codecortex-graph-query	judged	test
+Our benchmark says one call is eating most of the frame time - help me actually look at that code and what feeds into it.	codecortex-perf-target	judged	test
+A teammate sent me an mcp config file from another project - I want it checked over before I let it anywhere near my machine.	codecortex-security-scan	judged	test
+This parser reads whatever a client sends over the socket before we have validated any of it - I want eyes on that before it ships.	codecortex-security-scan	judged	test
+I am rotating off this project on Friday - put together something the next person can actually read instead of skimming the whole repo.	codecortex-handoff	judged	test
+We keep saying the UI layer should not import the database layer but nothing actually stops it - can we make that a real rule in CI?	codecortex-layers	judged	test
+Before I open this PR I just want to know what got worse, not a whole style lecture.	codecortex-quality-bar	judged	test
+Here is the crash log with the full stack trace - I would rather not manually walk every frame by hand.	codecortex-find-bug	judged	test
+# ── negatives: no codecortex skill should fire (author-judged) ─────────────────────────────────────────
+How do I vertically center a div inside a flex container?	none	neg	test
+What does git rebase --onto actually do?	none	neg	test
+Undo my last three commits but keep the changes staged.	none	neg	test
+Why does npm install fail with EACCES on my machine?	none	neg	test
+Write a limerick about compilers.	none	neg	test
+Convert this JSON blob to YAML for me.	none	neg	test
+What is the difference between TCP and UDP?	none	neg	test
+My Kubernetes pod is stuck in CrashLoopBackOff - what are the common causes?	none	neg	test
+Set up a Python virtualenv pinned to an older interpreter.	none	neg	test
+Rename a file in git while preserving its history.	none	neg	test
+What is a good commit message format for a small team?	none	neg	test
+Increase the terminal font size in VS Code.	none	neg	test
+Proofread and review my conference talk abstract.	none	neg	test
+Draft a standup update from what I did yesterday.	none	neg	test
+Book a meeting room for the design review tomorrow.	none	neg	test
+# ── negatives: growth pass 2026-07-25, kept proportional to the judged growth above. General
+# off-topic prompts plus hard negatives that reuse a skill-name WORD in an unrelated everyday sense
+# (orient/navigate/layers/merge/review/quality/efficient/graph/security/reuse/build/perf/test/fresh) -
+# the same discipline as the original 4 hard negatives (talk-abstract review, commit/rebase wording).
+What is a good stretch routine for lower back pain from sitting all day?	none	neg	test
+Recommend a wine pairing for grilled salmon.	none	neg	test
+How do I turn on dark mode in my terminal emulator?	none	neg	test
+What is the plural of octopus - octopi or octopuses?	none	neg	test
+Explain the offside rule in soccer to someone who has never watched a match.	none	neg	test
+Write a haiku about autumn leaves.	none	neg	test
+How long should I marinate chicken thighs before grilling?	none	neg	test
+What is the best way to learn a new language as an adult?	none	neg	test
+My cat will not stop scratching the couch - any tips?	none	neg	test
+Convert 75 degrees Fahrenheit to Celsius.	none	neg	test
+Which way is magnetic north from here, and how do I use a compass properly?	none	neg	test
+What is the fastest driving route to the airport that avoids tolls?	none	neg	test
+How many layers should a good lasagna have, and in what order?	none	neg	test
+Explain the rules for a handoff in a 4x100 relay race.	none	neg	test
+What is the etiquette for merging onto a busy highway?	none	neg	test
+Can you review this restaurant for me based on the menu photos?	none	neg	test
+What separates a good espresso bean from a mediocre one?	none	neg	test
+What is a fuel-efficient way to drive on the highway?	none	neg	test
+How do I make a pie chart in Excel from this spreadsheet?	none	neg	test
+What is a good deadbolt brand for a front door?	none	neg	test
+What plastics are actually accepted for curbside recycling?	none	neg	test
+What permits do I need before building a backyard shed?	none	neg	test
+How do I improve my 5K running pace?	none	neg	test
+What is a good practice test format for a driver's license exam?	none	neg	test
+I need a fresh pair of reading glasses - what prescription strength ranges are common?	none	neg	test
+# ── split=dev: tuning rows for the 2026-08-05..08-08 moments (nest-profile/essential-complexity/cache-lint/
+# --skipped/opt-remarks). Per the header discipline above: NOT scored against the frozen split=test floor,
+# reported separately, safe to iterate on next round without touching a single row above this line.
+This function keeps sprouting branches and I cannot tell if it is one tangled mess or just a long plain sequence - what shape is it actually?	codecortex-fresh-eyes	judged	dev
+I already have the humps and deep numbers for this function from a subsystem review - which refactor does that shape actually call for?	codecortex-quality-bar	router	dev
+The profiler says we are memory-bound in this struct-heavy loop - which fields are actually read together versus how the struct is laid out?	codecortex-perf-target	judged	dev
+Before I reach for a heavier profiler pass, are there any obvious bad data-layout patterns a plain lint run would already catch?	codecortex-perf-target	judged	dev
+The map that came back looks short - did some files just get dropped for being too big to index?	codecortex-orient	judged	dev
+I expected this function to show up in the ranked output and it is just not there at all - is my codecortex setup broken?	codecortex-mcp	judged	dev
+I am wrapping up for the day and want to leave a clean summary of this subsystem for whoever picks it up tomorrow.	codecortex-handoff	judged	dev
+Write up the entry points and the design rationale here so a teammate does not have to re-read the whole module cold.	codecortex-handoff	judged	dev
+I have a dozen old feature branches and no idea which ones still hold work that never made it to main.	codecortex-change-check	judged	dev
+Which ref actually still defines this function - I keep finding stale references to it across branches.	codecortex-change-check	judged	dev
+This function's complexity score looks huge, but half of it sits inside an #ifdef for a platform we do not even build - can I trust the number as reported?	codecortex-fresh-eyes	judged	dev
+The complexity number on this function is high, but I cannot tell if it is a genuine tangle or just a long simple sequence I could split by hand - how risky would splitting it actually be?	codecortex-quality-bar	judged	dev
+The compiler just printed "loop not vectorized" for a function I am editing in codecortex's own source - is that actually worth chasing with a code change?	codecortex-opt-remarks	judged	dev
+I am working on codecortex's C++ and clang keeps telling me a call "will not be inlined" - should I change the source or just move on?	codecortex-opt-remarks	judged	dev
+I have a huge pile of optimization-record YAML from a remarks build of this repo - how do I actually triage it instead of reading a gigabyte of output?	codecortex-opt-remarks	judged	dev
+Before I chase this LICM-failed-to-hoist remark with a source change, is a build flag more likely to be the real fix here?	codecortex-opt-remarks	judged	dev
+Our deploy pipeline is slow and the whole team is annoyed about it - where do we even start looking?	none	neg	dev
+This service feels sluggish under load - any general tips for speeding it up?	none	neg	dev
+My teammate left a bunch of code review remarks I still need to address before this merges.	none	neg	dev
+Can you optimize this paragraph so it reads faster for a non-technical audience?	none	neg	dev
+# -- 2026-08-11 growth pass (S1 round): judged rows grown to >=150; split assigned by sha256(prompt) parity
+#    at collection time (deterministic, collector-blind); provenance discipline unchanged (judged/neg only).
+New to this service as of today - what are the moving parts and where does execution start?	codecortex-orient	judged	test
+I got compacted mid-task and lost my reasoning - rebuild what I knew about the migration work.	codecortex-orient	judged	dev
+Jot this down for future sessions: the fixture loader silently caches across tests.	codecortex-orient	judged	test
+Track down every write to the retryBudget field before I change its type.	codecortex-navigate	judged	dev
+Show me the chain from handleUpload to the S3 client - the actual route the data takes.	codecortex-navigate	judged	dev
+If I rename applyPatch, what breaks downstream?	codecortex-navigate	judged	dev
+Read out flushQueue in full with whatever it calls - I need its contract before touching it.	codecortex-navigate	judged	dev
+The ticket names three structs - ledger, journal, snapshot - and I cannot see how they meet.	codecortex-navigate	judged	test
+Scope this for me: adding rate limiting across the gateway - how big does that change get?	codecortex-before-you-build	judged	dev
+I want a build order for the export feature before writing any code.	codecortex-before-you-build	judged	test
+Sketch the boundary for the new caching layer - what should its API expose?	codecortex-before-you-build	judged	dev
+Is streaming decode even viable here or am I fighting the architecture?	codecortex-before-you-build	judged	test
+My new backend must plug into StorageDriver - what has to exist and who implements it today?	codecortex-before-you-build	judged	test
+Before the sprint starts I want an implementation sequence for the notifications feature grounded in real code.	codecortex-before-you-build	judged	test
+About to add a tiny date-formatting util - two minutes tops.	codecortex-reuse-first	judged	test
+Need a function that slugifies titles - surely something like it exists here already?	codecortex-reuse-first	judged	dev
+Let me write a quick retry wrapper around the fetch call.	codecortex-reuse-first	judged	test
+Adding a dependency for CSV parsing - is that already vendored somewhere in here?	codecortex-reuse-first	judged	dev
+I am going to write a small helper that dedupes the config list.	codecortex-reuse-first	judged	test
+Give me the house pattern for a visitor class before I author mine.	codecortex-reuse-first	judged	dev
+One-liner to clamp values - just gonna type it out.	codecortex-reuse-first	judged	dev
+Let me skim a handful of files to get context on the session store first.	codecortex-orient	judged	test
+I keep pasting whole files into context and the budget is bleeding - better way?	codecortex-orient	judged	dev
+Hand me the whole task briefing at once, capped around six thousand tokens.	codecortex-orient	judged	test
+Spinning up four subagents for this refactor - carve the repo so their briefs do not overlap.	codecortex-orient	judged	test
+Before answering I will skim src end to end.	codecortex-orient	judged	test
+My context window is filling with file dumps again - keep this cheap.	codecortex-orient	judged	test
+Two worktrees touched the tokenizer - which lands first and where do they collide?	codecortex-change-check	judged	test
+A test named test_manifest_roundtrip failed on CI - I have its name and no clue what it exercises.	codecortex-find-bug	judged	test
+I think the patch is finished - what did I just make worse?	codecortex-quality-bar	judged	test
+Wrapping up - run the last-mile debt check before I tell them it is done.	codecortex-quality-bar	judged	dev
+The function I measured has one deep tangle in the middle - which restructuring actually fits that shape?	codecortex-quality-bar	judged	dev
+My fix landed but prove the cleanup stuck and nothing regressed.	codecortex-quality-bar	judged	test
+Before opening the PR, check whether my new code added duplication or dead branches.	codecortex-quality-bar	judged	dev
+Inheriting the billing module from a departed teammate - how rotten is it really?	codecortex-fresh-eyes	judged	dev
+This class smells like it does everything - confirm it is a god object and show the seams.	codecortex-fresh-eyes	judged	dev
+Why is feature X invisible at runtime - is it compiled out behind a flag?	codecortex-find-bug	judged	dev
+Planning to break up the parser package - what is entangled with what before I start?	codecortex-fresh-eyes	judged	test
+Users report the export silently produces an empty archive - zero leads on where it happens.	codecortex-find-bug	judged	dev
+Pasting the sanitizer output here - point me at the guilty frame.	codecortex-find-bug	judged	dev
+It worked on Friday and the demo just crashed - what changed underneath?	codecortex-find-bug	judged	dev
+I suspect the scheduler subsystem for these stuck jobs - narrow it down.	codecortex-find-bug	judged	test
+My last edit broke the pipeline somewhere - work backwards from my working diff.	codecortex-find-bug	judged	dev
+Exception says KeyError: locale but grepping locale gives 400 hits - find the real site.	codecortex-find-bug	judged	dev
+Throwing this compiler error at you - which of our symbols does it actually implicate?	codecortex-find-bug	judged	test
+Show me functions with complexity above twenty from which the allocator is reachable.	codecortex-graph-query	judged	test
+Which handlers in src/api have more than ten callers?	codecortex-graph-query	judged	dev
+Give me the two-hop callee closure of dispatch but only inside the network cluster.	codecortex-graph-query	judged	test
+Find the classes in the storage file with fan-in over five.	codecortex-graph-query	judged	dev
+Which untested symbols sit within one hop of main?	codecortex-graph-query	judged	dev
+I need functions matching: in the parser dir AND complexity over 15 AND called from outside it.	codecortex-graph-query	judged	dev
+Cross complexity with fan-in and show me symbols where both are high, scoped to core/.	codecortex-graph-query	judged	test
+Does anything in the UI reach directly into the database code? It should not.	codecortex-layers	judged	dev
+How tangled are our module boundaries - any cycles I should lose sleep over?	codecortex-layers	judged	dev
+Enforce that utils never imports from app - and make CI hold the line.	codecortex-layers	judged	dev
+If someone touches common.h, how far does the ripple spread through the build?	codecortex-layers	judged	dev
+Rate the health of our layering after the merge - worse or better?	codecortex-layers	judged	test
+Which file is the godfile gluing everything together and what would unpicking it cost?	codecortex-layers	judged	dev
+New architecture rule: adapters may not call services directly - wire up a violation gate.	codecortex-layers	judged	test
+Set this up inside Cursor so the model can query the index without shelling out.	codecortex-mcp	judged	dev
+Which server verbs should the agent lean on during a task instead of the CLI flags?	codecortex-mcp	judged	dev
+Hook the code map into Claude Code as a tool server for this repo.	codecortex-mcp	judged	test
+The index the agent sees feels stale after my rebase - how does the server refresh?	codecortex-mcp	judged	dev
+Windsurf integration: which config block do I add, and what safety do the editing verbs promise?	codecortex-mcp	judged	test
+Is calling fetch_body from the agent cheaper than pulling entire files into context?	codecortex-mcp	judged	test
+Getting my aider setup to use the graph tools - walk me through the wiring.	codecortex-mcp	judged	test
+Clang complains it could not vectorize the radix loop because no reduction was identified - worth chasing?	codecortex-opt-remarks	judged	test
+The build spewed will-not-inline: cost exceeds threshold on the hot comparator - do I care?	codecortex-opt-remarks	judged	dev
+Run the remarks harness and tell me which missed optimizations sit in hot code.	codecortex-opt-remarks	judged	dev
+-Rpass-missed is noisy on ingest.cpp - triage which remarks deserve a diff.	codecortex-opt-remarks	judged	dev
+I got a vectorization remark on the scoring kernel while editing - decide whether a diff pays.	codecortex-opt-remarks	judged	test
+The profiler pins 40 percent of samples in normalizeKeys - dig in from there.	codecortex-perf-target	judged	test
+Our p99 doubled and the flame profile points at JSON encode - investigate.	codecortex-perf-target	judged	dev
+Benchmark shows the cold path regressed 2x - I have the numbers, now what in the code?	codecortex-perf-target	judged	test
+Counters put the row scanner memory-bound - which fields fight over cache lines?	codecortex-perf-target	judged	dev
+Perf sample attached: most time under lockContention in the pool - map that call surface.	codecortex-perf-target	judged	dev
+Someone sent me a SKILL.md to install - screen it before it touches my agent.	codecortex-security-scan	judged	test
+Audit the deserializer path - it eats bytes arriving from the network unchecked.	codecortex-security-scan	judged	dev
+A new MCP server config landed in the repo - inspect its shell blocks before I enable it.	codecortex-security-scan	judged	dev
+Reviewing the auth handler for injection risk - assemble the evidence.	codecortex-security-scan	judged	test
+Periodic sweep: anything sketchy in the skills directory we installed last month?	codecortex-security-scan	judged	test
+This endpoint execs user-supplied templates - how exposed are we?	codecortex-security-scan	judged	dev
+The parser package has zero tests - give me a starting point so the effort counts.	codecortex-write-tests	judged	dev
+Which seams in this module does nothing exercise end to end?	codecortex-write-tests	judged	test
+Add a safety net around applyDiscount before we refactor it - what is its outside contract?	codecortex-write-tests	judged	dev
+Management wants the billing core covered - rank what deserves a test first.	codecortex-write-tests	judged	test
+I wrote a test for the queue - verify it actually reaches the code I meant.	codecortex-write-tests	judged	test
+Legacy util file, no tests, heavily called - close the gap.	codecortex-write-tests	judged	dev
+Nothing covers the ledger rollover path - write the missing test and prove it registers.	codecortex-write-tests	judged	test
+Brief the incoming agent on the ingest area - what it does, why, and where it bites.	codecortex-handoff	judged	dev
+I rotate off this codebase Friday - package what my successor needs about the sync engine.	codecortex-handoff	judged	dev
+Prepare a pasteable summary of the auth subsystem for the contractor starting Monday.	codecortex-handoff	judged	dev
+Another team inherits the exporter next sprint - produce the orientation doc.	codecortex-handoff	judged	dev
+Capture the state of the migration tooling so a fresh session continues without me.	codecortex-handoff	judged	dev
+Bump the package version and tag the release.	none	neg	dev
+Write a friendly README intro paragraph for the project.	none	neg	dev
+Convert this YAML config to JSON for me.	none	neg	dev
+Which HTTP verbs are idempotent according to the spec?	none	neg	test
+Add MIT license headers to the new files.	none	neg	dev
+Move the nightly cron to 3am UTC instead of midnight.	none	neg	test
+Translate these error strings into German for the locale file.	none	neg	test
+Center the logo on the landing page and darken the footer.	none	neg	test
+Draft the changelog entry for this week's release.	none	neg	test
+Rotate the staging API keys and update the secrets store.	none	neg	dev
+Squash my last four commits into one - the history is messy.	none	neg	test
+Set up prettier so the frontend formats on save.	none	neg	test
+Why does my Docker build keep missing the layer cache?	none	neg	dev
+Upgrade the CI runners to the larger instance size.	none	neg	dev
+Spell-check the documentation folder.	none	neg	dev
+Write a SQL query listing users who signed up this month.	none	neg	dev
+Regenerate the protobuf stubs with the new compiler version.	none	neg	test
+Mute the flaky Slack webhook alert until Monday.	none	neg	test
+What does HTTP status 451 mean?	none	neg	test
+Rename the default branch across our repositories.	none	neg	test
+Fill in the sprint retro doc with what shipped.	none	neg	test
+Convert the images in assets to WebP.	none	neg	dev
+Explain Python's walrus operator.	none	neg	test
+Pin the GitHub Action to a commit SHA instead of a tag.	none	neg	dev
+# ── STOP-RULE ROWS (2026-09-10, lane/helptask-precision) — BEGIN. Sliced by test/skillevalcheck.sh's
+# stop-rule arm between these two markers; the arm asserts exactly 16 rows, 4 per rule, so a silent
+# slice failure fails the gate. Each row's ground truth depends on one of the four frontmatter STOP
+# RULES #112 restored — sentences that no other row in this corpus could see (2026-09-10 audit F-R1-03:
+# stripping all four left split=test hit@1 byte-identical and split=dev 1.4pp BETTER). split=dev by the
+# corpus header's own rule that the test split is FROZEN and new rows belong in dev.
+#   before-you-build  "A small feature with an obvious home needs none of this."
+#   fresh-eyes        "A single-lens question is a single call."
+#   orient            "Stop at the first rung that answers."
+#   write-tests       "For one target one --seams or --callers pass suffices."
+# PROVENANCE, stated honestly: the first 8 (the audit's own) echo the rules' vocabulary, which is what
+# `desc` means in this file — they are labelled `desc`, not `judged`, because a lexical ranker can only
+# detect a sentence's removal through rows that share its words. The second 8 were written to AVOID that
+# vocabulary and are `judged`; they were MEASURED at exactly zero discrimination (bm25-desc 50.0% with
+# the rules and 50.0% without), which is the honest answer to "phrase it without quoting it": for a BM25
+# arm, you cannot. They are kept as ordinary hard judged rows and as the record of that null result.
+This feature is small and I already know exactly which file it belongs in - do I still need a plan?	codecortex-before-you-build	desc	dev
+A one-file addition with an obvious home, nothing multi-symbol about it	codecortex-before-you-build	desc	dev
+Just one lens please: which files are the hotspots, nothing else	codecortex-fresh-eyes	desc	dev
+A single question about this inherited module - where is the rot, one answer is enough	codecortex-fresh-eyes	desc	dev
+Give me the first rung only - what are the main subsystems, then stop	codecortex-orient	desc	dev
+Landing cold here; one map is all I want before I start reading	codecortex-orient	desc	dev
+One target, one pass: which tests reach parseFrame and which do not	codecortex-write-tests	desc	dev
+This single function has no coverage - one call to find the seam is enough	codecortex-write-tests	desc	dev
+This addition is tiny and I already know which module owns it - is a full plan worth it?	codecortex-before-you-build	judged	dev
+Do I really need the whole planning pass for a change this contained?	codecortex-before-you-build	judged	dev
+I only want the hotspot list for this inherited service, nothing more.	codecortex-fresh-eyes	judged	dev
+Where is the dead code in this module? That is the only thing I am asking.	codecortex-fresh-eyes	judged	dev
+New to this repo - the top-level subsystems and entry points, and I will take it from there.	codecortex-orient	judged	dev
+I want just enough of a map to start reading, not a full tour.	codecortex-orient	judged	dev
+There is exactly one function I need coverage for - what is the shortest way to find its seam?	codecortex-write-tests	judged	dev
+One untested helper, one pass to find what reaches it, done.	codecortex-write-tests	judged	dev
+# ── STOP-RULE ROWS — END ────────────────────────────────────────────────────────────────────────────

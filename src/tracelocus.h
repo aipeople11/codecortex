@@ -1,0 +1,1314 @@
+#pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include "infra/os.h"   // rw::os::open_memstream — the trace render buffers
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
+
+// tracelocus.h — the shared trace-to-locus bundle assembler behind --from-trace (CLI, L2) and the MCP
+// from_trace verb (L4). tracein.h owns PURE frame extraction (no corpus
+// knowledge); this header owns the CORPUS resolution (a frame's path → indexed fileId, then the frame's own
+// NAME → a unique def, falling back to the frame's line → its enclosing symbol) and the bundle assembly (the
+// <trace> map + suspects' signatures + the innermost in-corpus symbol's full body) — so main.cpp's
+// runFromTrace() and mcpverbs.h's fromTraceText() share ONE implementation, never two hand-copies of the
+// innermost-first ranking/serialization logic.
+//
+// §A2 — the two honesty contracts this file now keeps:
+//   * NAME-FIRST resolution. A trace comes from a binary that may predate the checkout, so its line numbers
+//     are the stale half of every frame; binding by line alone silently rebound `runDefaultMap` to whatever
+//     squats on that line today. Each frame stamps resolved_by="name"|"line", and a name/line DISAGREEMENT is
+//     disclosed (line_encloses=), never reconciled behind the reader's back.
+//   * A CLOSING partition. in_corpus = suspects + merged + unresolved: every file-matched frame is visible in
+//     exactly one bucket, so a frame can no longer be counted and then vanish from the document.
+//
+// Included BEFORE mcp.h in main.cpp so mcpverbs.h can reach fromTraceBundleText() — self-contained (its own
+// #includes only) so include ORDER elsewhere in main.cpp never matters to it.
+
+#include "model.h"
+#include "nextverb.h"     // P3 (L7): next= on the trace bundle root
+#include "graph.h"
+#include "filter.h"        // LB-A: isTestPath / isTestSymbol — the SHARED test partition the hop below asks
+#include "compactlegend.h" // L1 fix round: compactDeliveredBytes — the section floor and ladder at the delivered price
+#include "serialize.h"     // packSignatures / packBodies / escapeXml / kForPayloadBudgetBytes
+#include "redact.h"
+#include "tracein.h"        // table-driven stack-trace/sanitizer/compiler frame extraction (pure string work)
+#include "infra/namesplit.h"      // stripTrailingGroup/stripTemplateArgs — shared with ingest.cpp's H4 re-split
+#include "mention.h"        // mention_detail::pathSuffixMatches — the longest-suffix file match
+
+#include <algorithm>
+#include <cstdio>
+#include <cstdint>
+#include <optional>   // renderTraceBlock / renderTestHopBlock: nullopt is a buffer that failed
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+namespace rw
+{
+
+inline constexpr std::uint32_t kNoTraceFile = UINT32_MAX;
+
+// the indexed fileId a trace frame's path resolves to. A trace carries absolute / build-relative prefixes
+// the repo-relative index never has, so the LONGEST path-suffix that matches any indexed file wins (the
+// mention-anchor precedent, src/mention.h) — first ascending fileId on a tie. kNoTraceFile ⇒ out of corpus.
+inline std::uint32_t traceMatchFile( const IngestResult& ing, std::string_view rawPath )
+{
+    // split the frame path into whole '/'-components (drop empties so a leading '/' or '//' is harmless)
+    std::vector<std::string> segments;
+    std::size_t p = 0;
+    while( p < rawPath.size() )
+    {
+        while( p < rawPath.size() && rawPath[p] == '/' )
+        {
+            ++p;
+        }
+        const std::size_t s = p;
+        while( p < rawPath.size() && rawPath[p] != '/' )
+        {
+            ++p;
+        }
+        if( p > s )
+        {
+            segments.emplace_back( rawPath.substr( s, p - s ) );
+        }
+    }
+    if( segments.empty() )
+    {
+        return kNoTraceFile;
+    }
+
+    const std::uint32_t fileCount = std::uint32_t( ing.files.size() );
+    for( std::size_t suffixLen = segments.size(); suffixLen >= 1; --suffixLen )
+    {
+        const std::vector<std::string> suffix( segments.end() - std::ptrdiff_t( suffixLen ), segments.end() );
+        for( std::uint32_t f = 0; f < fileCount; ++f )
+        {
+            if( mention_detail::pathSuffixMatches( rootRelPath( ing, f ), suffix ) )
+            {
+                return f;
+            }
+        }
+    }
+    return kNoTraceFile;
+}
+
+// the innermost indexed symbol whose def span [line, line + loc - 1] contains `frameLine` in `fileId`.
+// Deepest (largest start line) wins; ties break to the smaller span, then id asc. kNoNode ⇒ the frame hit
+// file-scope code with no enclosing def (the file is still in-corpus; it just yields no ranked suspect).
+inline NodeId traceEnclosingSymbol( const IngestResult& ing, std::uint32_t fileId, std::uint32_t frameLine )
+{
+    NodeId best = kNoNode;
+    for( const Symbol& s : ing.symbols )
+    {
+        if( s.fileId != fileId || s.line == 0 || frameLine < s.line )
+        {
+            continue;
+        }
+        const std::uint32_t endLine = s.line + ( s.loc > 0 ? s.loc - 1 : 0 );
+        if( frameLine > endLine )
+        {
+            continue;
+        }
+        if( best == kNoNode ) { best = s.id; continue; }
+
+        const Symbol&       b    = ing.symbols[ best ];
+        const std::uint32_t bEnd = b.line + ( b.loc > 0 ? b.loc - 1 : 0 );
+        const bool deeper = s.line > b.line
+            || ( s.line == b.line && ( endLine - s.line ) <  ( bEnd - b.line ) )
+            || ( s.line == b.line && ( endLine - s.line ) == ( bEnd - b.line ) && s.id < b.id );
+        if( deeper )
+        {
+            best = s.id;
+        }
+    }
+    return best;
+}
+
+namespace tracelocus_detail
+{
+
+// how many progressively-less-qualified spellings of one frame name we are willing to probe. The LADDER stops
+// early on the first unique hit, so on almost every frame this bound is never reached.
+//
+// It was documented here as "a bound, never a silent cap on results", on the reasoning that exhausting it
+// merely degrades the frame to line-enclosure with resolved_by="line" stamped. That is wrong, and the 2026-09-10
+// cap round measured why: the ladder is built from SUFFIXES, most-qualified first, so the shortest and
+// likeliest-to-resolve rung — the BARE function name — is the LAST one, and is therefore exactly what a
+// truncation removes. A frame in a package eight segments deep never gets its own method name probed. The
+// measurement (test/tracehandoffcapcheck.sh arm A is the same fixture): one Java frame, one stale line, spelled
+// `com.example.service.internal.deep.nest.pkg.RequestHandler.handleTheRequestNow` binds rank 1 to the WRONG
+// symbol by line, while `pkg.RequestHandler.handleTheRequestNow` binds to the right one by name AND discloses
+// the name-vs-line disagreement. resolved_by="line" cannot distinguish the two, because it is also what an
+// absent, unknown or ambiguous name produces. So the ladder's own truncation is now disclosed on the row —
+// name_ladder_capped="1" with the pre-cut rung count — and ONLY when the cap both fired and was exhausted.
+inline constexpr std::size_t kNameCandidateCap = 8;
+
+// the ladder built for one frame name, plus how long it was BEFORE kNameCandidateCap cut it. `rungs.size() <
+// total` is exactly "the cap fired on this frame"; `total` is deduped, so it counts probeable spellings and
+// not raw separators.
+struct NameLadder
+{
+    std::vector<std::string> rungs;
+    std::size_t              total = 0;
+};
+
+// the balanced-trailing-group scanner now lives in the leaf header namesplit.h, because src/ingest.cpp needs
+// the SAME scan for the H4 qualified-call re-split and cannot include this header (it pulls graph.h +
+// serialize.h). These using-declarations keep every call site below — and every gate that rides them —
+// spelled and behaving exactly as before; nothing but the definition's location changed.
+using rw::namesplit::stripTrailingGroup;
+
+// drop a trailing `(…)` parameter list AND any cv/ref/noexcept qualifiers after it, so a demangled C++ frame
+// name reduces to the spelling the symbol table keys: `runDefaultMap(MainDispatch const&) const` ->
+// `runDefaultMap`. Cutting to the LAST ')' first is what lets the shared scan see the group at the very end.
+inline std::string_view stripCallSignature( std::string_view f ) noexcept
+{
+    const std::size_t closeIndex = f.rfind( ')' );
+    if( closeIndex == std::string_view::npos )
+    {
+        return f;
+    }
+
+    const std::string_view upToClose = f.substr( 0, closeIndex + 1 );
+    const std::string_view head      = stripTrailingGroup( upToClose, '(', ')' );
+    return head.size() == upToClose.size() ? f : head;                // nothing stripped ⇒ keep the qualifiers too
+}
+
+// drop a trailing balanced `<…>` template-argument group: `make<Foo,Bar>` -> `make`. (Definition hoisted to
+// namesplit.h alongside the scanner it wraps; the spelling here is unchanged.)
+using rw::namesplit::stripTemplateArgs;
+
+// the ordered name spellings to probe for one raw frame function name, most-qualified FIRST: the cleaned name,
+// then every suffix after a `::` or `.` separator (C++ namespaces/classes, Python/JS module and method dots).
+// Deterministic, deduped, bounded by kNameCandidateCap. An empty/absent frame name yields no candidates. The
+// DEDUP test runs before the cap test, so `total` counts the distinct spellings the name really produced —
+// the kept set is unchanged by that ordering (a duplicate never became a rung either way).
+inline NameLadder nameCandidates( std::string_view rawFunc )
+{
+    const std::string_view clean = stripTemplateArgs( tracein::detail::trim( stripCallSignature( tracein::detail::trim( rawFunc ) ) ) );
+
+    // EVERY distinct spelling first, the cap applied once at the end — rather than a cap test inside the
+    // dedup, which would have to remember the refused spellings separately to keep `total` deduped (a name
+    // whose 9th and 10th rungs are the same string must count once). Bounded by one frame name's separator
+    // count, so the extra entries are a handful of small strings on the frames that reach the cap at all.
+    std::vector<std::string> spellings;
+    const auto add = [ & ]( std::string_view c )
+    {
+        if( c.empty() || std::find( spellings.begin(), spellings.end(), c ) != spellings.end() )
+        {
+            return;
+        }
+        spellings.emplace_back( c );
+    };
+
+    add( clean );
+    for( std::size_t i = 0; i + 1 < clean.size(); ++i )
+    {
+        if( clean[i] == ':' && clean[i + 1] == ':' )
+        {
+            add( clean.substr( i + 2 ) );
+        }
+        else if( clean[i] == '.' )
+        {
+            add( clean.substr( i + 1 ) );
+        }
+    }
+
+    NameLadder ladder;
+    ladder.total = spellings.size();
+    ladder.rungs.assign( spellings.begin(), spellings.begin() + std::min( spellings.size(), kNameCandidateCap ) );
+    return ladder;
+}
+
+} // namespace tracelocus_detail
+
+// §A2a: the indexed definition the frame's OWN function name denotes, or kNoNode when the name is absent,
+// unknown here, or ambiguous. This is the primary resolver: a trace comes from a binary that may predate the
+// checkout, so its line numbers are the stale half of the frame and its name is the stable half. Ambiguity is
+// broken ONLY by the frame's own (already file-matched) fileId — one same-named def in that file wins; two do
+// not, and the frame degrades to line-enclosure rather than guessing an overload.
+//
+// The ladder's own truncation travels with the answer: `isLadderCut` is set only when kNameCandidateCap
+// dropped rungs AND every kept rung was exhausted without binding — the one case where a longer ladder could
+// have produced a different symbol. A frame that bound on rung 3 carries nothing, so the disclosure costs
+// bytes only where it is true.
+struct TraceNameBinding
+{
+    NodeId      symbolId    = kNoNode;
+    std::size_t ladderTotal = 0;
+    bool        isLadderCut = false;
+};
+
+inline TraceNameBinding traceResolveByName( const IngestResult& ing, std::string_view rawFunc, std::uint32_t fileId )
+{
+    const tracelocus_detail::NameLadder ladder = tracelocus_detail::nameCandidates( rawFunc );
+
+    for( const std::string& candidate : ladder.rungs )
+    {
+        const std::vector<NodeId> defs = resolveAllByName( ing, candidate );
+        if( defs.size() == 1 )
+        {
+            return { defs[0], ladder.total, false };
+        }
+        if( defs.size() < 2 )
+        {
+            continue;
+        }
+
+        NodeId      sameFileId    = kNoNode;
+        std::size_t sameFileCount = 0;
+        for( const NodeId d : defs )
+        {
+            if( ing.symbols[d].fileId == fileId )
+            {
+                sameFileId = d;
+                ++sameFileCount;
+            }
+        }
+        if( sameFileCount == 1 )
+        {
+            return { sameFileId, ladder.total, false };
+        }
+    }
+    return { kNoNode, ladder.total, ladder.rungs.size() < ladder.total };
+}
+
+// one ranked in-corpus suspect. `frame` is the TRACE's own locator (path verbatim, its own line) — it is a
+// trace report, so p= stays the frame's coordinates and the DEFINITION site travels in <sigs> l=.
+// `lineEnclosesId` is set only when the two resolvers DISAGREE (name says X, today's line sits in Y): the tell
+// that the trace predates this checkout, disclosed rather than silently reconciled.
+struct TraceSuspect
+{
+    const tracein::ParsedFrame* frame            = nullptr;
+    NodeId                      symbolId         = kNoNode;
+    NodeId                      lineEnclosesId   = kNoNode;
+    bool                        isResolvedByName = false;
+    // the pre-cut rung count of this frame's name ladder, and 0 when the ladder never ran out — so a
+    // non-zero value is BOTH the marker and its total, in the one field. See kNameCandidateCap.
+    std::size_t                 nameLadderTotal  = 0;
+};
+
+// §A2b: the WHOLE partition of one trace's parsed frames — every frame lands in exactly one bucket, and the
+// counters close: in_corpus = suspects + merged + unresolved. `skipped` is the out-of-every-root bucket
+// (listed, never ranked); `unresolved` is the third bucket that used to vanish — file indexed, but no symbol
+// found by either resolver (a line in a doc-comment gap / file-scope code, with no usable name).
+struct TracePartition
+{
+    std::vector<TraceSuspect>                suspects;
+    std::vector<const tracein::ParsedFrame*> skipped;
+    std::vector<const tracein::ParsedFrame*> unresolved;
+    // parallel to `unresolved` (G2: SoA, not a struct per row): the same pre-cut rung count TraceSuspect
+    // carries, for the frames that bound to nothing at all. An unresolved frame whose ladder ran out is the
+    // most misleading row in the document — "no def by name or by line" when the bare name was never probed.
+    std::vector<std::size_t>                 unresolvedLadderTotal;
+    std::size_t                              parsedCount   = 0;
+    std::uint32_t                            inCorpusCount = 0;
+    std::uint32_t                            mergedCount   = 0;    // frames folded into an already-claimed symbol
+    // §B10: the OUTER denominator — frame-shaped INPUT LINES (tracein::FrameScan), of which parsedCount were
+    // extractable. Set by the caller, which is the only place that still holds the raw text. Everything else
+    // in this struct partitions parsedCount; this is the one number that says how big parsedCount's own
+    // universe was, so a dropped frame (a dyld line with no source location) stops being invisible.
+    std::size_t                              frameLinesSeen = 0;
+};
+
+// bucket every frame of an ALREADY innermost-first-sorted `frames` (whose storage must outlive the result —
+// the buckets hold pointers into it). Name-first resolution per §A2a, line-enclosure fallback, dedup by
+// resolved symbol so a recursive/looping trace ranks each symbol once and COUNTS the folds.
+inline TracePartition partitionTraceFrames( const IngestResult& ing, const std::vector<tracein::ParsedFrame>& frames )
+{
+    TracePartition    part;
+    std::vector<char> seenSym( ing.symbols.size(), 0 );
+    part.parsedCount = frames.size();
+
+    for( const tracein::ParsedFrame& fr : frames )
+    {
+        if( fr.lineOverflowed ) { part.skipped.push_back( &fr ); continue; }
+        const std::uint32_t fileId = traceMatchFile( ing, fr.path );
+        if( fileId == kNoTraceFile ) { part.skipped.push_back( &fr ); continue; }
+        ++part.inCorpusCount;
+
+        // name first (the stable half of a frame), line-enclosure second (the half a stale binary invalidates)
+        const TraceNameBinding bind    = traceResolveByName( ing, fr.func, fileId );
+        const NodeId           byName  = bind.symbolId;
+        const NodeId           byLine  = traceEnclosingSymbol( ing, fileId, fr.line );
+        const NodeId           chosen  = byName != kNoNode ? byName : byLine;
+        const std::size_t      cutRungs = bind.isLadderCut ? bind.ladderTotal : 0;
+        if( chosen == kNoNode )
+        {
+            part.unresolved.push_back( &fr );
+            part.unresolvedLadderTotal.push_back( cutRungs );
+            continue;
+        }
+        if( seenSym[ chosen ] ) { ++part.mergedCount; continue; }
+        seenSym[ chosen ] = 1;
+
+        TraceSuspect sus;
+        sus.frame            = &fr;
+        sus.symbolId         = chosen;
+        sus.isResolvedByName = byName != kNoNode;
+        sus.nameLadderTotal  = cutRungs;
+        if( byName != kNoNode && byLine != kNoNode && byLine != byName )
+        {
+            sus.lineEnclosesId = byLine;
+        }
+        part.suspects.push_back( sus );
+    }
+
+    ASSUME( part.inCorpusCount == part.suspects.size() + part.mergedCount + part.unresolved.size() );
+    ASSUME( part.unresolved.size() == part.unresolvedLadderTotal.size() );
+    return part;
+}
+
+// the ladder-truncation marker for ONE row: empty unless kNameCandidateCap both fired and was exhausted on
+// that frame, which is the pr_converged shape — absence means "the ladder had rungs to spare or bound", and
+// presence means "it ran out AND here is how long it really was". An uncut trace is byte-identical.
+inline std::string nameLadderAttr( std::size_t ladderTotal )
+{
+    return countFieldIfAbove( std::uint32_t( ladderTotal ), 0,
+        " name_ladder_capped=\"1\" name_ladder_total=\"", "\"" );   // serialize.h's ONE economy-of-attributes idiom
+}
+
+// did ANY row in this partition carry the marker — the seam that keeps the legend clause off every other trace
+inline bool hasNameLadderCut( const TracePartition& part ) noexcept
+{
+    for( const TraceSuspect& sus : part.suspects )
+    {
+        if( sus.nameLadderTotal > 0 ) { return true; }
+    }
+    for( const std::size_t total : part.unresolvedLadderTotal )
+    {
+        if( total > 0 ) { return true; }
+    }
+    return false;
+}
+
+// the ladder clause, appended to the bundle header ONLY when a ladder actually ran out (hopLegendOf's seam).
+// It exists because resolved_by="line" has FOUR causes and the legend named three: absent, unknown, ambiguous
+// — and now "the name ladder was cut before the bare name was reached", which is the only one of the four the
+// reader can do something about (re-run with the frame's short spelling).
+inline constexpr std::string_view kNameLadderLegend =
+    "NAME LADDER: a frame binds by probing its name in progressively-less-qualified spellings (the bare name "
+    "LAST), bounded at 8 rungs - so a deep package/namespace path can exhaust the bound before its own "
+    "function name is ever probed. name_ladder_capped=\"1\" marks the rows where that happened and "
+    "name_ladder_total= is how many spellings the name produced; absent everywhere else, so an unmarked "
+    "resolved_by=\"line\" really did have an absent, unknown or ambiguous name. Re-running a marked frame "
+    "under its short spelling binds it by name. ";
+
+inline std::string_view ladderLegendOf( const TracePartition& part ) noexcept
+{
+    return hasNameLadderCut( part ) ? kNameLadderLegend : std::string_view{};
+}
+
+// ── LB-A: the TEST-TO-SOURCE hop ─────────────────────────────────────────────────────────────────────────
+// A failing-test trace names TEST frames, and often ONLY test frames: the innermost in-corpus frame is
+// `test_listen` in `tests/test_listeners.py`, while the code the reader has to open is `listen` in
+// `src/listeners.py`. This lens did exactly what it promised — the innermost in-corpus frame, ranked first —
+// and the subject never entered the bundle at all. The hop below adds it, in two tiers of decreasing
+// evidence, and says which tier each row came from:
+//
+//   via="callee"   a REAL 1-hop call edge out of the test symbol into non-test code. Evidence, not a guess.
+//   via="basename" the test file's naming-convention source pair, used ONLY where no call edge landed in
+//                  that file. A test runner's linkage to its subject is invisible to a static call graph
+//                  (a fixture app, a `#[test]` integration crate, a vitest playground spec), so this tier
+//                  is the honest fallback for exactly that case — and it is a guess, labelled as one.
+//
+// What the hop does NOT do: it never rewrites the <trace> frame partition (the frame map stays the factual
+// record of what the trace said), and it never displaces the innermost frame — that symbol keeps rank 1 and
+// keeps its full body. What it DOES move is the SERVED order, and the legend states the move rather than
+// performing it quietly: hop rows rank in <sigs> directly after the innermost frame and before the
+// remaining frames, and the first hop row's body is served beside the innermost frame's.
+
+namespace tracelocus_detail
+{
+
+// row caps — bounds, never silent: TestHop::cappedCount records what they dropped and the block emits it
+// beside the two PRE-cap candidate counts, so callee + basename = rows + capped closes for a reader.
+inline constexpr std::size_t kTestHopCalleeRowCap   = 5;
+inline constexpr std::size_t kTestHopBasenameRowCap = 3;
+
+// the path's last component. mention.h's copy is the one this file already links against for the
+// longest-suffix file match, so the pairing below asks IT rather than growing a second scanner — the same
+// reuse-by-using-declaration the stripTrailingGroup seam above records.
+using rw::mention_detail::baseNameOf;
+
+// how many leading DIRECTORY components two paths share. `src/net/listeners.py` and `tests/net/x.py` share
+// none; `pkg/net/listeners.go` and `pkg/net/listeners_test.go` share two. The tie-break that keeps a
+// monorepo's fourteen `util.py` files from pairing with the wrong one.
+inline std::size_t sharedDirPrefixCount( std::string_view a, std::string_view b ) noexcept
+{
+    std::size_t count = 0;
+    std::size_t ia    = 0;
+    std::size_t ib    = 0;
+    while( true )
+    {
+        const std::size_t ea = a.find( '/', ia );
+        const std::size_t eb = b.find( '/', ib );
+        if( ea == std::string_view::npos || eb == std::string_view::npos )
+        {
+            break;                                          // one side has no further directory component
+        }
+        if( a.compare( ia, ea - ia, b, ib, eb - ib ) != 0 )
+        {
+            break;
+        }
+        ++count;
+        ia = ea + 1;
+        ib = eb + 1;
+    }
+    return count;
+}
+
+// the source FILENAMES a test file's own filename pairs with, most specific first. The four mainstream
+// marker conventions, then the bare same-name case that covers the DIRECTORY convention (`tests/foo.rs`
+// beside `src/foo.rs`, `spec/foo.rb` beside `lib/foo.rb`) where the filename carries no marker at all.
+// The extension is preserved throughout: a pair across languages is not a pair.
+inline std::vector<std::string> testPairFileNames( std::string_view testPath )
+{
+    const std::string_view fileName = baseNameOf( testPath );
+    const std::size_t      dot      = fileName.rfind( '.' );
+    if( dot == std::string_view::npos || dot == 0 )
+    {
+        return {};
+    }
+    const std::string_view stem = fileName.substr( 0, dot );
+    const std::string_view ext  = fileName.substr( dot );
+
+    std::vector<std::string> names;
+    const auto add = [ & ]( std::string_view base )
+    {
+        if( base.empty() )
+        {
+            return;
+        }
+        std::string candidate = std::string( base ) + std::string( ext );
+        for( const std::string& have : names )
+        {
+            if( have == candidate )
+            {
+                return;
+            }
+        }
+        names.emplace_back( std::move( candidate ) );
+    };
+    const auto endsWith = []( std::string_view s, std::string_view suffix ) noexcept
+    {
+        return s.size() > suffix.size() && s.compare( s.size() - suffix.size(), suffix.size(), suffix ) == 0;
+    };
+
+    // suffix markers: foo_test.go, foo.test.ts, foo_spec.rb, foo.spec.ts, FooTest.java, FooTests.cs
+    for( std::string_view marker : { std::string_view( "_test" ),  std::string_view( ".test" ), std::string_view( "_tests" ),
+                                     std::string_view( "_spec" ),  std::string_view( ".spec" ), std::string_view( "Tests" ),
+                                     std::string_view( "Test" ),   std::string_view( "Spec" ) } )
+    {
+        if( endsWith( stem, marker ) )
+        {
+            add( stem.substr( 0, stem.size() - marker.size() ) );
+        }
+    }
+    // prefix markers: test_foo.py, TestFoo.cs
+    for( std::string_view marker : { std::string_view( "test_" ), std::string_view( "Test" ) } )
+    {
+        if( stem.size() > marker.size() && stem.compare( 0, marker.size(), marker ) == 0 )
+        {
+            add( stem.substr( marker.size() ) );
+        }
+    }
+    // the directory convention — same filename, a source directory instead of a test one
+    add( stem );
+    return names;
+}
+
+// the indexed NON-test file `testFileId` pairs with by naming convention, or kNoTraceFile. Candidate
+// filename order is the primary key (most specific marker first); within one candidate the file sharing the
+// longest leading directory prefix wins, and the smallest fileId breaks what is left.
+inline std::uint32_t testPairFile( const IngestResult& ing, std::uint32_t testFileId )
+{
+    if( testFileId >= ing.files.size() )
+    {
+        return kNoTraceFile;
+    }
+    const std::string& testPath = ing.files[ testFileId ];
+
+    for( const std::string& candidate : testPairFileNames( testPath ) )
+    {
+        std::uint32_t best      = kNoTraceFile;
+        std::size_t   bestDepth = 0;
+        for( std::uint32_t f = 0; f < std::uint32_t( ing.files.size() ); ++f )
+        {
+            if( f == testFileId || rw::isTestPath( rw::rootRelPath( ing, f ) ) || baseNameOf( ing.files[f] ) != candidate )
+            {
+                continue;
+            }
+            const std::size_t depth = sharedDirPrefixCount( ing.files[f], testPath );
+            if( best == kNoTraceFile || depth > bestDepth )
+            {
+                best      = f;
+                bestDepth = depth;
+            }
+        }
+        if( best != kNoTraceFile )
+        {
+            return best;
+        }
+    }
+    return kNoTraceFile;
+}
+
+} // namespace tracelocus_detail
+
+// which tier produced one hop row — the attribute the reader calibrates trust with
+enum class TestHopVia : std::uint8_t { Callee = 0, Basename = 1 };
+
+struct TestHopRow
+{
+    NodeId     symbolId = kNoNode;
+    TestHopVia via      = TestHopVia::Callee;
+};
+
+// the whole hop: whether it fired, what it hopped FROM, the paired file it found (if any), the rows it
+// serves, and the two PRE-cap candidate counts whose arithmetic closes against rows + capped.
+struct TestHop
+{
+    bool                    isFired                = false;
+    NodeId                  fromSymbolId           = kNoNode;         // the innermost in-corpus frame (a test symbol)
+    std::uint32_t           pairFileId             = kNoTraceFile;    // its basename-paired source file, or none
+    std::vector<TestHopRow> rows;
+    std::size_t             calleeCandidateCount   = 0;
+    std::size_t             basenameCandidateCount = 0;
+    std::size_t             cappedCount            = 0;
+};
+
+namespace tracelocus_detail
+{
+
+// tier 1 candidates — the non-test symbols a REAL call edge reaches from the test, paired file first, then
+// path/line/id. `taken` carries the symbols already spoken for (the ranked frames) in and the claimed
+// callees out, so tier 2 can never re-serve one. The return is the PRE-cap candidate list.
+inline std::vector<NodeId> testHopCalleeCandidates( const IngestResult& ing, const Graph& g, NodeId from,
+                                                    std::uint32_t pairFileId, std::vector<char>& taken )
+{
+    std::vector<NodeId> callees;
+    for( std::uint32_t e = g.outOff[ from ]; e < g.outOff[ from + 1 ]; ++e )
+    {
+        const NodeId target = g.outTargets[e];
+        if( target >= ing.symbols.size() || taken[ target ] || isTestSymbol( ing, target ) )
+        {
+            continue;
+        }
+        taken[ target ] = 1;
+        callees.push_back( target );
+    }
+    std::stable_sort( callees.begin(), callees.end(), [ & ]( NodeId a, NodeId b )
+    {
+        const Symbol& sa = ing.symbols[a];
+        const Symbol& sb = ing.symbols[b];
+        if( ( sa.fileId == pairFileId ) != ( sb.fileId == pairFileId ) ) { return sa.fileId == pairFileId; }
+        if( sa.fileId != sb.fileId )                                    { return ing.files[ sa.fileId ] < ing.files[ sb.fileId ]; }
+        if( sa.line   != sb.line )                                      { return sa.line < sb.line; }
+        return a < b;
+    } );
+    return callees;
+}
+
+// tier 2 candidates — the paired source file's own non-test defs in source order. Only reached when no call
+// edge landed in that file, which is precisely the runner-mediated case a static call graph cannot see.
+inline std::vector<NodeId> testHopPairedCandidates( const IngestResult& ing, std::uint32_t pairFileId, std::vector<char>& taken )
+{
+    std::vector<NodeId> paired;
+    for( std::size_t i = 0; i < ing.symbols.size(); ++i )
+    {
+        if( ing.symbols[i].fileId != pairFileId || taken[i] || isTestSymbol( ing, i ) )
+        {
+            continue;
+        }
+        taken[i] = 1;
+        paired.push_back( NodeId( i ) );
+    }
+    std::stable_sort( paired.begin(), paired.end(), [ & ]( NodeId a, NodeId b )
+    {
+        if( ing.symbols[a].line != ing.symbols[b].line ) { return ing.symbols[a].line < ing.symbols[b].line; }
+        return a < b;
+    } );
+    return paired;
+}
+
+} // namespace tracelocus_detail
+
+// build the hop for an already-partitioned trace. Fires only when the innermost in-corpus frame's symbol
+// classifies as a test through filter.h's SHARED predicate (isTestSymbol — the same one the tested= lens and
+// --ignore-tests ask; a second classifier here is exactly the copy that would drift).
+inline TestHop buildTestHop( const IngestResult& ing, const Graph& g, const TracePartition& part )
+{
+    TestHop hop;
+    if( part.suspects.empty() || !isTestSymbol( ing, part.suspects[0].symbolId ) )
+    {
+        return hop;                     // no frames, or the innermost is already source — the hop adds nothing
+    }
+    const NodeId from = part.suspects[0].symbolId;
+    if( std::size_t( from ) + 1 >= g.outOff.size() )
+    {
+        DISCLOSE( "test-hop: the innermost frame's symbol has no out-edge CSR row — hop skipped" );
+        return hop;
+    }
+
+    hop.fromSymbolId = from;
+    hop.pairFileId   = tracelocus_detail::testPairFile( ing, ing.symbols[ from ].fileId );
+
+    // every frame the bundle already ranks is spoken for: a hop row must be a symbol it does NOT carry yet
+    std::vector<char> taken( ing.symbols.size(), 0 );
+    for( const TraceSuspect& sus : part.suspects )
+    {
+        taken[ sus.symbolId ] = 1;
+    }
+
+    // tier 1 — real call edges. Paired-file callees sort first, so the isPairCovered test below reads the
+    // whole candidate list and can never be fooled by the row cap dropping the one that mattered.
+    const std::vector<NodeId> callees = tracelocus_detail::testHopCalleeCandidates( ing, g, from, hop.pairFileId, taken );
+    hop.calleeCandidateCount          = callees.size();
+    bool isPairCovered                = false;
+    for( std::size_t i = 0; i < callees.size(); ++i )
+    {
+        isPairCovered = isPairCovered || ing.symbols[ callees[i] ].fileId == hop.pairFileId;
+        if( i < tracelocus_detail::kTestHopCalleeRowCap )
+        {
+            hop.rows.push_back( { callees[i], TestHopVia::Callee } );
+        }
+    }
+
+    // tier 2 — the naming-convention pair, ONLY where no call edge landed in that file
+    if( hop.pairFileId != kNoTraceFile && !isPairCovered )
+    {
+        const std::vector<NodeId> paired = tracelocus_detail::testHopPairedCandidates( ing, hop.pairFileId, taken );
+        hop.basenameCandidateCount       = paired.size();
+        for( std::size_t i = 0; i < paired.size() && i < tracelocus_detail::kTestHopBasenameRowCap; ++i )
+        {
+            hop.rows.push_back( { paired[i], TestHopVia::Basename } );
+        }
+    }
+
+    ASSUME( hop.rows.size() <= hop.calleeCandidateCount + hop.basenameCandidateCount );
+    hop.cappedCount = hop.calleeCandidateCount + hop.basenameCandidateCount - hop.rows.size();
+    hop.isFired     = !hop.rows.empty();
+    return hop;
+}
+
+// the SERVED order <sigs> ranks by: the innermost frame keeps rank 1, the hop's source rows follow it, and
+// the remaining frames follow them. With no hop this is the suspect order verbatim, which is what makes a
+// non-test trace's bundle byte-identical to the pre-hop one.
+inline std::vector<NodeId> traceServedOrder( const TracePartition& part, const TestHop& hop )
+{
+    std::vector<NodeId> served;
+    served.reserve( part.suspects.size() + hop.rows.size() );
+    if( !part.suspects.empty() )
+    {
+        served.push_back( part.suspects[0].symbolId );
+    }
+    for( const TestHopRow& row : hop.rows )
+    {
+        served.push_back( row.symbolId );
+    }
+    for( std::size_t i = 1; i < part.suspects.size(); ++i )
+    {
+        served.push_back( part.suspects[i].symbolId );
+    }
+    return served;
+}
+
+// the rank vector packSignatures orders <sigs> by: a strictly descending score down the served order, so
+// the ordering is total and the sort has nothing to break ties on by accident.
+inline std::vector<float> traceRankOf( std::size_t symbolCount, const std::vector<NodeId>& servedOrder )
+{
+    std::vector<float> rank( symbolCount, 0.0f );
+    for( std::size_t i = 0; i < servedOrder.size(); ++i )
+    {
+        rank[ servedOrder[i] ] = float( servedOrder.size() - i );
+    }
+    return rank;
+}
+
+// the bodies this bundle serves in full: the innermost frame (the standing contract, always first) and,
+// when the hop fired, the top hop row beside it — the assertion without its subject was the missing half.
+inline std::vector<NodeId> traceBodyIds( const TracePartition& part, const TestHop& hop )
+{
+    std::vector<NodeId> bodyIds;
+    if( !part.suspects.empty() )
+    {
+        bodyIds.push_back( part.suspects[0].symbolId );
+    }
+    if( hop.isFired )
+    {
+        bodyIds.push_back( hop.rows[0].symbolId );
+    }
+    return bodyIds;
+}
+
+// the hop's legend paragraph, appended to the bundle header ONLY when the hop fired. It states the
+// served-order change rather than performing it quietly, and it names which tier is evidence and which is
+// a guess — the calibration a reader needs before trusting a via="basename" row.
+inline constexpr std::string_view kTestHopLegend =
+    "TEST-TO-SOURCE HOP: the innermost in-corpus frame is a TEST symbol, so the <test_hop> block below "
+    "carries the source symbols reached from it. via=\"callee\" is a REAL 1-hop call edge out of the test "
+    "into non-test code; via=\"basename\" is the test file's naming-convention source pair "
+    "(foo_test.go/foo.go, test_foo.py/foo.py, foo.spec.ts/foo.ts, FooTest.java/Foo.java, "
+    "tests/foo.rs/src/foo.rs), used ONLY where no call edge landed in that file. That second tier is a "
+    "HEURISTIC and the block says so (heuristic=\"1\"): a test runner's linkage to its subject is "
+    "invisible to a static call graph, so a pair can be wrong. The <trace> frame map is UNCHANGED and the "
+    "innermost frame keeps rank 1; what the hop moves is the SERVED order - these rows rank in <sigs> "
+    "directly after the innermost frame and before the remaining frames, and the first hop row's body is "
+    "served beside the innermost frame's. callee= and basename= are PRE-cap candidate counts and capped= "
+    "is what the row caps dropped, so callee + basename = rows + capped. ";
+
+// empty unless the hop fired — the seam that keeps every non-test trace's header byte-identical
+inline std::string_view hopLegendOf( const TestHop& hop ) noexcept { return hop.isFired ? kTestHopLegend : std::string_view{}; }
+
+// render the <test_hop> block — <trace>'s sibling, never a rewrite of it. Empty string when the hop did not
+// fire, which is what keeps every non-test trace byte-identical to the pre-hop bundle. Built through
+// open_memstream for renderTraceBlock's reason: no attribute may be truncated mid-value (F6). nullopt when the
+// buffer failed (at the open, or a write lost inside it): the block the bundle needed does not exist, and the
+// caller withholds the bundle rather than serve it without the block (fromTraceBundleText).
+inline std::optional<std::string> renderTestHopBlock( const IngestResult& ing, const TestHop& hop, std::string_view rootArg )
+{
+    if( !hop.isFired )
+    {
+        return std::string();
+    }
+
+    std::vector<char> esc;
+    const auto        ex          = [ & ]( std::string_view s ) -> std::string { return std::string( escapeXml( s, esc ) ); };
+    const std::string rootPrefix  = rootArg.empty() ? std::string() : rw::sarif::rootPrefixOf( rootArg );
+    const auto        pathRel     = [ & ]( std::uint32_t fileId ) -> std::string_view
+    {
+        return rootArg.empty() ? std::string_view( ing.files[ fileId ] ) : rw::sarif::rootRelativeUri( ing.files[ fileId ], rootPrefix );
+    };
+
+    rw::MemoryStream stream;
+    std::FILE* const m = stream.open();
+    if( !m )
+    {
+        return std::nullopt;
+    }
+
+    const Symbol&     fromSym  = ing.symbols[ hop.fromSymbolId ];
+    const std::string pairPath = hop.pairFileId == kNoTraceFile ? std::string() : ex( pathRel( hop.pairFileId ) );
+    rw::emitTo( m, "<test_hop heuristic=\"1\" from=\"{}\" from_p=\"{}:{}\" pair=\"{}\" callee=\"{}\" basename=\"{}\" rows=\"{}\" capped=\"{}\">",
+        ex( fromSym.name ).c_str(), ex( pathRel( fromSym.fileId ) ).c_str(), fromSym.line, pairPath.c_str(),
+        hop.calleeCandidateCount, hop.basenameCandidateCount, hop.rows.size(), hop.cappedCount );
+    for( std::size_t i = 0; i < hop.rows.size(); ++i )
+    {
+        const Symbol& s = ing.symbols[ hop.rows[i].symbolId ];
+        rw::emitTo( m, "<hop rank=\"{}\" n=\"{}\" t=\"{}\" p=\"{}:{}\" via=\"{}\"/>",
+            i + 1, ex( s.name ).c_str(), symTag( s.kind ), ex( pathRel( s.fileId ) ).c_str(), s.line,
+            hop.rows[i].via == TestHopVia::Callee ? "callee" : "basename" );
+    }
+    rw::emitRaw( m, "</test_hop>" );
+    const rw::MemoryStreamBytes block = stream.finish();
+    if( !block.isWhole )
+    {
+        // a lost write left a hole in the block: never serve it, and never serve the bundle without it (the caller discloses)
+        return std::nullopt;
+    }
+    return std::string( block.bytes );
+}
+
+// render the <trace> block (the ranked suspect map + the two listed-but-unranked buckets) to a string, so
+// the caller can subtract its exact byte cost from the sigs budget. Built through open_memstream so no
+// attribute is ever truncated regardless of path length (F6: a fixed-size row buffer truncated long
+// sanitizer paths mid-attribute, dropping the closing `"/>` and breaking G4).
+inline std::optional<std::string> renderTraceBlock( const IngestResult& ing, tracein::FrameFormat dominant, std::string_view srcNote,
+                                     const TracePartition& part )
+{
+    std::vector<char> esc;
+    const auto ex = [ & ]( std::string_view s ) -> std::string { return std::string( escapeXml( s, esc ) ); };
+
+    rw::MemoryStream stream;
+    std::FILE* const m = stream.open();
+    if( !m )
+    {
+        return std::nullopt;
+    }
+    rw::emitTo( m, "<trace src=\"{}\" format=\"{}\" frame_lines=\"{}\" parsed=\"{}\" in_corpus=\"{}\" skipped=\"{}\" merged=\"{}\" unresolved=\"{}\" suspects=\"{}\">",
+        ex( srcNote ).c_str(), tracein::formatSpec( dominant ).label, part.frameLinesSeen, part.parsedCount, part.inCorpusCount,
+        part.skipped.size(), part.mergedCount, part.unresolved.size(), part.suspects.size() );
+    for( std::size_t i = 0; i < part.suspects.size(); ++i )
+    {
+        const TraceSuspect& sus = part.suspects[i];
+        const Symbol&       s   = ing.symbols[ sus.symbolId ];
+
+        // the name/line disagreement, disclosed inline: today's line sits in a DIFFERENT def than the frame names
+        std::string encloses;
+        if( sus.lineEnclosesId != kNoNode )
+        {
+            encloses = " line_encloses=\"" + ex( ing.symbols[ sus.lineEnclosesId ].name ) + "\"";
+        }
+
+        rw::emitTo( m, "<frame rank=\"{}\" n=\"{}\" t=\"{}\" p=\"{}:{}\" resolved_by=\"{}\"{}{}{}/>",
+            i + 1, ex( s.name ).c_str(), symTag( s.kind ), ex( sus.frame->path ).c_str(), sus.frame->line,
+            sus.isResolvedByName ? "name" : "line", encloses.c_str(), nameLadderAttr( sus.nameLadderTotal ).c_str(),
+            i == 0 ? " innermost=\"1\"" : "" );
+    }
+    for( std::size_t i = 0; i < part.unresolved.size(); ++i )
+    {
+        const tracein::ParsedFrame* ur = part.unresolved[i];
+        std::string named;
+        if( !ur->func.empty() )
+        {
+            named = " n=\"" + ex( ur->func ) + "\"";
+        }
+        rw::emitTo( m, "<unresolved p=\"{}:{}\"{}{}/>", ex( ur->path ).c_str(), ur->line, named.c_str(),
+            nameLadderAttr( part.unresolvedLadderTotal[i] ).c_str() );
+    }
+    for( const tracein::ParsedFrame* sk : part.skipped )
+    {
+        rw::emitTo( m, "<skipped p=\"{}\" line=\"{}\"/>", ex( sk->path ).c_str(), sk->line );
+    }
+    rw::emitRaw( m, "</trace>" );
+    const rw::MemoryStreamBytes block = stream.finish();
+    if( !block.isWhole )
+    {
+        return std::nullopt;
+    }
+    return std::string( block.bytes );
+}
+
+// optional Q3/redaction/notes inputs, same graceful-degrade contract as packtask.h's PackTaskInputs — every
+// field defaults to "not available" (attribute simply omitted downstream).
+// R1: the fixed width a MEASURED prelude value is priced at (FromTraceInputs::preludeMeasuredDigits). Six digits
+// covers every duration under 1000 s — a --run-trace that takes longer prices one token wider per extra digit, and
+// the 600 s default timeout makes that reachable only by an explicit --run-timeout.
+inline constexpr std::size_t kMeasuredDigitsPricedWidth = 6;
+
+struct FromTraceInputs
+{
+    std::size_t                        bundleBudgetBytes    = kForPayloadBudgetBytes;   // overall <ctx> budget; caller resolves --token-budget/budget
+    std::size_t                        budgetTokens         = 0;                        // M11: the --token-budget as passed (0 = none) — budget_tokens= on the root_tokens into bytes
+    std::size_t                        sigLadderBudgetBytes = 0;                        // packSignatures per-doc ladder (0 = unlimited)
+    std::size_t                        bodyBudgetBytes      = 0;                        // packBodies budget for the rank-1 full body (0 = unlimited)
+    std::size_t                        maxTokens            = 0;                        // H9: the --max-tokens ceiling as PASSED (0 = none) — max_tokens= on the root.
+    bool                               compactLegend        = false;                    // L1 fix round (rv-r1-L1 MED-4): the run's legend posture is
+                                                                                        // compact — the section floor and the ceiling ladder are
+                                                                                        // priced at the bytes the compact layer DELIVERS
+                                                                                         // bodyBudgetBytes is derived from it and also carries the packBudget default,
+                                                                                         // so it cannot answer "what ceiling did the caller ask for"
+    bool                                compress             = false;
+    const std::vector<std::uint32_t>*  fanIn  = nullptr;
+    const std::vector<char>*           impure = nullptr;
+    const std::vector<std::uint8_t>*   tested = nullptr;
+    const std::vector<std::uint32_t>*  amp    = nullptr;
+    // §B10.1 — R14's UNNAMED TWIN, named here. R14 records `PackTaskInputs::redact = nullptr` as the residual
+    // W3-N1's "REQUIRED redact, no default" discipline could not reach; this field is the identical shape in
+    // the identical position and was never listed beside it. Both keep the default DELIBERATELY: an aggregate
+    // whose whole contract is "every field defaults to not-available, each degrades gracefully" cannot make
+    // ONE field required — dropping the initialiser on a POD member does not force a caller to spell it, it
+    // makes `FromTraceInputs in;` leave it INDETERMINATE, which is strictly worse than nullptr. The
+    // CalleeCallsSink shape (no defaults on ANY member, so the aggregate must be spelled in full) is the
+    // pattern that does work, and converting these two to it is a separate change with a real call-site cost.
+    // Until then the net is held by test/fixedbufsweep.sh's population sweep, not by the compiler.
+    RedactCounts*                      redact = nullptr;
+    const notes::NoteIndex*            notes  = nullptr;
+    // L3 follow-up (CodeRabbit 4053600616): read BEFORE the caller nulls `notes` for emptiness, so a sidecar
+    // that left EVERY line unparsed still reaches this bundle's root (mcpverbs.h fromTraceText sets it from
+    // NoteIndex::degraded before its own notesPtr is nulled).
+    bool                                notesDegraded = false;
+    // VT-1 (--run-trace): pre-rendered XML the caller wants INSIDE the bundle, immediately after the header
+    // comment and before <trace> — the exec verb's <run> record + <lines> view ride here so the run report
+    // and the mapping stay ONE document under ONE budget ledger (the prelude's bytes are charged against the
+    // sigs budget exactly like the header's). Empty (the default, every existing caller) ⇒ byte-identical
+    // output — the G5 inertness contract.
+    std::string_view                   preludeXml;
+    // R1 (capture-audit verify-wave1 2026-09-04): how many digits of preludeXml are a MEASURED value — --run-trace's
+    // duration_ms=. est_tokens= and the ceiling ladder price those digits at kMeasuredDigitsPricedWidth instead of
+    // their live width, so the PRICE is a deterministic function of the fixed output while the VALUE stays the
+    // honest measurement (a 9 → 10 ms run moved est_tokens by one and made runtracecheck's determinism arm ~30%
+    // red). 0 (every other caller) ⇒ the document prices as-is, byte-identical.
+    std::size_t                        preludeMeasuredDigits = 0;
+    // R-R (2026-08-24): the run's root argument, so this bundle's <sigs><f p=…> rows are root-relative like
+    // every other lens's. Empty ⇒ multi-root (or a caller that has no single root), where ing.files already
+    // carry the labeled identity — the same degrade every pathRel applies.
+    std::string_view                   rootArg;
+};
+
+struct FromTraceResult
+{
+    bool        ok         = false;   // false = zero parseable frames, or isBufferLost — caller refuses loudly, xml is empty
+    // true when a block's memory buffer failed (at the open, or a write lost inside it — rw::MemoryStream::finish). The
+    // <trace> map, the test hop and the signature/body section are the answer, and this bundle cannot render them
+    // another way, so it is WITHHELD rather than served without them: the caller says so on stderr / as an MCP error.
+    // It used to omit the block and serve the rest, a bundle missing its trace map that no Release build disclosed.
+    bool        isBufferLost = false;
+    // The DISCLOSE sink for those buffer failures: disclose() sets isBufferLost, which the CLI refuses on (stderr, exit 1)
+    // and MCP answers as an error — the withholding IS the disclosure, in every build flavour.
+    enum class DisclosureWhy : std::uint8_t
+    {
+        BlockBufferLost,     // the <trace> map or the <test_hop> block
+        SectionBufferLost,   // the signature/body section
+    };
+    void disclose( DisclosureWhy ) noexcept   // every reason records the same fact
+    {
+        isBufferLost = true;
+    }
+    std::size_t frameCount = 0;
+    std::size_t inCorpus   = 0;
+    std::string xml;                  // the <ctx>…</ctx> bundle; only meaningful when ok
+};
+
+// ── THE DELIVERED PRICE (L1 fix round, rv-r1-L1 MED-4) ─────────────────────────────────────────────────────────────────
+// Under the compact posture the header's prose is never delivered, so --from-trace cut its signature section to make room
+// for bytes nobody receives, and climbed its ceiling ladder on a header the reader never gets. These price what the
+// compact layer will print instead. --legend=full never calls them.
+
+// The size the compact layer delivers for one assembled candidate (its own size when the layer would not rewrite it).
+[[nodiscard]] inline std::size_t traceDeliveredBytes( std::string_view candidate )
+{
+    const std::size_t delivered = rw::compactDeliveredBytes( candidate, "from-trace" );
+    return delivered > 0 ? delivered : candidate.size();
+}
+
+// The signature/body section, sized against the fixed part the reader actually receives. The first render prices the
+// DELIVERED fixed part — the compacted document minus the section, whose rows the layer never touches, so the row
+// readings that section brings are counted — and, when that is smaller, renders again with the room it frees. A larger
+// sig budget only ever adds rows, so rows(default) ⊇ rows(full) (compactlegendcheck (P1)). nullopt = a lost buffer.
+template<typename RenderFn>
+inline std::optional<std::string> renderTraceSectionAtPrice( const RenderFn& renderSection, const std::string& fixedHead,
+                                                             std::size_t fixedBytes, std::size_t bundleBudget, bool compactLegend )
+{
+    const auto sigsBudgetFor = [ bundleBudget ]( std::size_t fixed ) { return bundleBudget > fixed ? bundleBudget - fixed : std::size_t( 1 ); };
+    std::optional<std::string> section = renderSection( sigsBudgetFor( fixedBytes ) );
+    if( !compactLegend || !section || section->empty() )
+    {
+        return section;
+    }
+    const std::size_t delivered = traceDeliveredBytes( fixedHead + *section + "</ctx>" );
+    if( delivered <= section->size() || delivered - section->size() >= fixedBytes )
+    {
+        return section;
+    }
+    // the second render only ever gets MORE room than the first: the rows(default) ⊇ rows(full) claim rests on it
+    const std::size_t fixedDelivered = delivered - section->size();
+    ASSUME( fixedDelivered < fixedBytes, "the delivered fixed part is smaller, so the sig budget only grows" );
+    return renderSection( sigsBudgetFor( fixedDelivered ) );
+}
+
+// The ceiling ladder judged on the delivered document: every rung's candidate header, followed by the rest of the bundle,
+// priced by `deliveredOf` (which splices the widest root attributes and compacts), against one byte allowance.
+template<typename BuildFn, typename DeliveredFn>
+inline CeilingLadderChoice climbDeliveredLadder( BuildFn&& build, const std::string& header, const std::string& rest,
+                                                 DeliveredFn&& deliveredOf, std::size_t allowance, const CeilingLadderNotes& notes )
+{
+    const auto fits = [ & ]( std::string_view candidate ) { return deliveredOf( std::string( candidate ) + rest ) <= allowance; };
+    return climbCeilingLadderBy( build, header, fits, fits, /*hasRouteAttr=*/false, notes );
+}
+
+
+// extracts frames (tracein.h, table-driven), ranks the enclosing symbols INNERMOST-first over in-corpus
+// frames ONLY (out-of-corpus frames are listed + counted, never ranked — no silent caps), and returns a
+// --for-style bundle: the <trace> map, the suspects' signatures, and the innermost in-corpus symbol's FULL
+// body. `srcNote` is the trace's human-readable source label (a filename, "<stdin>", or an MCP caller's own
+// label) — "--" runs are collapsed here so it stays legal inside the emitted XML comment (G4).
+inline FromTraceResult fromTraceBundleText( const IngestResult& ing, const Graph& g, const std::string& text,
+                                            std::string_view srcNoteIn, const FromTraceInputs& inArg )
+{
+    FromTraceResult res;
+
+    // P2.4: --from-trace emitted in="0" on every row while --for reported the truth for the SAME symbol —
+    // it told the reader "nobody calls this" about the frame it had just ranked. packSignatures now omits
+    // in= when no vector is supplied, so silence was already honest; supplying the real thing is better, and
+    // it is free (one O(symbols) pass over the in-edge CSR that is already built).
+    std::vector<std::uint32_t> localFanIn;
+    FromTraceInputs            in = inArg;
+    if( !in.fanIn )
+    {
+        localFanIn = fanInFromInEdges( ing, g );
+        if( !localFanIn.empty() )
+        {
+            in.fanIn = &localFanIn;
+        }
+    }
+
+    tracein::FrameScan                scan   = tracein::extractFrames( text );
+    std::vector<tracein::ParsedFrame>& frames = scan.frames;
+    if( frames.empty() )
+    {
+        return res; // ok=false — nothing parseable
+    }
+
+    const tracein::FrameFormat dominant   = tracein::dominantFormat( frames );
+    const std::size_t          frameCount = frames.size();
+    std::stable_sort( frames.begin(), frames.end(), [ & ]( const tracein::ParsedFrame& a, const tracein::ParsedFrame& b )
+    {
+        return tracein::innermostKey( a, dominant, frameCount ) < tracein::innermostKey( b, dominant, frameCount );
+    } );
+
+    TracePartition part = partitionTraceFrames( ing, frames );
+    part.frameLinesSeen = scan.frameShapedLines;   // §B10: the outer denominator, from the only scope holding the raw text
+
+    // LB-A: the test-to-source hop — inert (and byte-identical) unless the innermost frame is a test symbol
+    const TestHop             hop         = buildTestHop( ing, g, part );
+    const std::vector<NodeId> servedOrder = traceServedOrder( part, hop );
+    const std::vector<float>  rank        = traceRankOf( ing.symbols.size(), servedOrder );
+
+    // W3FIX M3: srcNote is a FILENAME (or an MCP caller's own label), and a filename may legally contain a
+    // newline on this platform — `--from-trace=$'…/tr\nace.txt'` put a raw newline both in this comment and in
+    // <trace src=…>, two G4 breaches out of one byte. xmlCommentText is the shared comment scrub (dash collapse
+    // + control bytes + invalid UTF-8); the attribute half is escapeXml's character references (M2).
+    const std::string srcNote = xmlCommentText( srcNoteIn );
+
+    const std::size_t bundleBudget = in.bundleBudgetBytes > 0 ? in.bundleBudgetBytes : kForPayloadBudgetBytes;
+
+    // CA4 §B3 — the budget ledger + the ceiling ladder, the third member of the family cli.h enumerates BY
+    // NAME ("--for / --pack-task / --from-trace"). This lens STATED a budget and never labelled an overrun:
+    // when the header floor exceeds it, `sigsBudget` clamps to 1 and the whole bundle is emitted anyway —
+    // measured on base_w3 at --token-budget=50: 4 833 B against a 135 B allowance (35.8x) with zero
+    // over_ceiling, while --pack-task printed its ledger and --for and --recall both labelled themselves.
+    // Verbatim the W3FIX-H2 mechanism. THE HEADER IS NOW A BUILDER for exactly the reason the two siblings
+    // are: the ladder must be able to PRICE a shape before choosing it, and a header built once cannot be.
+    //
+    // Rungs, cheapest information loss first (climbCeilingLadder owns the order):
+    //   (a) as built;
+    //   (b) the comment's src echo dropped — a byte-for-byte DUPLICATE, since ctxRootOpen's task= attribute
+    //       above still carries the verbatim copy;
+    //   (c) skipped: this lens has no route= attribute (hasRouteAttr=false), so rung (c) is not available;
+    //   (d) over_ceiling — the complete bundle plus an honest label, never a mutilated bundle.
+    const auto buildTraceHeader = [ & ]( bool withSrcEcho, std::string_view extraNotes ) -> std::string
+    {
+        // §B1.7 root attrs: the trace SOURCE is this lens's request text — the same slot --for/--pack-task put
+        // the user's query in — so it is machine-readable and VERBATIM (escapeXml + M2 character references),
+        // beside the lossy readable echo in the comment. This lens emitted a bare `<ctx>` and had neither.
+        std::string h = ctxRootOpen( srcNoteIn, {} );
+        // L3 follow-up (CodeRabbit 4053600616): notes.h's ONE marker — absent on a clean read. Measured
+        // directly from `h`/`whole`'s own bytes downstream (no separate reserve to keep in sync), the same
+        // way this root's own est_tokens is priced (spliceRootAttrs on the FINISHED document, below).
+        if( in.notesDegraded && h.size() > 1 && h.back() == '>' )
+        {
+            h.insert( h.size() - 1, notes::kNotesDegradedAttr );
+        }
+        // P3 (L7, nextverb.h): the one follow-up — the def-use slice AT the innermost in-corpus frame's line
+        // (--slice=@FILE:LINE, FILE as the index spells it); absent when no frame landed in the corpus.
+        if( !part.suspects.empty() && h.size() > 1 && h.back() == '>' )
+        {
+            const TraceSuspect& top  = part.suspects[ 0 ];
+            const std::string_view file = ing.files[ ing.symbols[ top.symbolId ].fileId ];
+            const std::string   loc  = std::string( inArg.rootArg.empty() ? file : rw::sarif::rootRelativeUri( file, rw::sarif::rootPrefixOf( inArg.rootArg ) ) )
+                                     + ":" + std::to_string( top.frame->line );
+            h.insert( h.size() - 1, nextAttrXml( nextFlag( "--slice=@", loc ) ) );
+        }
+        h += "<!-- codecortex trace-to-locus for ";
+        if( withSrcEcho ) { h += "\"";  h += srcNote;  h += "\""; }
+        else
+        {
+            h += "[src_echo: dropped (ceiling) - the verbatim copy is the task= attribute above]";
+        }
+        h += ": frames of a ";
+        h += tracein::formatSpec( dominant ).label;
+        h += " trace mapped onto indexed symbols, ranked INNERMOST-first. ";
+        h += "frame_lines=";  h += std::to_string( part.frameLinesSeen );
+        h += " parsed=";      h += std::to_string( part.parsedCount );
+        h += " in_corpus=";   h += std::to_string( part.inCorpusCount );
+        h += " skipped=";     h += std::to_string( part.skipped.size() );
+        h += " (out of every root - listed, never ranked) merged=";
+        h += std::to_string( part.mergedCount );
+        h += " unresolved=";  h += std::to_string( part.unresolved.size() );
+        h += ". ";
+
+        // §A2b/§A2c legend: the closing arithmetic, HOW each frame bound, and which line convention p= carries
+        // §B10: the OUTER denominator, stated before the inner partition — parsed= was previously the largest
+        // number in the report, so a frame-shaped line no format shape could read (a dyld frame with no source
+        // location) simply lowered parsed= and left no trace of itself anywhere.
+        h += "frame_lines = frame-shaped lines the INPUT presented (a #N marker, a leading \"at \", or a Python File \"...\" "
+             "line, plus every line that did extract); parsed = how many of them yielded a usable path:line, so "
+             "frame_lines - parsed is the count that matched no format shape and enters no bucket below. ";
+        h += "in_corpus = suspects + merged + unresolved, so every file-matched frame is visible: merged= folded into an "
+             "already-claimed symbol, unresolved= listed as <unresolved> (indexed file, no def by name or by line). ";
+        h += "resolved_by=\"name\" means the frame's OWN function name bound to a unique def (line_encloses=, when present, "
+             "names the different symbol today's line sits in: the tell that the trace predates this checkout); "
+             "resolved_by=\"line\" means the name was absent, unknown or ambiguous, so the def enclosing that line was used. ";
+        h += ladderLegendOf( part );                  // empty unless a ladder ran out (byte-identical otherwise)
+        h += "p= on a frame is the FRAME's own locator (the trace's path:line, verbatim); definition sites live in <sigs> l=. ";
+        // §B7.5 (CA4): the <sigs> rows this verb emits carry the same ranking-row vocabulary --pack-task
+        // spells out, and this legend defined only the frame half — a reader met cx=/ccx=/in= on the
+        // signature rows with nothing to read them against, the identical gap on the identical rows.
+        h += "On a <sigs> row (rows in r= order): n=name, sc=enclosing scope (when scoped; the full id is p::sc::n), p=file, t=kind, cx=cyclomatic complexity, "
+             "ccx=cognitive complexity, in=reuse-count (absent = not measured, never a false 0). ";
+        h += "rank 1 = the innermost in-corpus frame; its FULL body follows, other suspects as signatures. ";
+        h += hopLegendOf( hop );                      // LB-A: empty unless the hop fired (byte-identical otherwise)
+        // §B3 the BUDGET LEDGER, the fact this bundle never stated. The two numbers are the working budget the
+        // caller resolved (--token-budget x kMinBytesPerToken x kBudgetHeadroom, or the default) and the bar
+        // this lens is JUDGED against — the same single-entry overshoot tolerance --for and --pack-task use,
+        // re-expressed against a post-headroom byte budget (serialize.h ceilingAllowanceFromBudgetBytes).
+        h += "budget=";  h += std::to_string( bundleBudget );
+        h += " bytes (allowance ";  h += std::to_string( ceilingAllowanceFromBudgetBytes( bundleBudget ) );
+        h += " bytes = ceiling + the single-entry overshoot a whole first signature costs). ";
+        // M11: the root's machine-readable price, defined beside the ledger prose.
+        // F5: "it" used to have three possible referents on this root. over_ceiling= names the ONE comparison
+        // it is: est_tokens against the smallest ceiling this root prints.
+        h += "On the root: est_tokens= prices the delivered bundle in tokens, budget_tokens= is the token target you passed (absent "
+             "when none), max_tokens= is the body ceiling you passed via the max_tokens flag (absent when none); over_ceiling= is 1 when "
+             "est_tokens exceeds the smallest ceiling named here (the bundle is then complete, not trimmed).";
+        h += extraNotes;
+        if( in.notesDegraded )
+        {
+            h += " ";  h += notes::kNotesDegradedReading;  h += ".";
+        }
+        // P3 (L7): next= defined where the reader meets it
+        h += " next= is the one pasteable follow-up: the slice at the innermost in-corpus frame (@FILE:LINE); absent when none landed.";
+        h += " -->";
+        return h;
+    };
+
+    std::string                      headerStr   = buildTraceHeader( /*withSrcEcho=*/true, {} );
+    const std::optional<std::string> traceBlock  = renderTraceBlock( ing, dominant, srcNote, part );
+    const std::optional<std::string> hopBlock    = renderTestHopBlock( ing, hop, in.rootArg );   // LB-A; empty unless the hop fired
+    if( !traceBlock || !hopBlock )
+    {
+        // withheld, not served without the block (see FromTraceResult)
+        DISCLOSE( res, FromTraceResult::DisclosureWhy::BlockBufferLost,
+                  "from-trace: the trace or test-hop block's buffer failed (at the open, or a lost write) — the bundle is withheld" );
+        return res;
+    }
+    const std::string& traceStr = *traceBlock;
+    const std::string& hopStr   = *hopBlock;
+
+    // VT-1: the caller's prelude (--run-trace's <run> + <lines>) is fixed bytes exactly like the header and
+    // the trace block — charged against the same ledger, so the sigs/bodies section shrinks to make room
+    // rather than the document silently outgrowing its budget.
+    const std::size_t fixedBytes   = headerStr.size() + in.preludeXml.size() + traceStr.size() + hopStr.size() + 6;   // + "</ctx>"
+
+    // The signature/body section at a given sig budget, or nullopt when its buffer failed (the bundle is then withheld).
+    const auto renderSection = [ & ]( std::size_t sigsBudget ) -> std::optional<std::string>
+    {
+        if( part.suspects.empty() )
+        {
+            return std::string();
+        }
+        rw::MemoryStream stream;
+        if( std::FILE* const m = stream.open() )
+        {
+            packSignatures( m, ing, rank, int( servedOrder.size() ), in.sigLadderBudgetBytes, /*metrics=*/true,
+                            in.fanIn, in.impure, in.redact,
+                            nullptr, nullptr, in.tested, in.amp,     // Q3: tested/amp folded on; churn/clone omitted (no git walk here)
+                            /*rankAdaptivePayload=*/true, sigsBudget,
+                            in.notes,                                // L3: field-notes surfacing (inert when null)
+                            in.rootArg );                            // R-R: root-relative <f p=…>
+
+            const std::vector<NodeId> bodyIds = traceBodyIds( part, hop );   // LB-A: innermost frame, then the top hop row
+            packBodies( m, ing, bodyIds, in.bodyBudgetBytes, g.outOff, g.outTargets, in.compress, in.redact,
+                        /*ranges=*/nullptr, in.notes,                 // L3: the rank-1 body surfaces notes too
+                        /*outEmitted=*/nullptr, /*truncateOversizedFirst=*/true, /*withFileContext=*/false,
+                        in.rootArg,                                   // R-R: root-relative <b p=…>
+                        &rank );                                      // the served body's CUT <calls> ordered by the TRACE's own rank
+                                                                       // (traceRankOf): a callee that is ITSELF a frame of this trace
+                                                                       // scores positive, so the edge the trace walked survives the cut.
+            if( const rw::MemoryStreamBytes section = stream.finish(); section.isWhole )
+            {
+                return std::string( section.bytes );
+            }
+            DISCLOSE( res, FromTraceResult::DisclosureWhy::SectionBufferLost, "from-trace: the signature/body buffer did not finish whole — the bundle is withheld" );
+            return std::nullopt;
+        }
+        DISCLOSE( res, FromTraceResult::DisclosureWhy::SectionBufferLost, "from-trace: open_memstream failed for the signature/body section — the bundle is withheld" );
+        return std::nullopt;
+    };
+    const std::string          fixedHead = headerStr + std::string( in.preludeXml ) + traceStr + hopStr;
+    std::optional<std::string> section   = renderTraceSectionAtPrice( renderSection, fixedHead, fixedBytes, bundleBudget, in.compactLegend );
+    if( !section )
+    {
+        return res;   // withheld: renderSection disclosed the lost buffer on res (see FromTraceResult)
+    }
+    std::string whole = fixedHead + *section + "</ctx>";
+
+    // §B3 — climb the ladder over the ASSEMBLED document. Priced after assembly (like both siblings) because
+    // the bar is the delivered bytes, not an estimate; the payload was rendered against the pre-ladder
+    // `fixedBytes`, so a shortened header only ever leaves the bundle further UNDER its allowance — never over.
+    {
+        // F5 (capture-audit verify-wave2 2026-09-05): the last rung's note may only spell the MARKER WORD on a
+        // document whose root can actually carry the attribute — i.e. one where the caller named a ceiling.
+        // The unnamed variant states the same trim fact against the working budget the ledger prose above
+        // already prints in bytes, so nothing is hidden; what is removed is a marker pointing at an attribute
+        // the root does not have.
+        static constexpr CeilingLadderNotes kNotesNamedCeiling{
+            " [src_echo: dropped (ceiling)]",
+            " [src_echo: dropped (ceiling)]",   // no route= attribute on this lens: hasRouteAttr=false ⇒ rung (c) is never taken
+            " [over_ceiling: the header floor (verbatim src echo + fixed legend) plus the innermost frame's whole"
+            " signature exceeds this budget - the bundle is complete and larger than the ceiling, not trimmed]" };
+        static constexpr CeilingLadderNotes kNotesDefaultCeiling{
+            " [src_echo: dropped (ceiling)]",
+            " [src_echo: dropped (ceiling)]",
+            " [ceiling: the header floor (verbatim src echo + fixed legend) plus the innermost frame's whole"
+            " signature exceeds the working budget above - the bundle is complete and larger than it, not trimmed]" };
+        const bool namedACeiling = in.budgetTokens > 0 || in.maxTokens > 0;
+        const CeilingLadderNotes& kNotes = namedACeiling ? kNotesNamedCeiling : kNotesDefaultCeiling;
+        // M11: the PRICED ROOT (the whole bundle at the map rate — the rank-1 body is a minority of the bytes,
+        // and the map rate over-prices body text, so the number errs conservative), budget_tokens= when a
+        // --token-budget was passed, over_ceiling="1" when the ladder's last rung fired. Priced INTO the
+        // ladder at their widest spelling (see packtask.h's rootAttrsFor for the reasoning).
+        // R1: the priced size of a document — the caller's measured digits swapped for their fixed width, so the
+        // ladder's decision and the root's price are both independent of how long the subprocess happened to run.
+        const auto pricedBytesOf = [ & ]( std::size_t docBytes ) -> std::size_t
+        {
+            if( in.preludeMeasuredDigits == 0 ) { return docBytes; }
+            return docBytes - std::min( docBytes, in.preludeMeasuredDigits ) + kMeasuredDigitsPricedWidth;
+        };
+        // F5: the SMALLEST ceiling this root will actually print. over_ceiling= is measured against it and
+        // nothing else, so the attribute and the numbers beside it can always be reconciled by subtraction.
+        // 0 = the caller named none (the working budget is the lens's own default, stated in the ledger prose
+        // in bytes) and the label is then withheld rather than pointed at a number the root does not carry.
+        std::size_t namedCeiling = 0;
+        if( in.budgetTokens > 0 ) { namedCeiling = in.budgetTokens; }
+        if( in.maxTokens > 0 )    { namedCeiling = namedCeiling > 0 ? std::min( namedCeiling, in.maxTokens ) : in.maxTokens; }
+        const auto rootAttrsFor = [ & ]( const std::string& doc, bool widestSpelling ) -> std::string
+        {
+            std::size_t est   = 0;
+            std::string attrs = pricedRootAttr( pricedBytesOf( doc.size() ), kBytesPerTokenDefault, 0, &est );
+            if( in.budgetTokens > 0 ) { attrs += " budget_tokens=\"" + std::to_string( in.budgetTokens ) + "\""; }
+            // H9: --max-tokens bounds the rank-1 BODY here, and the bundle really does shrink for it
+            // (13.6 KB -> 2.6 KB on the audit's probe) — so the ceiling gets named, exactly as
+            // budget_tokens= names --token-budget's. The two flags are separate columns in cli.h's
+            // kShapingVerbs and --from-trace is the one verb whose row sets both, so both can appear.
+            if( in.maxTokens > 0 )    { attrs += " max_tokens=\"" + std::to_string( in.maxTokens ) + "\""; }
+            // F5: the PROPERTY, not the rung. The old test was `the ladder's last rung fired`, and the ladder
+            // climbs against the BUNDLE budget — so `--max-tokens=200` delivered 1090 tokens beside
+            // `max_tokens="200"` in silence, while `--max-tokens=8000` on a bundle over the lens's own default
+            // wore over_ceiling="1" at 4471 tokens, comfortably inside the ceiling it named. Both readings
+            // came from measuring against a ceiling other than the one printed. One rule now: the delivered
+            // document exceeds a ceiling named on this root, or the attribute is absent.
+            if( widestSpelling || ( namedCeiling > 0 && est > namedCeiling ) ) { attrs += " over_ceiling=\"1\""; }
+            return attrs;
+        };
+        const std::size_t rootAttrsBound = rootAttrsFor( whole, /*widestSpelling=*/true ).size();
+        const auto buildRung = [ & ]( bool, bool withSrcEcho, std::string_view extra ) { return buildTraceHeader( withSrcEcho, extra ); };
+        // L1 fix round: under the compact posture the rungs are judged on the DELIVERED document (see packtask.h's twin).
+        const auto deliveredOf = [ & ]( std::string candidate )
+        {
+            spliceRootAttrs( candidate, rootAttrsFor( candidate, /*widestSpelling=*/true ) );
+            return pricedBytesOf( traceDeliveredBytes( candidate ) );
+        };
+        const CeilingLadderChoice chosen = in.compactLegend
+            ? climbDeliveredLadder( buildRung, headerStr, whole.substr( headerStr.size() ), deliveredOf,
+                                    ceilingAllowanceFromBudgetBytes( bundleBudget ), kNotes )
+            : climbCeilingLadder( buildRung,
+                                                               headerStr, pricedBytesOf( whole.size() ) - headerStr.size() + rootAttrsBound,
+                                                               // ONE ceiling twice: this lens states its ceiling in BYTES and labels
+                                                               // over_ceiling= against `namedCeiling`, so it has no token-rate
+                                                               // mismatch for the two-ceiling ladder to resolve (PR #215 item 1 names
+                                                               // --for and --pack-task). Passing the same predicate for both rungs
+                                                               // reproduces the pre-#215 single-ceiling climb exactly.
+                                                               ceilingAllowanceFromBudgetBytes( bundleBudget ),
+                                                               ceilingAllowanceFromBudgetBytes( bundleBudget ),
+                                                               /*hasRouteAttr=*/false, kNotes );
+        if( chosen.header != headerStr )
+        {
+            whole.replace( 0, headerStr.size(), chosen.header );
+        }
+        // F5: no marker sniff any more — the decision is the property above, read off the number the root
+        // will print. (The ladder's last rung implies it whenever --token-budget set the bundle budget:
+        // the rung fires past budget x 2.36 x 1.15 bytes, i.e. past 1.085 x budget tokens.)
+        spliceRootAttrs( whole, rootAttrsFor( whole, /*widestSpelling=*/false ) );
+    }
+
+    res.ok         = true;
+    res.frameCount = part.parsedCount;
+    res.inCorpus   = part.inCorpusCount;
+    res.xml        = std::move( whole );
+    return res;
+}
+
+}   // namespace rw

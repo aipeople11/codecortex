@@ -1,0 +1,866 @@
+#pragma once
+
+// ingest.h — Phase 2 INGEST: deterministic crawl + tree-sitter tags-query extraction.
+//
+// ingest( rootDir ):
+//   1. crawl rootDir for candidate source paths (skip .git/, oversized, binary, generated);
+//   2. SORT paths lexicographically (byte order) — load-bearing determinism;
+//   3. parse each by extension via a constexpr extension -> {ts_language, tags.scm} table;
+//   4. run ONE ts_query per file, map @definition.* -> Symbol, @reference.* -> Reference;
+//   5. assign Symbol ids in (file, line, name) order so the whole pipeline is reproducible.
+//
+// Returns rw::IngestResult exactly as defined in model.h (the GRAPH/RANK/SERIALIZE contract).
+// Single-threaded for v1 ("single-threaded is fine for v1"); tree-sitter parsers are
+// not thread-safe, so multithreading would need one parser per worker (deferred).
+
+#include "model.h"
+#include "infra/os.h"   // rw::os::realpath — canonicalCrawlRoot and the containment check
+
+#include <atomic>       // AstQueryGroup::ellipsisCappedOut — a summed counter across the parallel file walk
+#include <cctype>
+#include <climits>       // PATH_MAX — the crawl-boundary realpath buffer below
+#include <cstdlib>       // realpath  — likewise
+#include <cstring>
+#include <mutex>         // AstRegexUndecided — the rare undecided-predicate path records its first site under a lock
+#include <span>          // spanTiersOfFiles takes a VIEW of paths — the caller owns the storage
+#include <string_view>
+#include <tuple>         // AstRegexUndecided orders its first site by (fileId, byte, cause, pattern)
+
+// GLOBAL-scope forward declaration, deliberately OUTSIDE namespace rw — the hazard the pattern-surface
+// note below records is a `struct TSLanguage;` INSIDE namespace rw (it would declare rw::TSLanguage and
+// shadow the real global one for every later include). At global scope it is the same incomplete type
+// tree_sitter/api.h completes, so sliceGrammarForFile below can hand a grammar pointer out of
+// kLangTable without this header growing a tree-sitter include.
+struct TSLanguage;
+
+namespace rw
+{
+
+// The crawl's per-file byte ceiling. A text file larger than this is skipped: at this size
+// it is overwhelmingly generated/vendored/data (bundles, generated parsers, minified blobs, data
+// tables) — noise for an architecture map, and it would dominate the cold-parse budget. The specific
+// value also bounds a WORST CASE: tree-sitter's parse is quadratic on pathological comment-dense input
+// (~4 s/MB²), so 4 MB caps such a file at ~1 min (real code parses linearly, ~0.7 s/MB). Overridable
+// per run via --max-file-size (CLI) for repos with genuinely-large hand-authored source.
+constexpr std::size_t kDefaultMaxFileBytes = 4u * 1024u * 1024u;   // 4 MB (was 1 MB pre-2026-07)
+
+// The JSON lane's OWN crawl ceiling (found live by bench/multiswe): .json is indexed for CONFIG
+// keys, and real config files (package.json, tsconfig, angular.json…) are tens of KB at most — while
+// 200KB-4MB pretty-printed .json is essentially always DATA (test corpora, benchmark datasets, exports)
+// that slips under both the 4MB skip and the minified-line heuristic and explodes into tens of thousands
+// of junk t="sec" symbols (measured: >2min ingest on a nlohmann/json historical tree vs 0.3s without the
+// data files). Generous on purpose: every real-world config file observed is far below it.
+constexpr std::size_t kMaxJsonConfigBytes = 256u * 1024u;          // 256 KB
+
+// JSON-lane nesting ceiling (companion to kMaxJsonConfigBytes; see jsonNestsTooDeep in ingest.cpp): real
+// config nests a handful of levels; hundreds means a parser-torture fixture or generated data whose
+// tree-sitter error recovery goes superlinear. 512 is orders of magnitude above any config observed.
+constexpr std::uint32_t kMaxJsonNestDepth = 512u;
+
+// THE TOML LANE HAS NO CEILING OF ITS OWN, AND THAT IS A MEASURED DECISION — not an omission, and not a
+// sibling the JSON pair above is still waiting for. The two constants exist because .json has a large,
+// common DATA class wearing a config extension; TOML has no such class, so a matching pair would be
+// theatre that only ever fires on a file no corpus contains. Measured over 90 real public repos
+// (bench-assets/r4/repos, 321 .toml files) before this lane was written:
+//   SIZE — p50 277 B, p90 3 578 B, p99 21 449 B, MAX 57 759 B. The largest real TOML in 90 repos is 57 KB,
+//     which is a quarter of what kMaxJsonConfigBytes would allow and 1.4% of kDefaultMaxFileBytes. A
+//     TOML-specific ceiling could not be set anywhere both above the observed max and below the generic
+//     4 MB skip without being unreachable by construction.
+//   PARSE — 270 of 321 parse clean; 50 of the 51 "failures" are cpython's test_tomllib/data/invalid/
+//     deliberately-malformed fixtures, so the real failure rate is ~0.3%.
+//   PATHOLOGY — none. `[` x100 000 = 17.4 ms · dotted key x50 000 = 7.0 ms · 50 000 `[[aot]]` = 58.7 ms ·
+//     a 2 MB unterminated string = 21.7 ms. All LINEAR. That is the substantive difference from JSON,
+//     whose error recovery goes superlinear (43 s for 100 KB of unclosed `[`) and forced jsonNestsTooDeep.
+//     TOML is line-oriented, so a malformed line resynchronizes at the newline instead of nesting.
+//   SCANNER — the vendored external scanner is stateless (create() returns NULL, serialize() returns 0,
+//     never allocates), so it adds no serialization or leak hazard to weigh against a guard either.
+// So .toml rides the GENERIC path only: the shared --max-file-size / kDefaultMaxFileBytes skip, which is
+// already disclosed through skipped_oversize=. test/tomllangcheck.sh pins this decision from the outside —
+// it indexes a 216 KB .toml (3.7x the corpus max, and past where the JSON ceiling would sit) and fails if
+// anything drops it, so a ceiling cannot be added later without the gate saying so out loud.
+
+// THE YAML LANE GETS JSON'S HAZARD PAIR AT ITS OWN CALIBRATION — measured, not inherited. .yml wears
+// JSON's problem (a large machine-written DATA class behind a config extension: dumped datasets, lockfile-
+// style manifests, .dSYM relocation files) so it gets a size ceiling — but JSON's 256 KB would drop REAL
+// config: NeMo's cicd-main.yml is a hand-maintained 293 KB workflow. 512 KB clears every real config file
+// observed in the 90-repo breadth corpus (4 449 .yml/.yaml files) while still amputating the data class.
+// Counted in skipped_oversize= exactly like the JSON drop (test/yamllangcheck.sh pins both sides).
+constexpr std::size_t kMaxYamlConfigBytes = 512u * 1024u;          // 512 KB — deliberately NOT kMaxJsonConfigBytes
+
+// YAML-lane nesting ceiling (companion to kMaxYamlConfigBytes; see yamlNestsTooDeep in ingest.cpp) — and
+// unlike JSON's, this one is MEMORY-SAFETY load-bearing, not merely a superlinear-parse guard.
+// tree-sitter-yaml's external scanner serialize() writes 4 bytes per open block indent level behind a loop
+// guard that only proves 1 byte fits (`size < TREE_SITTER_SERIALIZATION_BUFFER_SIZE`, then two int16
+// stores): the 10-byte header + 4n hits 1022 at n=253, passes the guard, and writes bytes 1022-1025 of a
+// 1024-byte buffer. Measured on the vendored v0.7.2: 253 indent levels rc=0, 254 rc=SIGABRT — and under
+// NDEBUG the ts_assert is compiled out, so a Release build performs the corrupting write SILENTLY. The
+// vendored scanner carries the one-line bounds fix (third_party/patches/yaml/, drift-gated), and this
+// prescan refuses such files BEFORE any parse so the parser never runs on them at all.
+// The prescan counts an over-approximation of the scanner's indent stack (each open block level costs one
+// stack slot; a block mapping and a block sequence can open at the SAME column, so the estimate charges 2
+// per open indent column plus 1 per `- `/`? ` marker). 64 is 4x under the 253-slot cliff and comfortably
+// above real config: the deepest file in the breadth corpus reaches AST depth 76 ≈ ~19 block levels
+// (each block level wraps ~4 AST nodes: block_node → block_mapping → pair → flow_node).
+constexpr std::uint32_t kMaxYamlNestDepth = 64u;
+
+// Markdown-lane nesting ceiling (companion prescan: mdNestsTooDeep in ingest.cpp) — MEMORY-SAFETY
+// load-bearing, the yaml posture on a WORSE upstream defect. tree-sitter-markdown's external scanner
+// serialize() memcpys open_blocks.size * sizeof(Block) bytes after a 5-byte header with NO bounds
+// check at all against the 1024-byte serialization buffer: the write goes out of bounds at 255 open
+// blocks. Measured standalone on the vendored v0.5.3 (2026-08-12): 300 nested '>' markers — or 300
+// `- ` list markers on ONE line — abort ts_assert(length <= 1024) (rc=134); under NDEBUG the assert
+// is compiled out and the heap is corrupted SILENTLY. The vendored scanner carries the whole-write
+// clamp (third_party/patches/markdown/001-serialize-bounds.patch, drift-gated by vendorpatchcheck
+// arm H class "upfront"), and this prescan refuses such files BEFORE any parse — two independent
+// layers, exactly the yaml pair.
+// The prescan over-approximates the scanner's open-blocks stack per line: one slot per blockquote
+// '>' marker, one per list marker (`-`/`*`/`+`/`N.`/`N)` — CommonMark nests a new list per marker,
+// so `- - - x` on one line opens three), plus leading indent width / 2 (a nested list level costs
+// ~2 columns of indent, so indentation alone can hold that many open blocks across lines). 200 is
+// ~25% under the 255-slot cliff and far above real prose: a thematic break is 3 markers, the
+// deepest real nesting in this repo's own docs is 4.
+constexpr std::uint32_t kMaxMdBlockDepth = 200u;
+
+// Kotlin-lane string-template nesting ceiling (companion prescan: kotlinStringsNestTooDeep in ingest_crawl.h) —
+// PROCESS-SURVIVAL load-bearing, the yaml/markdown posture on a different upstream defect. tree-sitter-kotlin's external
+// scanner keeps one 2-byte stack entry per OPEN string literal (a string nests inside another only through a `${ … }`
+// interpolation), and upstream bounded that stack with abort(): measured on the vendored 1852ea17 with
+// `"a${"a${ … "leaf" … }"}"`, 512 open strings parse and 513 end the process (SIGABRT, rc=134) — so one such .kt file
+// silently killed the index of every tree that contained it, with no output at all. The vendored scanner now refuses
+// the push instead (third_party/patches/kotlin/001-stack-push-no-abort.patch; vendorpatchcheck arms B and J),
+// and this prescan refuses the FILE before any parse and rows it in --skipped (why="nest-refused") — two independent
+// layers, the yaml pair's shape. 128 is 4x under the cliff and ~60x over real code: across the 2 741 .kt files of
+// nowinandroid, ktor and retrofit the deepest nesting is 2 (61 files; every other file is at 0 or 1).
+constexpr std::uint32_t kMaxKotlinStringNestDepth = 128u;
+
+// ── §L1 skip taxonomy / parse health ────────────────────────────────────────────────────────────────
+// How many ROWS --skipped will itemize per drop class before it stops collecting them. The COUNTS
+// beside the rows stay exact (they are incremented past the cap); only the itemization is bounded, and
+// the verb discloses `*_shown=` whenever it bit. A cap is needed at all because the unsupported-extension
+// class is unbounded by construction — an asset-heavy monorepo has hundreds of thousands of members —
+// and holding a std::string per member to print 500 of them is a memory hazard, not a feature.
+constexpr std::size_t kMaxSkipRowsPerClass = 500;
+
+// The leading window sampled for the whitespace-frequency (minified) heuristic, and the threshold it is
+// compared against. 0.07 is semgrep's published minified-file threshold (their `is_minified` check reads
+// the same leading window); it is stated in per-mille here so the comparison is integer and the emitted
+// ws_freq= can be reproduced exactly by a reader dividing the same two numbers.
+constexpr std::size_t   kHealthWsSampleBytes   = 4096;
+constexpr std::uint32_t kMinifiedWsPerMille    = 70;    // ws_freq < 0.070 ⇒ minified-suspect
+// …but only once there is enough text to judge. A 40-byte header file has no meaningful whitespace
+// frequency, and flagging it would bury the real bundles under noise. Files under this size are never
+// flagged, and the floor is disclosed in the verb's legend.
+constexpr std::size_t   kMinifiedMinBytes      = 256;
+
+// Extensions that are NOT source or text, so their absence from the index is not a disclosure the reader
+// needs: an unindexed .png is a picture, not a language codecortex failed to read. This is the rule the
+// `unindexed=` header and the unsupported-extension rows apply, stated once here and named in the legend
+// so a reader can see exactly what was withheld. `.cache` is on the list for the same reason and one more:
+// it is codecortex's OWN blob (`--cache=PATH`, and the `.cache` directory name already on kCrawlSkipDirs), so a
+// run that writes its cache inside the crawl root was reporting its own artifact as a language it failed to
+// read — and once #66 put that roll-up on every graph verb's root as graph_unindexed=, that self-reference
+// made the SAME query answer differently cold and warm (test/lib/jsimportalias.sh's cold/warm arm caught it).
+// A gauge an agent is asked to trust must not move because the tool wrote a file.
+// A file with NO extension is likewise not counted (the
+// class is "extensions this build has no grammar for" — an extensionless LICENSE/Makefile has no
+// extension to report, and inventing one would be a guess).
+// SORT ORDER IS LOAD-BEARING: isNonTextExtension binary-searches this table, so the entries are byte-sorted,
+// not grouped by media kind. The static_assert below is the guard, and it is not decoration — an
+// out-of-order entry does not fail to compile on its own, it silently stops matching, and the only symptom
+// is one asset extension quietly appearing in `unindexed=`.
+constexpr std::string_view kNonTextExts[] = {
+    ".7z", ".a", ".apk", ".avi", ".avif", ".avro", ".bcsymbolmap",
+    ".bin", ".bmp", ".bz2", ".cache", ".car", ".class", ".d", ".dat",
+    ".db", ".deb", ".dll", ".dmg", ".doc", ".docx", ".ds_store",
+    ".dylib", ".eot", ".exe", ".flac", ".gif", ".gz", ".icns",
+    ".ico", ".idx", ".ipa", ".jar", ".jpeg", ".jpg", ".jpg_large",
+    ".lib", ".m4a", ".m4v", ".mkv", ".mo", ".mov", ".mp3",
+    ".mp4", ".nib", ".node", ".npy", ".npz", ".o", ".obj",
+    ".ogg", ".onnx", ".otf", ".pack", ".parquet", ".pb", ".pdb",
+    ".pdf", ".pkg", ".png", ".ppt", ".pptx", ".psd", ".pt",
+    ".pth", ".pyc", ".pyo", ".rar", ".rlib", ".rmeta", ".rpm",
+    ".so", ".sqlite", ".tar", ".tgz", ".tif", ".tiff", ".ttf",
+    ".war", ".wasm", ".wav", ".webm", ".webp", ".whl", ".woff",
+    ".woff2", ".xls", ".xlsx", ".xz", ".zip", ".zst" };
+
+static_assert( std::is_sorted( std::begin( kNonTextExts ), std::end( kNonTextExts ) ),
+               "kNonTextExts must stay byte-sorted — isNonTextExtension binary-searches it" );
+
+// Is this (lowercased, dot-prefixed) extension one the `unindexed=` roll-up deliberately withholds?
+// Empty extension ⇒ true (nothing to report; see kNonTextExts).
+//
+// SORTED table + binary_search, not the linear scan every other extension test in this tree writes. Two
+// reasons, and the second is the interesting one: the table is 5-10x longer than any of them (a linear scan
+// pays 50 string compares per non-source file on an asset-heavy crawl), AND a sixth copy of the
+// `for( x : table ) if( x == v ) return true;` shape makes this a clone of five unrelated helpers at once —
+// codecortex's own --clones lens said so about the first draft of this function. Consolidating those five is a
+// real refactor for a lane that owns them; picking a different algorithm is the honest local answer.
+inline bool isNonTextExtension( std::string_view ext ) noexcept
+{
+    // Hand-rolled comparator instead of string_view's operator<: libstdc++'s _S_compare subtracts the two
+    // lengths in size_type, and G1's -fsanitize=integer (correctly) flags that unsigned wrap on every
+    // shorter-vs-longer compare — Linux-ASan-only, libc++ compares differently. memcmp-then-length never
+    // subtracts.
+    const auto extLess = []( std::string_view a, std::string_view b ) noexcept
+    {
+        const std::size_t common = a.size() < b.size() ? a.size() : b.size();
+        const int cmp            = common == 0 ? 0 : std::memcmp( a.data(), b.data(), common );
+        if( cmp != 0 )
+        {
+            return cmp < 0;
+        }
+        return a.size() < b.size();
+    };
+    return ext.empty() || ext == "."
+        || std::binary_search( std::begin( kNonTextExts ), std::end( kNonTextExts ), ext, extLess );
+}
+
+// The NUL-byte binary heuristic, made public (§R-J): grep's aux-file scan (search.h grepCollectAux) needs
+// the SAME sniff ingest.cpp's parse pool already runs on every file it reads, but that copy used to live in
+// ingest.cpp's anonymous namespace (TU-local) — and grep already has the candidate's bytes in hand from its
+// own read, so a second file-opening sniff (rw::binstale::looksBinary, which re-reads from disk) would cost
+// a redundant read per candidate. This is now the ONE definition; ingest.cpp's own scan sites use it too via
+// plain unqualified lookup (same namespace), so there is no third NUL-scan loop anywhere in the tree.
+inline constexpr std::size_t kBinarySniffCap = 4096;   // NUL-byte sniff window
+
+inline bool looksBinary( std::string_view bytes ) noexcept
+{
+    const std::size_t n = bytes.size() < kBinarySniffCap ? bytes.size() : kBinarySniffCap;
+    return std::memchr( bytes.data(), '\0', n ) != nullptr;
+}
+
+// The crawl's default directory denylist (a .gitignore-lite): noise/vendor/build subtrees pruned entirely.
+// Shared, not private to ingest.cpp, because a second crawler now exists — darkflags.h walks for CMake files,
+// which ingest deliberately never collects (CMake is not one of the indexed grammars) — and a crawl that
+// disagreed with this one about what counts as source would report gates from nested agent worktrees and
+// build-output trees as if they were the repo's own. One table, both walkers.
+constexpr std::string_view kCrawlSkipDirs[] = {
+    ".git", ".claude", ".hg", ".svn", "node_modules", "vendor", "third_party",
+    ".cache", "build", "dist", "out", "target", ".venv", "venv", "__pycache__",
+    ".idea", ".vscode",
+    // CMake / compiler-id build dirs (generated stubs, not source — break --around=main etc.)
+    "asan", "build_prof", "CMakeFiles",
+    // Generated output captures (docs/captures/ here): a doc that quotes every verb's output out-scores
+    // the source for almost any query about the tool — 77% of --recall on this repo was capture text
+    // (owner decision). A "captures" dir is generated evidence,
+    // not a design document; skipping beats a ranking de-prioritization no held-out eval can measure.
+    "captures" };
+
+// Is this directory NAME (not path) one the crawl prunes? Also covers the JetBrains "cmake-build-*" convention.
+inline bool isSkippedCrawlDir( std::string_view dirName ) noexcept
+{
+    for( std::string_view s : kCrawlSkipDirs )
+    {
+        if( dirName == s )
+        {
+            return true;
+        }
+    }
+    if( dirName.size() > 12 && dirName.compare( 0, 12, "cmake-build-" ) == 0 )
+    {
+        return true;
+    }
+    // "<Bundle>.dSYM" debug-symbol bundles (YAML-round prerequisite): a .dSYM carries yaml-format
+    // relocation files under Contents/Resources/ — the private validation corpus holds 197 of them and
+    // ZERO real .yml config — so an unpruned .dSYM ships hundreds of pure-noise t="sec" symbols. A
+    // suffix rule (not a table entry) because the bundle is named after its product, never literally ".dSYM".
+    return dirName.size() > 5 && dirName.compare( dirName.size() - 5, 5, ".dSYM" ) == 0;
+}
+
+// ── §SEC1: THE CRAWL BOUNDARY ────────────────────────────────────────────────────────────────────────────
+//
+// ONE RULE, STATED ONCE, FOR EVERY WALK THIS BINARY OWNS: a path a crawl collected must resolve, AFTER LINK
+// RESOLUTION, to somewhere inside the root it was crawled under. Shared for the same reason kCrawlSkipDirs
+// above is shared — there is a second walker (darkflags.h's CMake harvest) and a boundary two walkers
+// disagreed about is not a boundary.
+//
+// WHY THIS EXISTS (v0.5.0 and main). The crawl accepted a
+// file symlink whose LEXICAL path was inside the root while its TARGET was outside it: `directory_entry`'s
+// `is_regular_file()` and `file_size()` both FOLLOW the link, so a repository-controlled tracked symlink made
+// codecortex open and serve any text file the invoking user could read — through --expand, --recall, --grep's
+// unindexed aux scan, --flags, and MCP memory_recall, i.e. straight into a connected model. And it emitted
+// those bytes under the IN-ROOT link path, so the map ATTRIBUTED out-of-root content to a path inside the
+// repository: a disclosure defect layered on a disclosure.
+//
+// THE LEXICAL TEST IS THE BUG, so do not write another one. Both sides are canonicalized:
+//
+//   * the ROOT, because a root reached through a link is ordinary (`/tmp` is a link to `/private/tmp` on
+//     macOS; every worktree this project's own gates build lives under one). Compare a resolved target
+//     against an unresolved root and every file under a symlinked root reads as an escape — the corpus
+//     silently empties on a correct tree.
+//   * the FILE, because the whole point is that its lexical spelling lies.
+//
+// …and the comparison is at a COMPONENT BOUNDARY, never a raw string prefix: `<root>-evil/f.c` shares a byte
+// prefix with `<root>` and is not inside it.
+//
+// FAIL CLOSED. An unresolvable path is refused, not admitted. A root that will not canonicalize keeps its
+// literal spelling, which can only make the test stricter.
+//
+// COST. `realpath()` is a syscall per call, so the walk must not pay it per FILE. It does not: the caller
+// tests `is_symlink()` first — a cached readdir `d_type` on every platform this builds for — and only a
+// symlink reaches here. A tree with no symlinks pays nothing measurable (llvm-project, 10 034 files: cold
+// crawl within run-to-run noise of the unfixed binary).
+//
+// WHAT IT DOES NOT COVER, said plainly: a HARD link to an out-of-root file is indistinguishable from an
+// ordinary file — same inode, no link to resolve — so no path-based rule can see it. A `--bind` mount or a
+// firmlink is the same shape. This bounds the SYMLINK channel, which is the one a git repository can carry.
+//
+// `real` and `rootReal` must both already be canonical absolute paths.
+inline bool withinCanonicalRoot( std::string_view real, std::string_view rootReal ) noexcept
+{
+    if( rootReal.empty() || real.size() < rootReal.size() || real.compare( 0, rootReal.size(), rootReal ) != 0 )
+    {
+        return false;
+    }
+    if( real.size() == rootReal.size() )
+    {
+        return true;   // the root itself — a single-file root is its own boundary
+    }
+    // "/" already ends in the separator; every other root needs the next byte to BE one, or this is a sibling
+    // whose name merely starts with the root's ("/x/repo" vs "/x/repo-evil").
+    return rootReal.back() == '/' || real[ rootReal.size() ] == '/';
+}
+
+// The canonical spelling of a crawl root, computed ONCE per walk. Falls back to the literal argument when the
+// root will not resolve (fail closed: an unresolved root matches fewer targets, never more).
+inline std::string canonicalCrawlRoot( std::string_view rootDir )
+{
+    const std::string dir( rootDir.empty() ? std::string_view( "." ) : rootDir );
+    char              resolved[ PATH_MAX ];
+    return os::realpath( dir.c_str(), resolved ) != nullptr ? std::string( resolved ) : dir;
+}
+
+// Does `path` (as the walk spelled it) still live inside `rootReal` once every link on it is resolved?
+// Call ONLY for entries that are symlinks — see the cost note above.
+inline bool crawlPathStaysInRoot( const std::string& path, const std::string& rootReal ) noexcept
+{
+    char resolved[ PATH_MAX ];
+    if( os::realpath( path.c_str(), resolved ) == nullptr )
+    {
+        return false;   // fail closed
+    }
+    return withinCanonicalRoot( resolved, rootReal );
+}
+
+// Crawl + parse rootDir into the symbol/reference model. Never throws: a bad file, missing
+// grammar, or ABI mismatch degrades (skipped + stderr note), never aborts ingestion.
+// excludeSubstr: drop any path containing one of these substrings (and prune matching dirs)
+// — for vendored/generated trees not caught by the built-in dir denylist (--exclude=SUBSTR).
+// cacheFile (--cache=PATH): incremental content-hash cache — unchanged files reuse cached facts,
+// only changed files are re-parsed. Empty ⇒ full parse. Node ids are reassigned each run (not
+// cached), so a warm run is byte-identical to a cold one.
+// maxFileBytes: the crawl's per-file size ceiling (default kDefaultMaxFileBytes; --max-file-size).
+// captureValueUses: include read/write use-sites for --uses / metrics-quality lenses. Default true
+// preserves the complete index for library/MCP callers; the CLI default map may pass false because
+// PageRank consumes calls/imports/inheritance/composition only.
+// excludeLabel (multi-root workspaces ONLY, A12): when non-empty, each --exclude
+// substring is matched against the LABELED spelling `<excludeLabel>/<root-relative-path>` instead of the
+// crawled path — so ONE excludes list applies uniformly across roots and `--exclude=lib1/` scopes to the
+// root labeled lib1. Empty (the default, every single-root call) ⇒ behavior byte-identical to today.
+// respectGitignore (§N6-C, --no-ignore turns it OFF): in a git work tree the crawl consults git's own
+// ignore rules and skips what the repository already declared uninteresting, disclosing the drop as
+// ignored_files=/ignored_dirs=. A non-git root, a missing git binary, or a root that is itself inside an
+// ignored subtree all keep TODAY'S FULL WALK and say which (CrawlSkips::ignoreMode). Default true: the
+// HEAD-snapshot and edit-preview callers re-ingest a `git archive` extraction, which holds tracked files
+// only, so the two sides of a --quality-delta compare the same population either way.
+//
+// THE LAYOUT LINK STAMP (the trailing IngestLayout argument, which every caller defaults). CLAUDE.md records builds that
+// linked objects compiled against two different struct layouts and reported success: sizeof( Symbol ) 96 in one object
+// and 104 in another gave a real ASan report of a fake bug, and an "impossible" std::length_error. The empty tag type
+// carries both sizes in its template arguments, so they enter ingest()'s MANGLED NAME: an object compiled against a
+// stale layout references an ingest() that no fresh object defines, and the link fails instead.
+// MEASURED 2026-09-16 on this tree, with the dev build's own flags and link line: main.o compiled with the stamp at
+// sizeof( Symbol ) 112, ingest.o at 120 (one u64 added) -> ld: undefined symbol
+// rw::ingest(…, IngestLayoutStamp<112, 848>) against a defined …<120, 848>. The same mixed pair WITHOUT the stamp linked
+// at exit 0, and the binary died with SIGBUS (exit 138) on test/fixture. The consistent stamped pair links and prints
+// byte-identical output. Symbol is named separately because sizeof( IngestResult ) does not move when an element type
+// held in one of its vectors grows (848 on both sides above). An empty class argument: at most one ignored register,
+// on a function called once per run.
+template<std::size_t kSymbolBytes, std::size_t kIngestResultBytes> struct IngestLayoutStamp {};
+using IngestLayout = IngestLayoutStamp<sizeof( Symbol ), sizeof( IngestResult )>;
+
+IngestResult ingest( const char* rootDir, const std::vector<std::string>& excludeSubstr = {},
+                     std::string_view cacheFile = {}, std::size_t maxFileBytes = kDefaultMaxFileBytes,
+                     bool captureValueUses = true, std::string_view excludeLabel = {},
+                     bool respectGitignore = true, IngestLayout = {} );
+
+// ---- index-identity disclosure (the two functions behind --doctor's index-cache row) ----
+//
+// WHY THIS IS PUBLIC API AND NOT A SECOND COPY OF THE GUARD. `kCacheVersion`, `kParserVer` and
+// `kArtifactArch` decide whether ANY committed `--index-out` artifact is reusable, and until this pair
+// existed they had no user-visible surface at all: `--doctor`, `--help` and the map header named none of
+// them, and every refusal reached the user only through DISCLOSE, which NDEBUG (i.e. every
+// installed binary — install.sh configures Release) compiles out. So `codecortex DIR --cache=/gone.bin`
+// exited 0, printed nothing on either stream, and emitted bytes identical to a valid-artifact run.
+// Gate: test/cacheidentitycheck.sh. The definitions live in ingest.cpp because the guard they wrap
+// (openCacheFrame) is internal to that TU, and running the REAL guard rather than a doctor-local
+// re-implementation is the point — a disclosure free to drift from the behaviour it describes is worse
+// than none.
+struct CacheIdentity
+{
+    std::uint32_t cacheVersion  = 0;   // kCacheVersion — the on-disk format generation
+    std::uint32_t parserVerLean = 0;   // parserVerFor(false) — the extraction identity of the lean family
+    std::uint32_t parserVerRich = 0;   // parserVerFor(true)  — …and of the rich family (--for/--exemplar/--metrics/--uses)
+    unsigned      artifactArch  = 0;   // kArtifactArch — endianness | sizeof(void*) << 1
+};
+CacheIdentity cacheIdentity() noexcept;
+
+// The verdict for ONE artifact, as the stable lowercase vocabulary CacheReject declares (see
+// src/ingest_cache.h): "ok" | "absent" | "not-regular" | "unreadable" | "truncated" | "not-a-cache" |
+// "format-version" | "parser-version" | "artifact-arch" | "checksum" | "corrupt-frame". A FORMAT verdict
+// about an artifact, never a freshness verdict about an index: per-file freshness is re-validated on every
+// invocation (docs/EVALS.md, "card A3"), which is why no equivalent may be emitted on the map.
+const char* cacheArtifactVerdict( const std::string& path, bool captureValueUses );
+
+// ---- shared AST-query pass (powers --match structural search + --lint) ----
+// Re-parse the already-crawled files in parallel and run one or more tree-sitter queries over each tree.
+// Each spec's query is compiled against every grammar it is VALID for (others are skipped), so a
+// C-family query simply doesn't fire on Python files, etc. A query must contain at least one @capture;
+// each captured node becomes a match. Results are sorted (file, startByte, endByte, tag) — endByte is
+// load-bearing: a nesting kind puts an outer and an inner capture at the SAME startByte, and without it
+// the unstable sort leaks the parallel fan-out's arrival order (nondeterministic --match/--lint output).
+struct AstQuerySpec { std::string query; std::string tag; };   // tag = lint rule name, or "" for raw --match
+struct AstMatch     { std::uint32_t fileId; std::uint32_t startByte; std::uint32_t endByte; std::uint32_t line; std::string tag; std::string text; };
+
+// maxMatches is PER SPEC TAG, not a shared pool (§P0.2). One walk of the tree serves every spec, but each
+// tag's surviving rows are truncated against its OWN budget — so a query that saturates (e.g. every
+// number_literal) can never starve a quiet one out of the result, which is what made `--lint` report
+// `goto count="1"` on a tree holding two. Two specs sharing a tag deliberately share one budget.
+// A tag whose kept count lands exactly ON maxMatches is a FLOOR: the caller must disclose it (the
+// house rule --match already follows with hits_capped="1").
+// uncompiledOut (optional): receives the query text of every spec that compiled for NO grammar — the
+// caller can then refuse instead of presenting the resulting zero as a measurement (§P0.1's last gap).
+// A caller that also wants the §L3 grammar-applicability disclosure (grammarsOut / eligibleFilesOut on
+// AstQueryGroup, below) builds its own one-element AstQueryGroup vector and calls astQueryGrouped directly
+// — kept off this convenience wrapper so its signature (and every existing call site) is untouched.
+std::vector<AstMatch> astQuery( const IngestResult& ing, const std::vector<AstQuerySpec>& specs, std::size_t maxMatches = 5000,
+                                std::vector<std::string>* uncompiledOut = nullptr );
+
+// ---- ONE parse pass serving N independent query GROUPS ----
+// A group is a whole astQuery call's worth of work — its own spec table, its own per-TAG budget, its own
+// uncompiled-spec disclosure — and it gets back exactly the vector astQuery would have returned for it.
+// What is shared is the FILE WALK. `--lint` ran three astQuery passes (the built-in [AST] checks, the
+// atoms pack, the cache pack) and every one of them re-read and re-parsed the whole corpus: three reads
+// and three tree-sitter parses per file to answer three sets of questions about the SAME tree. Grouping
+// them reads and parses each file ONCE and executes every group's queries against that one tree.
+// Output is unchanged by construction: captures are bucketed per group as they are produced, and each
+// bucket is then merged, sorted and truncated by exactly the code a standalone call runs.
+//
+// A group's rows normally come from its own TSQuery spec table. `walk` names a BUILT-IN TREE WALK
+// instead — a check whose traversal no tree-sitter query can express, but which needs exactly the
+// per-file work the query groups already do: one read, one parse, one newline index. Riding the shared
+// walk is what stops such a check from re-reading and re-parsing the whole corpus for a FOURTH time.
+// A walk group carries NO spec table (nothing to compile, nothing to disclose); it emits a single tag,
+// so the per-tag budget below degenerates to one truncation of the sorted list — which is exactly the
+// tail a standalone pass would run. Setting both `specs` and `walk` on one group is not supported.
+enum class AstWalk : std::uint8_t
+{
+    None = 0,          // ordinary spec-driven group
+
+    // ---- unreachable-code detection (joern-lite CFG sketch; built-in --lint rule "unreachable-code") ----
+    // Pure-syntactic, intra-block: walk every genuine block node (compound_statement / block /
+    // statement_block) and, once an UNCONDITIONAL terminator statement (return/break/continue/throw, plus
+    // Python raise) is seen at that block level, flag the NEXT non-comment sibling statement in the SAME
+    // block as unreachable. Conservative by construction: no dataflow, no cross-branch reasoning, `goto`
+    // excluded (label targets are ambiguous), and any jump-target sibling (labeled_statement /
+    // case_statement) after the terminator stops the scan. Every finding carries tag "unreachable-code";
+    // the group's rows come back sorted (file path, startByte) like any other group's. Implementation:
+    // ur_walkTree in ingest.cpp, next to the rest of the rule's helpers.
+    //
+    // This is a WALK and not a spec table because the rule is an ORDERED scan of a block's statement
+    // siblings — "the first non-comment statement after an unconditional exit" — which no tree-sitter
+    // pattern can express. What it shares with the query groups is the read, the parse and the newline
+    // index; the traversal stays its own.
+    UnreachableCode,
+
+    // ---- R2 pattern surface (the pattern verb; src/pattern.h) ----
+    // A WALK for the same reason UnreachableCode is one: the traversal is "try the compiled pattern
+    // against every node of this file's tree", which no tree-sitter query can express (the pattern is
+    // code, and it becomes a different node shape in each grammar). What it shares with the query groups
+    // is the read, the parse and the newline index — the whole point of riding this walk instead of
+    // opening the corpus a second time. Its programs come from AstQueryGroup::patternPrograms.
+    Pattern,
+};
+
+// src/pattern.h owns the compiled form; ingest.h only ever holds a BORROWED pointer to it, so this
+// header stays free of tree-sitter. main.cpp includes pattern.h to build the set and read the
+// disclosures; ingest.cpp includes it to run the match. NOTE: no `struct TSLanguage;` forward
+// declaration here — inside namespace rw it would declare rw::TSLanguage and shadow the real global
+// one for every header included after this point, which is a whole-file cascade of "different return
+// type (const rw::TSLanguage* vs const TSLanguage*)" and not an obvious one to read backwards from.
+namespace pattern { struct PatternProgramSet; struct GrammarRow; }
+
+// Every grammar the pattern surface serves, one row per distinct grammar OBJECT, in kLangTable order.
+// Built in ingest.cpp rather than in pattern.h because the extension-to-grammar mapping is ingest's
+// fact, and a second copy of it is exactly the drift CONTRIBUTING's declarative-table rule prevents.
+std::vector<pattern::GrammarRow> supportedPatternGrammars();
+
+// --slice (lane/paper-slice): the grammar object for ONE file path (extension-mapped, the crawl's own
+// lowerExtensionOf + kLangTable rule), for a verb-time re-parse of a single definition. Same "ingest owns
+// the extension→grammar fact" rationale as supportedPatternGrammars above — slice.h must never grow a
+// second copy of kLangTable. nullptr when the extension has no grammar (the caller refuses, never
+// guesses). The ::TSLanguage spelling rides the global-scope forward declaration at the top of this header.
+const ::TSLanguage* sliceGrammarForFile( std::string_view path );
+
+// §L3 applicability, in the pattern surface's own terms, counted per grammar OBJECT — the same
+// extension-based (never content-sniffed) convention computeGrammarDisclosure uses for --match, so
+// eligible_files= means the same thing on both verbs.
+//
+// V-3 (adversarial verification 2026-08-20): `skipped` is the other half, and the half whose absence was
+// the defect. A file whose extension maps to a grammar this verb SERVES, but whose grammar OBJECT the
+// pattern did not resolve for, is never scanned — and on a run with hits>0 the old emitter withheld
+// unresolved_in= entirely, so a `.ts` file sitting beside a matched `.tsx` one went unread with nothing on
+// the element to say so. Counting it here is what lets the emitter decide honestly.
+struct PatternFileCensus
+{
+    std::size_t eligibleCount = 0;   // files whose grammar object the pattern RESOLVED for — these were scanned
+    std::size_t skippedCount  = 0;   // files in a SERVED language whose grammar object it did not — never scanned
+};
+PatternFileCensus eligiblePatternFiles( const IngestResult& ing, const pattern::PatternProgramSet& set );
+
+// The unreachable-code rule's own budget, named so every caller spends the same one.
+inline constexpr std::size_t kUnreachableMaxHits = 5000;
+
+// ---- a user's #match? / #not-match? predicate that could not be DECIDED, by cause ----
+// Four different facts that used to share one counter and one sentence — "the regex engine abandoned the match" —
+// which was false for three of them and sent the reader to the wrong fix:
+//   TextScreened     — a capture-typed argument's per-match TEXT was refused by the structural screen (e.g. a captured
+//                      string literal spelling a catastrophic-backtracking construct). Nothing was matched.
+//   TextUncompilable — that per-match text does not parse as a regular expression (e.g. "foo(").
+//   Abandoned        — a pattern compiled and the engine gave up part-way through the match (RegexVerdict::Exhausted).
+//   Skipped          — the captured text was too long to hand the engine at all on this thread (RegexVerdict::Skipped,
+//                      F-B4 — never tried, never abandoned mid-match; the same bound `--regex` uses on a long line).
+enum class AstRegexUndecidedCause : std::uint8_t { TextScreened, TextUncompilable, Abandoned, Skipped };
+
+// What a finished walk hands the verb: a count per cause and the FIRST undecided evaluation — lowest fileId, then
+// byte, then cause, then pattern — so the refusal names one concrete site, and the same one on every run whatever the
+// thread interleaving. Plain and copyable, unlike the sink below.
+struct AstRegexUndecidedReport
+{
+    std::uint64_t          textScreened     = 0;
+    std::uint64_t          textUncompilable = 0;
+    std::uint64_t          abandoned        = 0;
+    std::uint64_t          skipped          = 0;
+    bool                   hasFirst         = false;
+    std::uint32_t          firstFileId      = 0;
+    std::uint32_t          firstByte        = 0;
+    std::uint32_t          firstLine        = 0;
+    AstRegexUndecidedCause firstCause       = AstRegexUndecidedCause::Abandoned;
+    std::string            firstPattern;     // the per-match text (Text*) or the pattern that was running (Abandoned/Skipped)
+    std::string            firstReason;      // the guard's refusal, or kRegexAbandonedReason / kRegexOversizeReason
+
+    std::uint64_t total() const noexcept { return textScreened + textUncompilable + abandoned + skipped; }
+};
+
+// The sink the walk's workers write into. Only the undecided path ever touches it, which is why a mutex is the whole
+// synchronisation: a query whose predicates all decide never takes the lock.
+class AstRegexUndecided
+{
+public:
+    void note( AstRegexUndecidedCause cause, std::uint32_t fileId, std::uint32_t byte, std::uint32_t line, std::string_view pattern, std::string_view reason )
+    {
+        const std::lock_guard<std::mutex> lock( mutex );
+        std::uint64_t& count = ( cause == AstRegexUndecidedCause::TextScreened )     ? state.textScreened
+                              : ( cause == AstRegexUndecidedCause::TextUncompilable ) ? state.textUncompilable
+                              : ( cause == AstRegexUndecidedCause::Skipped )          ? state.skipped
+                                                                                       : state.abandoned;
+        ++count;
+        const auto key      = std::make_tuple( fileId, byte, std::uint8_t( cause ), pattern );
+        const auto firstKey = std::make_tuple( state.firstFileId, state.firstByte, std::uint8_t( state.firstCause ), std::string_view( state.firstPattern ) );
+        if( state.hasFirst && !( key < firstKey ) )
+        {
+            return;
+        }
+        state.hasFirst     = true;
+        state.firstFileId  = fileId;
+        state.firstByte    = byte;
+        state.firstLine    = line;
+        state.firstCause   = cause;
+        state.firstPattern = std::string( pattern );
+        state.firstReason  = std::string( reason );
+    }
+
+    AstRegexUndecidedReport report() const
+    {
+        const std::lock_guard<std::mutex> lock( mutex );
+        return state;
+    }
+
+private:
+    mutable std::mutex      mutex;
+    AstRegexUndecidedReport state;
+};
+
+struct AstQueryGroup
+{
+    const std::vector<AstQuerySpec>* specs         = nullptr;   // borrowed — the caller owns the spec table
+    std::size_t                      maxMatches    = 5000;      // per-TAG budget, same semantics as astQuery's
+    std::vector<std::string>*        uncompiledOut = nullptr;   // optional, same semantics as astQuery's
+    AstWalk                          walk          = AstWalk::None;   // non-None ⇒ built-in walk, no specs
+
+    // AstWalk::Pattern only: the compiled pattern, keyed by grammar. Borrowed, and read-only for the
+    // whole walk — it is a flat POD snapshot precisely so every worker can share it without a copy.
+    const pattern::PatternProgramSet* patternPrograms = nullptr;
+
+    // AstWalk::Pattern only, optional (null ⇒ zero cost): how many times an ellipsis probe abandoned a
+    // candidate node because the sibling run exceeded the disclosed bound. Summed across the parallel file
+    // walk, and summation of integers is the only reduction, so the total is order-independent and the
+    // determinism contract is untouched. See pattern.h::MatchStats for what the number does and does not
+    // claim; the emitter turns a non-zero into ellipsis_capped="1" + ellipsis_skipped=N and labels hits= a
+    // floor, which is the disclosure V-2 found missing.
+    std::atomic<std::uint64_t>*       ellipsisCappedOut = nullptr;
+
+    // §L3: a query that DID compile (for at least one grammar) still tells the caller nothing about WHICH
+    // grammars accepted it, or how much of the corpus could even ask it the question. `(interface_declaration)
+    // @m` against a Python-only corpus compiles fine (java/csharp/typescript all have that node) and returns
+    // a bare hits="0" — indistinguishable from "this pattern does not occur", which the honesty contract
+    // forbids (CLAUDE.md: a zero means "none found", never "none exists"). Both fields are opt-in (default
+    // nullptr ⇒ zero cost, every existing caller unaffected) and are populated by probing the query against
+    // the FULL kLangTable, not just the grammars the corpus happens to hold — so the disclosure is honest
+    // even when eligible_files ends up zero.
+    std::vector<std::string>*        grammarsOut      = nullptr;   // optional: canonical names of every grammar
+                                                                     // this group's specs compiled against
+                                                                     // (dedup, kLangTable row order — fixed and
+                                                                     // deterministic, independent of corpus content)
+    std::size_t*                      eligibleFilesOut = nullptr;   // optional: corpus files whose extension maps
+                                                                     // to one of those grammars (same extension-
+                                                                     // based convention the grammar-presence scan
+                                                                     // above already uses — not content-sniffed)
+
+    // octocode F3: a spec that lands in uncompiledOut (compiled for NO grammar — a malformed/misspelled
+    // query) used to refuse with the query echoed back and nothing more, so a typo'd node-kind token (e.g.
+    // `call_expresion` for `call_expression`) got no nearer a fix than re-reading the S-expression by eye.
+    // Both fields are opt-in (default nullptr ⇒ zero cost for every caller that doesn't ask) and, when the
+    // caller supplies them, are appended to PARALLEL to uncompiledOut — one push per uncompiled spec, same
+    // order, so nearestKindOut[i]/nearestGrammarOut[i] describe uncompiledOut[i]. An entry is an empty
+    // string when no candidate node-kind token was within the edit-distance cutoff of any linked grammar's
+    // vocabulary (an honest "no plausible near-miss", the same contract as didyoumean.h's didYouMean()).
+    std::vector<std::string>*        nearestKindOut    = nullptr;   // optional: nearest valid node-kind name
+                                                                     // per uncompiled spec, or "" if none close
+    std::vector<std::string>*        nearestGrammarOut = nullptr;   // optional: the grammar (kLangTable's
+                                                                     // querySub name) that nearestKindOut's
+                                                                     // entry belongs to, "" alongside a "" kind
+
+    // USER-AUTHORED #match? / #not-match? patterns (src/regexguard.h). Both opt-in, both null for the built-in
+    // rule packs, whose patterns are constants of this binary: a caller that passes them is saying "these
+    // predicates are the user's, and a predicate that could not be decided must not quietly keep or drop a row".
+    //   regexRefusedOut   — one "'PATTERN' refused: REASON" per distinct constant pattern of this group's specs the
+    //                       guard REFUSED (malformed, non-portable, or catastrophic backtracking), sorted. Decided
+    //                       when the query is compiled, before any file is walked, so the verdict is the pattern's.
+    //   regexUndecidedOut — every predicate evaluation that could not be decided during the walk, BY CAUSE (see
+    //                       AstRegexUndecidedCause), with the first site named deterministically.
+    // Without them the legacy contract holds for that group: a refused or undecided predicate filters NOTHING.
+    std::vector<std::string>*        regexRefusedOut   = nullptr;
+    AstRegexUndecided*               regexUndecidedOut = nullptr;
+};
+
+// keptBytesOut (optional): the walk is where the corpus gets READ, so a pass that runs after it and needs
+// the same text was re-reading every file the walk had just closed. Pass a vector and the walk MOVES each
+// file's bytes into it at slot fileId (resized here, written only by the worker that owns that file, so
+// distinct indices never race) — the reader downstream then works from memory instead of the disk.
+// PARTIAL BY CONSTRUCTION, and the caller must treat it that way: only files the walk got as far as
+// resolving a grammar for are populated, so a slot can be empty because the file was skipped (unknown
+// extension, unreadable, binary, markdown) or because the file is genuinely empty. Both cases mean the
+// same thing to a consumer — fall back to your own read, which is what every consumer did for every file
+// before this existed — so an empty slot needs no separate "was it filled" flag to stay correct.
+// Costs one corpus's worth of bytes held for as long as the caller keeps the vector; the caller decides
+// whether that trade is worth it, which is why this is opt-in and not the default.
+std::vector<std::vector<AstMatch>> astQueryGrouped( const IngestResult& ing, const std::vector<AstQueryGroup>& groups,
+                                                    std::vector<std::string>* keptBytesOut = nullptr );
+
+// ---- R-H: SPAN TIERS — the NARROW single-file parse entry (2026-08-19, funded by wave-2 experiment E5) --
+//
+// astQueryGrouped() above always walks the WHOLE corpus: it sizes its work queue off ing.files.size(), and
+// there is no parameter for "just these files". That is the right cost model for --lint/--match (which ask
+// a question OF the corpus) and the wrong one for --grep (which has already narrowed the corpus to a
+// handful of hit files by scanning bytes). E5 measured what one file's on-demand parse actually costs
+// (~42 ns/byte for the C++ grammar; 0.217 ms median on a 2400-file tree, 3.99 ms p90 on codecortex's own
+// denser source) and funded THIS entry point rather than a widening of the general ingest path:
+// spanTiersOfFiles() parses exactly the files it is handed, nothing more, and returns one thing —
+// where the comments and strings are.
+//
+// What it is FOR: classifying a byte offset that some other pass already found. A --grep hit inside a
+// comment or a string literal is a mention, not a use, and 22-42% of a --grep answer's rows were such
+// mentions (2026-08-15 harvest, report-ugrep §F3). The spans are a property of the file's bytes at query
+// time, so the ingest cache never carries them and no kCacheVersion moves when this changes — but they ARE
+// persisted since: the span-tier memo (ingest_astquery.h spanTierMemoLoad, its own kSpanTierMemoVersion)
+// writes one tier byte per span to disk, and reads each one back as external input.
+enum class SpanTier : std::uint8_t { Code = 0, Comment = 1, String = 2 };
+// The number of SpanTier values — the bound spanTierMemoLoad validates every memo tier byte against. A byte at
+// or past it used to reach search.h's grepApplySpanTiers, which counts hits into a per-tier array indexed by it.
+inline constexpr std::size_t kSpanTierCount = static_cast<std::size_t>( SpanTier::String ) + 1;
+static_assert( enumCountIsExact<SpanTier, kSpanTierCount>(), "kSpanTierCount must name the LAST SpanTier value — move it with the append" );
+
+// One file's comment/string spans. SoA, not an array of {start,end,tier} structs: the classify path binary-
+// searches `startByte` alone and touches the other two arrays at most once per lookup, so the search walks
+// a dense u32 array instead of striding over 12-byte records. Spans are sorted by startByte and never
+// overlap (the walk does not descend into a span it already classified), which is what makes the
+// upper-bound search below a complete classifier rather than a heuristic.
+struct SpanTierMap
+{
+    std::vector<std::uint32_t> startByte;   // inclusive
+    std::vector<std::uint32_t> endByte;     // exclusive
+    std::vector<std::uint8_t>  tier;        // SpanTier, one per span
+    bool                       isParsed = false;   // false ⇒ UNCLASSIFIABLE (no grammar, unreadable, binary,
+                                                    // or the tree-sitter parse failed) — see spanTierAt()
+};
+
+// Which tier a byte offset lands in. An UNPARSED map answers Code for every offset, and that default is
+// load-bearing honesty rather than a convenience: a caller that suppresses non-code rows must never
+// suppress a row it could not classify, so "we don't know" has to read as "keep it".
+inline SpanTier spanTierAt( const SpanTierMap& m, std::uint32_t byteOffset ) noexcept
+{
+    if( !m.isParsed || m.startByte.empty() )
+    {
+        return SpanTier::Code;
+    }
+    // last span whose start is <= byteOffset (std::upper_bound minus one); spans do not overlap, so at
+    // most this one can contain the offset.
+    const auto  it    = std::upper_bound( m.startByte.begin(), m.startByte.end(), byteOffset );
+    if( it == m.startByte.begin() )
+    {
+        return SpanTier::Code;
+    }
+    const std::size_t index = std::size_t( it - m.startByte.begin() ) - 1;
+    return ( byteOffset < m.endByte[index] ) ? SpanTier( m.tier[index] ) : SpanTier::Code;
+}
+
+// What one batched call parsed, so the caller can DISCLOSE it rather than imply completeness.
+// `parsedFileCount + unparsedFileCount == perFile.size()` always.
+struct SpanTierBatch
+{
+    std::vector<SpanTierMap> perFile;              // parallel to the paths handed in
+    std::uint32_t            parsedFileCount   = 0;
+    std::uint32_t            unparsedFileCount = 0;
+    std::uint64_t            bytesParsed       = 0;
+};
+
+// Parse each of `diskPaths` (on-disk paths, already resolved — this does not know about labeled multi-root
+// spellings) and return its comment/string spans, in the SAME order the paths arrived. Parallel over
+// hardware_concurrency() workers using the biggest-file-first work-stealing order astQueryGrouped's own
+// pool uses (E5 design condition 2), scoped to just these files: on the worst legal --grep shape E5 modelled
+// (100 hit files) that is what keeps a serial ~3.6 s ceiling at ~0.2 s. The CALLER owns the budget — this
+// function parses everything it is given, so bound the list before calling (search.h's grepApplySpanTiers
+// is the bounded caller, and discloses its own bail-out).
+//
+// DETERMINISM: which worker draws which file never reaches the result — every file writes only its own
+// slot, and each slot's spans are sorted on the file's own byte offsets.
+//
+// P4.1 `useMemo`: consult (and populate) the per-file span-tier memo — a stat-gated blob under the shared
+// cache-dir ladder that lets an unchanged file skip BOTH the read and the parse on a later run. The result
+// is byte-identical either way (the map is a pure function of the file's bytes and its grammar); false is
+// the --no-cache posture, and the only difference it makes is how long the answer takes. See
+// ingest_astquery.h's own header for the four freshness conditions and the disclosed warm-path-only limit.
+SpanTierBatch spanTiersOfFiles( std::span<const std::string> diskPaths, bool useMemo = true );
+
+// ---- §P0.1: the shape of a user's tree-sitter query, so a capture-less one is never a silent zero ----
+// astQuery reports CAPTURES, so a query that binds none matches nothing it can report:
+// `--match='(if_statement)'` returned a clean, confident hits="0" while `--match='(if_statement) @i'`
+// returned 5000. The zero was indistinguishable from a true negative and it already did damage — a capture
+// recorded `--match='(goto_statement)' → hits="0"` and that was read as "this repo has no gotos". It has two.
+//
+// The caller uses this to either AUTO-CAPTURE (safe only for a single top-level pattern: appending ` @m` to
+// it is exactly what the user would have typed) or REFUSE with the add-@name message — never to emit the
+// bare zero. Both flags are scanned OUTSIDE double-quoted strings, so an anonymous node like `"("` does not
+// unbalance the group count and an "@" inside a #match? argument is not mistaken for a capture.
+struct AstQueryShape
+{
+    bool hasCapture       = false;   // an @capture appears outside any string literal
+    bool isSingleTopLevel = false;   // exactly one top-level (…) or […] group, with nothing beside it
+    bool hasComment = false;         // a `;` line comment — an appended capture could land inside it
+    std::size_t maxDepth = 0;        // the deepest ( / [ nesting outside strings and comments
+};
+
+// The deepest ( / [ nesting a tree-sitter query may carry before codecortex hands it to ts_query_new. The query
+// compiler recurses once per level, and it runs on worker threads with a small stack: a --match query nested
+// 4,000 levels deep died with SIGBUS (exit 138), and 2,000 levels ran for over a minute. A structural query a
+// person or an agent writes nests a few dozen levels; deeper is refused by name before any compile.
+inline constexpr std::size_t kMaxAstQueryNesting = 256;
+
+inline AstQueryShape astQueryShape( std::string_view query )
+{
+    AstQueryShape shape;
+
+    // scan once: track string state + group depth, note the first group and whether anything follows it
+    int         depth = 0;
+    bool        inString = false, closedTopLevelGroup = false, sawContentAfterTopLevelGroup = false;
+    std::size_t topLevelGroupCount = 0;
+    for( std::size_t i = 0; i < query.size(); ++i )
+    {
+        const char c = query[i];
+        if( inString )
+        {
+            if( c == '\\' ) { ++i; continue; }                    // escape: skip the escaped byte
+            if( c == '"' )
+            {
+                inString = false;
+            }
+            continue;
+        }
+        if( c == '"' ) { inString = true; continue; }
+        // `;` starts a tree-sitter query line comment: everything to end-of-line is inert, so an `@` (or a
+        // group char) inside it must not count — `(goto_statement) ; @x` binds NOTHING and used to slip
+        // past this scan as "has a capture", resurrecting the bare hits="0" §P0.1 made unreachable.
+        if( c == ';' )
+        {
+            shape.hasComment = true;
+            while( i + 1 < query.size() && query[i + 1] != '\n' )
+            {
+                ++i;
+            }
+            continue;
+        }
+        if( c == '@' ) { shape.hasCapture = true; continue; }
+        if( c == '(' || c == '[' )
+        {
+            if( depth == 0 )
+            {
+                ++topLevelGroupCount;
+            }
+            ++depth;
+            shape.maxDepth = std::max( shape.maxDepth, static_cast<std::size_t>( depth ) );
+            continue;
+        }
+        if( c == ')' || c == ']' )
+        {
+            if( depth > 0 )
+            {
+                --depth;
+            }
+            if( depth == 0 )
+            {
+                closedTopLevelGroup = true;
+            }
+            continue;
+        }
+        if( depth == 0 && closedTopLevelGroup && !std::isspace( static_cast<unsigned char>( c ) ) )
+        {
+            sawContentAfterTopLevelGroup = true;
+        }
+    }
+
+    shape.isSingleTopLevel = ( topLevelGroupCount == 1 ) && ( depth == 0 ) && !inString && !sawContentAfterTopLevelGroup;
+    return shape;
+}
+
+inline bool astQueryNestsTooDeep( std::string_view query )
+{
+    return astQueryShape( query ).maxDepth > kMaxAstQueryNesting;
+}
+
+// ---- local-variable-indexing plan, Phase 2 (docs/LOCALS_INDEXING.md) ----
+// On-demand re-parse of ONE already-gated function's own byte span [sigStartByte, endByte) — reusing
+// Phase 1's cc_isCountableLocalDecl/cc_declHasStructuredBinding predicates so the SET of declarations this
+// walk visits is provably the same set Phase 1's `locals=` count already covers (no second, silently
+// divergent rule). C/C++ only (model.h::localsCountedLang; the caller must gate on it — this function
+// degrades to an empty result for any other lang rather than assert, since a caller mistake here is a
+// missing finding, not a memory-safety issue). NEVER cached, NEVER promoted into IngestResult/Symbol/the
+// call graph — call sites are expected to be RARE (only functions clearing naminglens.h's size+locals
+// gate), so a fresh re-parse per call is the right cost/simplicity tradeoff, not a hot-path concern.
+// `defBytes` = the exact substring `fileBytes.substr( sigStartByte, endByte - sigStartByte )` (a full
+// function/method definition, which parses standalone under the C/C++ grammar); `defStartLine` = the
+// 1-based file line `sigStartByte` falls on, so each fact's `line` is an ABSOLUTE file line, not a row
+// local to the re-parsed substring.
+std::vector<LocalNameFact> collectGatedLocalNames( std::string_view defBytes, std::uint32_t defStartLine, Lang lang );
+
+}   // namespace rw

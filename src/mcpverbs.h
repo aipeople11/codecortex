@@ -1,0 +1,5541 @@
+#pragma once
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include "infra/os.h"   // rw::os::open_memstream — the verb response buffers
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
+
+// mcpverbs.h — the per-verb text/JSON builders for --mcp: the pure functions each MCP
+// read/flagship verb dispatches to (analyzeToString / for / lego / owners / exemplar / impact /
+// uses / path_between / connect / quality_delta / fetch_body / batch, …). Each reuses the warm
+// McpIndex via getIndex() and returns the verb's answer body verbatim. Extracted from mcp.h (the
+// mcp.h/main.cpp concern-split). Includes mcpindex.h; included by mcp.h (runMcp dispatches here).
+
+#include "mcpindex.h"
+#include "nextverb.h"       // P3 (L7): next= on the MCP impact root (CLI parity)
+#include "gitmine.h"       // B3: gitRecentCommitFileSets + applyCoChangeBoost — the `for` verb's co-change prior (same boost as CLI --for)
+#include "ownersview.h"    // §P6.4: countUniformOwnership/ownershipRowsToPrint — shared with main.cpp's --owners CLI path
+#include "gitstamp.h"      // §P8: gitstamp::atAttr/stampAt — the at="<sha>[+dirty]" anchor on the git-history verbs
+#include "mention.h"       // B8: applyMentionBoost — the `for` verb's query-mention anchor (same default-on behavior as CLI --for)
+#include "filter.h"        // §P4: rankTierSymbolMultipliers — the fixture/present tier down-weight the CLI ranking lenses apply
+#include "redact.h"        // RedactCounts — the per-request redaction tally threaded through the body/doc verbs
+#include "forpage.h"    // L-W: the --for file page, coverage= and the thin rule — shared with the CLI twin
+#include "packtask.h"      // L4: the shared --pack-task / MCP explore+pack_task bundle assembler (packTaskBundleText)
+#include "partition.h"     // the explore verb's `partition` argument (packTaskPartitionText)
+#include "tracelocus.h"    // L4: the shared --from-trace / MCP from_trace bundle assembler (fromTraceBundleText)
+#include "editcheck.h"     // L4: the shared --edit-check / MCP edit_check contract-comparison core (editCheckBundleText)
+#include "callhierarchy.h"  // H14/M13: the shared 1-hop call-hierarchy computation — find_symbol / find_referencing_symbols
+#include "graphlegend.h"   // §H4 §3.4: the ONE counts_floor= marker + shared graph-count legend wording (CLI ≡ MCP)
+#include "crossref.h"      // the shared cross-branch content index (whereis / stray_content)
+#include "darkflags.h"     // the shared dark-content gate harvest (flags)
+#include "flipimpact.h"    // the flags verb's `symbol` argument: one gate's flip blast radius
+#include "docdrift.h"      // the shared doc-anchor verifier (doc_drift)
+#include "exemplar.h"      // §B6 M2: selectExemplar + kExemplarSelectionRule — the ONE selector/wording both surfaces use
+#include "mcprefusal.h"    // §B6 M7/M8/M9: the shared verb+field refusal table both MCP arms speak
+#include "compactlegend.h" // M1: applyCompactDialect — the batch sub-answer compaction (applyCompactToBatchSubs)
+#include "sarif.h"         // G1 (2026-08-15): rw::sarif::rootRelativeUri/rootPrefixOf — grepHitsJson's root-relative `file` (CLI ≡ MCP, no re-derivation)
+#include "slice.h"         // lane/tc-sliceat: the shared --slice / MCP slice def-use core (sliceBundleText — ONE emitter, two surfaces)
+#include "fielduses.h"     // the member-variable round: the ONE --uses=Owner.field renderer (renderFieldUses — CLI ≡ MCP)
+#include "testmap.h"       // lane/t10-mcp-coverage: writeAffectedReport — the shared --affected / `affected` verb renderer
+
+#include <filesystem>      // §B6 M3: the shared root-path existence/directory check (mcpRootRefusal below)
+#include <optional>        // mcpAnswerText / usesText: nullopt is an answer buffer that failed, never an empty answer
+#include <span>            // std::span — connectemit::rebuildFromLegs reads the caller's retained-leg mask
+
+namespace rw
+{
+
+// ─── §B6 M4: the ONE place both MCP arms read a paging window ────────────────────────────────────────────
+//
+// The `impact` and `whereis` legends both instructed "raise the default cap with limit=N (offset=M pages)"
+// — and no MCP tool declared either field, so passing them was silently ignored and the two answers were
+// byte-identical with and without them. §P15.3 killed that accept-and-ignore class on the CLI arm only.
+//
+// The knobs are now real rather than the sentence removed, because the underlying verbs already page
+// correctly (pageview.h's pageWindow/effectiveRowCap/pageDisclosure, and crossref's writeWhereisPage): the
+// CLI has had the window for these two verbs since §P8 and the MCP surface was simply not passing it.
+//
+// This reader exists so the two dispatch arms cannot drift: the live server's tools/call scope and the
+// batch verb's sub-query object are both flat JSON spans, so ONE extractor serves both and "does the batch
+// arm honor limit?" has one answer.
+//
+// ─── verifier N2/N3: PRESENT-BUT-INVALID is a refusal, not a default ─────────────────────────────────────
+//
+// M4 made limit/offset REAL; it did not make them HONEST. The original clampPos mapped every non-positive,
+// non-numeric and fractional value onto 0 = "absent", so `limit:0`, `limit:-1`, `limit:"abc"` and
+// `offset:-2` were accepted and silently ignored and `limit:3.9` was truncated to 3 — while the CLI twin
+// refuses all five loudly. `connect`'s radius was a notch worse: a bare `std::uint32_t(radArg)` cast, so
+// `radius:2^40` WRAPPED to 0 and clamped to radius="1" — a different question, answered with confidence,
+// under a number the caller never typed.
+//
+// mcpIntArg closes the whole class at ONE seam for both arms and every verb: ABSENT still means the verb's
+// own default (the un-paged answer stays byte-identical), and present-but-outside-the-domain returns the
+// mcprefusal.h sentence carrying the domain, the value as typed, and a runnable example.
+struct McpIntArg
+{
+    long long   value     = 0;    // meaningful only when isPresent && refusal.empty()
+    bool        isPresent = false;
+    std::string refusal;          // non-empty ⇒ the caller must refuse this request
+};
+
+inline McpIntArg mcpIntArg( const std::string& scope, const char* field, long long least, long long most )
+{
+    const mcpdetail::RawValue raw = mcpdetail::findRawValue( scope, field );
+    if( !raw.isPresent )
+    {
+        return {}; // absent ⇒ the verb's default, untouched
+    }
+
+    long long v = 0;
+    // a QUOTED integer still parses (findInt has always accepted "3", and a client that stringifies its
+    // numbers is not asking a different question); a quoted NON-integer falls through to the refusal.
+    if( !mcpdetail::parseWholeInt( raw.text, v ) || v < least || v > most )
+    {
+        return { 0, true, mcprefuse::badValueRefusal( field, raw.text ) };
+    }
+    return { v, true, {} };
+}
+
+// The STRING-typed twin (verifier N11). A field the inputSchema declares as a string, given as an ARRAY,
+// read as absent through findString — and `situational_awareness` then answered about `git diff` and
+// reported a clean working tree with total confidence. Absent still means the verb's default.
+//
+// W3FIX H5: N11 wired this into `files` and stopped there, so thirteen more schema-typed string fields kept
+// the bare findString path and kept silently ignoring a wrong-shaped value — including
+// `situational_awareness diff:["a","b"]`, which is the SAME confidently-wrong clean-tree answer one field
+// over, and `kind`/`symbol` across whereis / stray_content / flags / doc_drift / owners. Both arms now read
+// every string argument through here, so the shape check is a property of the reader, not of remembering.
+//
+// The decode reads the occurrence the SHAPE check accepted (raw.valuePos), not a second independent lookup —
+// with duplicate keys pinned first-wins (mcpjson.h) those are the same bytes, and saying so in code is what
+// keeps them the same bytes.
+struct McpStringArg { std::string value; std::string refusal; };
+
+inline McpStringArg mcpStringArg( const std::string& scope, const char* field )
+{
+    const mcpdetail::RawValue raw = mcpdetail::findRawValue( scope, field );
+    if( !raw.isPresent )
+    {
+        return {};
+    }
+    if( !raw.isQuoted )
+    {
+        return { {}, mcprefuse::badValueRefusal( field, raw.text ) };
+    }
+    return { mcpdetail::decodeStringAt( scope, raw.valuePos ), {} };
+}
+
+// The BOOLEAN-typed twin (P9, capture-audit 2026-09-04). `post_check` is the first schema-typed boolean
+// argument in this server, and it gets a reader for exactly the reason the string and int twins have one:
+// absent must mean the verb's default, a present-but-wrong-shaped value must REFUSE naming the field, and
+// neither may collapse into the other. The two JSON literals are the whole vocabulary — a quoted "false" is
+// a string, not a boolean, and is refused rather than guessed at (the badValueRefusal wording every other
+// typed reader uses).
+struct McpBoolArg { bool value = false; bool isPresent = false; std::string refusal; };
+
+inline McpBoolArg mcpBoolArg( const std::string& scope, const char* field )
+{
+    const mcpdetail::RawValue raw = mcpdetail::findRawValue( scope, field );
+    if( !raw.isPresent )
+    {
+        return {};
+    }
+    if( raw.isQuoted || ( raw.text != "true" && raw.text != "false" ) )
+    {
+        return { false, true, mcprefuse::badValueRefusal( field, raw.text ) };
+    }
+    return { raw.text == "true", true, {} };
+}
+
+// The ARRAY-typed twin (W3FIX M8). `symbols` / `queries` / `paths` are the three schema-typed arrays, and a
+// present-but-wrong-shaped value (`connect symbols:5`, `batch queries:5`, `analyze paths:5`) read as absent
+// through findArray — so both arms answered "missing required field: X" for a field the caller DID send,
+// which is exactly the absent-vs-wrong-shape collapse findRawValue exists to separate. The element-COUNT
+// domain lives here too, so `connect symbols:["main"]` gets the table's domain clause and a runnable example
+// instead of the bespoke "connect needs 2..16 symbols (got 1)" fourth dialect.
+//
+// `acceptsCsv` is a COLUMN, not a guess: `connect symbols` documents a lenient comma-string form, the other
+// two do not, and a reader that silently accepted a string for `queries` would be inventing a shape.
+struct McpArrayArg
+{
+    std::string              span;              // the '[…]' span (or the comma-string) exactly as typed; "" when absent
+    std::vector<std::string> strings;           // its "…" elements in order, or the split comma-string
+    bool                     isPresent = false;
+    std::string              refusal;           // non-empty ⇒ the caller must refuse this request
+};
+
+inline McpArrayArg mcpArrayArg( const std::string& scope, const char* field, bool acceptsCsv,
+                                std::size_t leastCount = 0, std::size_t mostCount = ~std::size_t( 0 ) )
+{
+    const mcpdetail::RawValue raw = mcpdetail::findRawValue( scope, field );
+    if( !raw.isPresent )
+    {
+        return {};
+    }
+
+    McpArrayArg out;
+    out.span      = raw.text;
+    out.isPresent = true;
+
+    if( raw.isArray )
+    {
+        out.strings = mcpdetail::arrayStrings( scope, field );
+    }
+    else if( acceptsCsv && raw.isQuoted )
+    {
+        // the documented lenient form: "a,b,c" → {a,b,c}. Empty fragments are dropped, not passed on as
+        // unresolvable symbol names, exactly as the pre-M8 hand-rolled split at the connect dispatch did.
+        const std::string csv = mcpdetail::decodeStringAt( scope, raw.valuePos );
+        for( std::size_t start = 0; start <= csv.size(); )
+        {
+            const std::size_t comma = csv.find( ',', start );
+            const std::string tok   = csv.substr( start, comma == std::string::npos ? std::string::npos : comma - start );
+            if( !tok.empty() )
+            {
+                out.strings.push_back( tok );
+            }
+            if( comma == std::string::npos )
+            {
+                break;
+            }
+            start = comma + 1;
+        }
+    }
+    else
+    {
+        return { raw.text, {}, true, mcprefuse::badValueRefusal( field, raw.text ) };
+    }
+
+    if( out.strings.size() < leastCount || out.strings.size() > mostCount )
+    {
+        out.refusal = mcprefuse::badValueRefusal( field, raw.text );
+    }
+    return out;
+}
+
+// The OBJECT-typed twin (§B6 M7), for the two envelope objects: `params` and `params.arguments`. findObject
+// returns "" for BOTH "absent" and "present but not an object", and that collapse was the quietest bug on the
+// surface: `arguments:5` — and the common host bug of sending `arguments` as a STRING of JSON — fell back to
+// the `params` scope, so the caller's `path` VANISHED and the verb answered about the default startup root
+// with total confidence (measured: files=6 for a request that named a 1-file subdir). Same class as the
+// wrong-shaped `paths` W3FIX M8 fixed one level down; this is that fix at the envelope.
+//
+// `null` reads as ABSENT, deliberately: JSON-RPC 2.0 forbids it, MCP hosts send it anyway for "no parameters"
+// (test/mcpreadloopcheck.sh's hostile corpus carries both `params:null` and `arguments:null`), and null
+// genuinely carries no arguments — which is what absent means. Refusing it would break handshakes for no
+// honesty gain. An ARRAY is refused rather than tolerated: positional params are legal JSON-RPC but this
+// server reads arguments BY NAME, so an array's contents could never be read and silence would drop them.
+struct McpObjectArg
+{
+    std::string span;                  // the '{…}' span exactly as typed; "" when absent
+    bool        isPresent = false;
+    std::string refusal;               // non-empty ⇒ the caller must refuse this request
+};
+
+inline McpObjectArg mcpObjectArg( const std::string& scope, const char* field )
+{
+    const mcpdetail::RawValue raw = mcpdetail::findRawValue( scope, field );
+    if( !raw.isPresent )
+    {
+        return {};
+    }
+    if( !raw.isQuoted && !raw.isArray && raw.text == "null" )
+    {
+        return {}; // "no parameters" — absent
+    }
+    if( raw.isQuoted || raw.isArray || raw.text.empty() || raw.text.front() != '{' )
+    {
+        return { {}, false, mcprefuse::badValueRefusal( field, raw.text ) };
+    }
+    return { mcpdetail::containerSpanAt( scope, raw.valuePos, '{', '}' ), true, {} };
+}
+
+// ─── §B6 M3: does `path` name a readable DIRECTORY? ONE check, for every index-backed verb ────────────────
+//
+// The false-zero class (see mcprefusal.h's rootRefusal for the finding): a nonexistent path and a file-as-path
+// both produced all-zero SUCCESS reports. The check is ONE call in dispatchMcpLine, placed after the `paths`
+// rebind and the workspace/default-root policy gates and BEFORE the dispatch chain, because the sibling sweep
+// showed the damage is not limited to the six verbs that answer zeros: the other verbs "refuse", but with a
+// FALSE CAUSE ("symbol not found: 'distance'" when there is no tree to look in, "not a git repository" for a
+// path that does not exist at all). One shared check makes all 30 name the real condition, and none of them
+// reaches getIndex() first.
+//
+// A registered multi-root workspace KEY is not a filesystem path (it is the \x1f-joined realpath join), so the
+// key's own ROOTS are checked instead — the check must never stat a key, and the refusal must never render one.
+inline std::string mcpRootDirRefusal( const std::string& dir )
+{
+    std::error_code                     ec;
+    const std::filesystem::file_status  st = std::filesystem::status( std::filesystem::path( dir ), ec );
+    if( ec || !std::filesystem::exists( st ) )
+    {
+        return mcprefuse::rootRefusal( mcprefuse::RootFault::Missing, dir );
+    }
+    if( !std::filesystem::is_directory( st ) )
+    {
+        return mcprefuse::rootRefusal( mcprefuse::RootFault::NotADirectory, dir );
+    }
+    return {};
+}
+
+// is `path` a REGISTERED multi-root workspace key (2+ roots), rather than a plain directory path? The one
+// predicate both the root check above and the single-root verb refusals (§B6 M9) ask.
+inline bool isMcpMultiRootPath( const std::string& path )
+{
+    const auto it = mcpWorkspaceRegistry().find( path );
+    return it != mcpWorkspaceRegistry().end() && it->second.size() >= 2;
+}
+
+inline std::string mcpRootRefusal( const std::string& path )
+{
+    const auto it = mcpWorkspaceRegistry().find( path );
+    if( it != mcpWorkspaceRegistry().end() && it->second.size() >= 2 )
+    {
+        for( const WorkspaceRoot& r : it->second )
+        {
+            if( const std::string rootErr = mcpRootDirRefusal( r.arg ); !rootErr.empty() )
+            {
+                return rootErr;
+            }
+        }
+        return {};
+    }
+    return mcpRootDirRefusal( path );
+}
+
+// The paging pair, read through mcpIntArg so both fields speak the one refusal. `kMcpPageValueMax` restates
+// cli.h's kPageValueMax (parsePosInt's own ceiling) so the MCP arm accepts exactly the CLI's range — the two
+// headers cannot include each other, so the number is restated with its source named rather than guessed.
+struct McpPageArgs  { int limit = 0; int offset = 0; };
+struct McpPageParse { McpPageArgs page; std::string refusal; };
+
+inline constexpr long long kMcpPageValueMax = 1000000000;   // == cli.h's kPageValueMax
+
+// W3FIX M5: memory_recall's `top_k` ceiling, formerly an UNDECLARED silent clamp — `top_k:2^40` came back as
+// 1000 documents with nothing saying so, which is the accept-and-ignore class wearing a plausible number.
+// It is a declared DOMAIN now: the tools/list stanza states 1..1000, mcprefusal.h's row states it, and a
+// value outside the band is refused rather than quietly rewritten (the §B8.1 ruling, same as radius).
+inline constexpr long long kMcpRecallTopKMax = 1000;
+
+// C1 F-07: the verb-side fold of pageview.h's effectiveRowCap — "an explicit limit beats the verb's own
+// display default" in ONE place on this surface too. It exists because writing that line twice, once in
+// flagsText and once in flipText, is what --quality-delta reads as a new clone of a reused helper, and it
+// is right to: two copies of a cap decision is one more than the contract needs.
+inline std::size_t mcpRowCap( int pageLimit, std::size_t verbDefault ) noexcept
+{
+    return std::size_t( rw::effectiveRowCap( pageLimit, int( verbDefault ) ) );
+}
+
+inline McpPageParse mcpPageArgs( const std::string& scope )
+{
+    const McpIntArg limitArg = mcpIntArg( scope, "limit", 1, kMcpPageValueMax );
+    if( !limitArg.refusal.empty() )
+    {
+        return { {}, limitArg.refusal };
+    }
+
+    const McpIntArg offsetArg = mcpIntArg( scope, "offset", 0, kMcpPageValueMax );
+    if( !offsetArg.refusal.empty() )
+    {
+        return { {}, offsetArg.refusal };
+    }
+
+    return { { int( limitArg.value ), int( offsetArg.value ) }, {} };   // absent ⇒ 0 ⇒ the un-paged window
+}
+
+// ─── W3FIX M4: the unknown-ARGUMENT refusal, for both arms ───────────────────────────────────────────────
+//
+// The near-miss class in one sentence: `explore` honors `budget_tokens`, and `token_budget` / `max_tokens`
+// were read by nothing and silently dropped — the bundle came back at the default with nothing saying the
+// budget had been ignored. Rather than adding the two aliases and waiting for the fourth name, an argument
+// the verb's inputSchema does not declare is REFUSED, with a near-miss against that verb's own field set
+// (which is what makes `token_budget` → `budget_tokens` land) and the set listed for recovery.
+//
+// One helper, both arms: the live server passes its `arguments` scope and the tool name; the batch arm passes
+// one sub-query object and the batch item schema. `declared` is a PARAMETER rather than a lookup inside,
+// because those really are two different schemas — pretending otherwise is how a shared helper starts lying
+// about one of its callers.
+inline std::string mcpUnknownFieldRefusal( const std::string& scope, std::string_view verb,
+                                           std::span<const std::string_view> declared )
+{
+    if( declared.empty() )
+    {
+        return {}; // an unadvertised name — the unknown-TOOL refusal owns that request
+    }
+
+    for( const std::string& field : mcpdetail::objectKeys( scope ) )
+    {
+        if( !mcprefuse::isFieldAccepted( declared, field ) )
+        {
+            return mcprefuse::unknownFieldRefusal( verb, field, declared );
+        }
+    }
+    return {};
+}
+
+// Capture one FILE*-writing renderer into a string — infra/emit.h's ONE renderToString seam (whose Rendered sink
+// discloses a failure as ok == false; this surface keeps only the text). It kept its own copy of the memstream dance until the review of #214
+// gave the tree a single seam for it; the contract is unchanged (an allocation failure is an empty string,
+// never a NULL deref), and it now also ALERTS, which this copy never did.
+inline std::string captureXml( const std::function<void( std::FILE* )>& render )
+{
+    return rw::renderToString( render ).text;
+}
+
+// The seven verbs below that render into their own memstream (for, owners, exemplar, impact, uses, path_between,
+// connect) all finish it the same way, so they finish it HERE: the answer's bytes only when rw::MemoryStream::finish
+// says the buffer is whole, and nullopt when it is not. A lost write left a hole in the answer, so each caller answers
+// exactly what it answers when the open fails, never the short bytes. The stream itself closes and frees on every path.
+inline std::optional<std::string> mcpAnswerText( rw::MemoryStream& stream )
+{
+    const rw::MemoryStreamBytes answer = stream.finish();
+    if( !answer.isWhole )
+    {
+        DISCLOSE( Diagnostics::answerRefused, "every caller answers the MCP internal error (-32603) it gives a failed open; no short answer is served",
+                  "mcp: an answer buffer did not finish whole — this verb answers as if the buffer never opened" );
+        return std::nullopt;
+    }
+    return std::string( answer.bytes );
+}
+
+// full pipeline on a dir → XML captured into a string (captureXml, above).
+//
+// §B6 M1 — the two COMPLETENESS gauges are passed, not nulled. This front door handed serialize() null
+// ambOut/unresolvedOut, and serialize prints a null accumulator as a hard `ambiguous=0 unresolved=0`
+// (unlike `precise=`, which it OMITS when null) — so the agent surface claimed a perfectly resolved call
+// graph where the CLI's same map reports thousands of guessed calls, and the 35 per-row `amb=` markers the
+// legend advertises never appeared. The counters already live on the warm index's graph (g.ambOut /
+// g.unresolvedOut, filled by buildGraph's resolve loop); nothing is computed here that was not computed
+// before, it is only no longer discarded on the way to the emitter.
+//
+// §B6 M10 — statsFirstScreen: the MCP server runs `stable` by default (main.cpp's --mcp turns it on), which
+// moves the files=/symbols=/shown=/order= stanza to a TRAILING comment. That is a CLI KV-cache optimization;
+// on this surface it left the first screen with no denominator and no order marker. One argument, one
+// placement change, same single emission.
+//
+// The same call also passes outProv and bindLabel, on the SAME reasoning and with the same emptiness
+// convention main.cpp uses (`empty() ? nullptr : &`). outProv is the per-EDGE confidence axis and carries
+// more than SCIP: FFI binding provenance (prov="binding") and, since C1, the arms of a k-way split the
+// resolver could not choose between (prov="split"), both of which this tree has with no --scip anywhere —
+// so withholding it dropped a real edge-provenance fact and a real bind= identity from the agent's map.
+// (Found by test/mcpclidiffcheck.sh, which is the point of having it: the first version of this fix
+// null-passed both and explained the absence away.)
+//
+// CORRECTION, C1 (Round C lane B): the sentence this comment used to carry — "`precise=` is NOT a SCIP-only
+// attribute … which this tree has (precise="3")" — was reasoning from a bug, not describing a design.
+// `precise=` means "edges a SCIP index PINNED"; the counter summed every non-zero outProv, so this tree's
+// precise="3" was 3 FFI binding edges reported as index-pinned. serialize.h now counts value 1 alone and
+// omits the attribute at zero. outProv is still passed here, for the reason above.
+inline std::string analyzeToString( const std::string& root, int topK, bool stable = false )
+{
+    const McpIndex& ix = getIndex( root );                  // parse once, reuse across calls
+    // ── verifier FINDING E3 (2026-08-19): this verb is the default map's own MCP twin and serialize() has
+    //    taken a rootArg since the root-relative round — this call site simply never passed it, so the same
+    //    corpus answered the CLI question with `src/main.cpp` and the MCP twin of that question with the
+    //    absolute path (85 rows on codecortex's own tree). Same single-root condition every other MCP verb
+    //    uses; serialize() emits root= and the shared legend clause from there, so nothing else moves.
+    const std::string_view anRootArg = ix.ing.realPaths.empty() ? std::string_view( root ) : std::string_view();
+    return captureXml( [ & ]( std::FILE* f )
+                       { serialize( f, ix.ing, ix.rank, ix.g.outOff, ix.g.outTargets, topK,
+                                    /*mostImportantLast=*/false, /*metrics=*/false, /*fanIn=*/nullptr,
+                                    &ix.g.ambOut, stable,
+                                    ix.g.outProv.empty() ? nullptr : &ix.g.outProv,
+                                    /*cbo=*/nullptr, /*tested=*/nullptr,
+                                    /*lcom4=*/nullptr, /*amp=*/nullptr, &ix.g.unresolvedOut,
+                                    ix.g.bindLabel.empty() ? nullptr : &ix.g.bindLabel,
+                                    /*autoOrder=*/false, /*outEstTokens=*/nullptr,
+                                    /*extraPayloadTokens=*/0,
+                                    // W2-F: the map's convergence disclosure. The CLI map carries pr_iters= and
+                                    // this one must too — "the clause landed at 3 of its 5 echo sites" is the
+                                    // §B4 family, and mcpclidiffcheck is the gate that keeps the two surfaces one.
+                                    /*ann=*/rw::MapAnnotations{ .prDisclosure = ix.prDisclosure },
+                                    /*statsFirstScreen=*/true, anRootArg, &ix.g.locPinOut, ix.g.externalCalls, &ix.g.declinedOut ); } );
+}
+
+// `rank_by` verb (lane/t10-mcp-coverage): the MCP twin of --rank-by=pagerank|authority|hub|rrf — the SAME
+// map `analyze` serves, ranked by a different signal, through the SAME renderer (serialize(), the SAME
+// captureXml idiom analyzeToString uses just above) — never a forked emitter. `mode` is the CLI's own
+// closed-value spelling ("pagerank"/"authority"/"hub"/"rrf"); an unrecognised value degrades to "pagerank"
+// (the CLI's own default RankBy), so the dispatcher only needs to validate the CLOSED SET once, at the call
+// site, before reaching here.
+//
+// churn / churn-decay are NOT reachable through this front door: their CLI implementation (main.cpp
+// churnRankedGraph) is wired through MainDispatch/Config — the parsed-argv object this stdio server never
+// builds — and mining git history for a ranking prior is a materially bigger lift than swapping in a
+// pre-computed rank vector. The dispatch arm in mcp.h refuses those two values by name rather than silently
+// downgrading to pagerank (Honesty in output is a feature: a named gap, never a quiet substitution).
+//
+// DELIBERATELY NOT `ix.rank`: the warm index's cached vector is working-set-PERSONALIZED (mcpindex.h
+// feature 2, Cody-style — teleport-biased toward the uncommitted diff as of the last rebuild), which is
+// what `analyze` serves and is right for that verb, but the CLI's `--rank-by=pagerank|authority|hub|rrf`
+// runs a PLAIN `rankGraph(g)` with no working-set bias (main.cpp's `else` arm) — the `ix.rank` shortcut
+// would make this verb NOT byte-identical to its CLI twin on a dirty tree, which is exactly the parity
+// this lane is required to hold. A fresh, uniform-teleport run costs one extra power iteration per call;
+// correctness over that call's own CLI-parity gate wins the trade.
+inline std::string rankByText( const std::string& root, std::string_view mode, int topK, bool stable = false )
+{
+    const McpIndex& ix = getIndex( root );
+
+    RankDisclosure      plainDisclosure;
+    std::vector<float>  plainRank = takeRank( rankGraph( ix.g ), plainDisclosure );   // CLI parity: rankGraph(g), no working-set bias
+
+    std::vector<float> rank;
+    RankDisclosure      disclosure;   // default: isPageRank=false — HITS rankings disclose no pr_iters=/pr_converged=
+    const char*         rankByLabel = nullptr;   // nullptr ⇒ pagerank, the CLI's own windowless-label convention (§B2.1)
+
+    if( mode == "authority" || mode == "hub" || mode == "rrf" )
+    {
+        auto [ authority, hub ] = hits( ix.g );   // HITS runs ALONGSIDE PageRank — does not replace it (graph.h)
+        if( mode == "rrf" )
+        {
+            rank        = rrfFuse( { &plainRank, &authority, &hub } );   // fuse pagerank + authority + hub, CLI parity
+            disclosure  = plainDisclosure;   // rrf keeps pagerank's disclosure — pagerank is one of the three fused vectors
+            rankByLabel = "rrf";
+        }
+        else
+        {
+            rank        = ( mode == "hub" ) ? std::move( hub ) : std::move( authority );
+            rankByLabel = ( mode == "hub" ) ? "hub" : "authority";
+        }
+    }
+    else   // "pagerank" (and the closed-set default)
+    {
+        rank       = std::move( plainRank );
+        disclosure = plainDisclosure;
+    }
+
+    const std::string_view rbRootArg = ix.ing.realPaths.empty() ? std::string_view( root ) : std::string_view();
+    return captureXml( [ & ]( std::FILE* f )
+                       { serialize( f, ix.ing, rank, ix.g.outOff, ix.g.outTargets, topK,
+                                    /*mostImportantLast=*/false, /*metrics=*/false, /*fanIn=*/nullptr,
+                                    &ix.g.ambOut, stable,
+                                    ix.g.outProv.empty() ? nullptr : &ix.g.outProv,
+                                    /*cbo=*/nullptr, /*tested=*/nullptr,
+                                    /*lcom4=*/nullptr, /*amp=*/nullptr, &ix.g.unresolvedOut,
+                                    ix.g.bindLabel.empty() ? nullptr : &ix.g.bindLabel,
+                                    /*autoOrder=*/false, /*outEstTokens=*/nullptr,
+                                    /*extraPayloadTokens=*/0,
+                                    /*ann=*/rw::MapAnnotations{ .rankByLabel = rankByLabel, .prDisclosure = disclosure },
+                                    /*statsFirstScreen=*/true, rbRootArg, &ix.g.locPinOut, ix.g.externalCalls, &ix.g.declinedOut ); } );
+}
+
+// ─── the cross-branch + dark-content MCP twins (`whereis`, `stray_content`, `flags`) ───
+// Each is a thin front door onto the SAME computation + the SAME renderer its CLI sibling calls
+// (crossref.h / darkflags.h), captured with the open_memstream idiom above — one XML shape, two surfaces,
+// no forked logic. Unlike `merge_scout` (CLI-only: it takes a hand-authored ref LIST), these three take no
+// multi-ref UX — a symbol, an optional substring filter, nothing else — so they carry over cleanly.
+//
+// `stray_content` and `whereis` read OTHER refs' blobs, which the MCP index never ingested; they use `root`
+// only, and deliberately do NOT touch getIndex() (no rebuild, no staleness coupling). `flags` DOES need the
+// crawled file list, so it goes through getIndex() like every other index-backed verb.
+
+// `whereis` verb: which ref's tree defines or mentions SYM. "" ⇒ not a git repo (the caller reports it).
+//
+// §A7: this surface passes NO WhereisEvidence, so its HEAD rows keep the lexical shape heuristic and the root
+// says so (head_labels="lexical"). That is deliberate and is the paragraph above's rule, not an oversight:
+// supplying the index's def sites means calling getIndex(), which would couple this verb to index staleness
+// for the sake of a LABEL. The CLI, which has already built an index for the run, supplies them.
+//
+// §B6 M4: `page` is the request's limit/offset (mcpPageArgs, above). writeWhereisPage is the SAME entry
+// point the CLI --whereis calls with cfg.pageLimit/cfg.pageOffset, so the legend's "raise the default cap
+// with limit=N (offset=M pages)" is now true on this surface too, with the same has_more=/next_offset=
+// disclosure that lets a paging loop terminate. Defaulted to {} ⇒ byte-identical to the un-paged answer.
+//
+// L6 (capture-audit 2026-09-04, lane L5's found-not-fixed): the SEED and the NEAR-MISS now cross to this
+// surface. Two facts, both index questions, both previously CLI-only:
+//   * `@FILE:LINE` — a documented selector spelling. The CLI resolves it before scanning anything; here it
+//     fell through as a LITERAL and grepped the string "@src/arch.h:507" across 4,867 blobs, reporting a
+//     true and useless hits="0" shaped exactly like a name this repo never had. An agent holding a diff
+//     hunk or a stack frame — the caller this spelling exists for — got the wrong answer, confidently.
+//   * the near-miss on a zero — "is this a name this repo never had, or a keystroke away from one it has?"
+// The header above says this verb deliberately avoids getIndex(), and that reasoning is intact and kept:
+// it was about supplying def sites for a LABEL (head_labels= stays "lexical" here, which the root still
+// discloses), not about resolving the caller's own selector or explaining a zero. Both calls below are
+// LAZY — the seed one only when the selector starts with '@', the near-miss one only on an empty hit list
+// — so the ordinary request still touches no index and pays nothing. On an unresolvable seed the function
+// returns "" with `seedFault` set, and the dispatcher speaks the shared refusal triple over -32602 rather
+// than answering a question the caller did not ask.
+inline std::string whereisText( const std::string& root, const std::string& symbol, const std::string& filter,
+                                std::size_t maxHits, McpPageArgs page = {}, bool* seedFault = nullptr )
+{
+    std::string sel = symbol;
+    std::string seedSpec;
+    if( !sel.empty() && sel.front() == '@' )
+    {
+        const std::vector<NodeId> seeded = resolveAllByNameQualified( getIndex( root ).ing, sel );
+        if( seeded.empty() )
+        {
+            if( seedFault != nullptr ) { *seedFault = true; }
+            return {};
+        }
+        seedSpec = sel;
+        sel      = getIndex( root ).ing.symbols[ seeded.front() ].name;
+    }
+    crossref::WhereResult res = crossref::computeWhereis( root, sel, filter );
+    if( !res.ok )
+    {
+        return {};
+    }
+    res.seedSpec = std::move( seedSpec );
+    // The tree zero stays an answer; the near-miss only says WHICH zero it is. Computed only on the zero,
+    // so a real hit list costs nothing and is byte-identical to before.
+    if( res.hits.empty() )
+    {
+        res.nearMiss = didYouMean( getIndex( root ).ing, sel );
+    }
+    return captureXml( [ & ]( std::FILE* f ) { crossref::writeWhereisPage( f, res, maxHits, page.limit, page.offset ); } );
+}
+
+// `stray_content` verb: per ref, the content its own divergent work authored that the live line lacks.
+// M13: --stray-content is in cli.h's honorsPaging set — writeStrayContentPage is the entry point the
+// CLI already calls with cfg.pageLimit/cfg.pageOffset, so the twin passes the same pair rather than 0,0.
+inline std::string strayContentText( const std::string& root, const std::string& filter, std::size_t maxFiles,
+                                     McpPageArgs page = {} )
+{
+    const crossref::StrayResult res = crossref::computeStrayContent( root, filter );
+    if( !res.ok )
+    {
+        return {};
+    }
+    return captureXml( [ & ]( std::FILE* f ) { crossref::writeStrayContentPage( f, res, maxFiles, page.limit, page.offset ); } );
+}
+
+// `flags` verb: the dark-content dashboard. Index-backed (it needs the crawled file list).
+// C1 F-07 (2026-09-10): --flags joined cli.h's honorsPaging set when its per-gate <read> listing became
+// windowable, so the twin takes the same pair rather than 0,0 — M13's rule is that a CLI verb that pages has
+// a twin that pages, and test/mcpcontractcheck.sh (G) derives that set from kPagingHonoringVerbs itself.
+inline std::string flagsText( const std::string& root, const std::string& filter, std::size_t maxSites,
+                              McpPageArgs page = {} )
+{
+    const McpIndex& ix = getIndex( root );
+    const darkflags::FlagsResult res = darkflags::computeFlags( ix.ing, root, {}, filter );
+    return captureXml( [ & ]( std::FILE* f ) { darkflags::writeFlags( f, res, mcpRowCap( page.limit, maxSites ), page.offset ); } );
+}
+
+// `flags` verb with the optional `symbol` argument = the CLI's `--flags --flip=NAME`: the blast radius of
+// turning ONE gate on. An ARGUMENT rather than a 31st verb, because it is the same question at a different
+// zoom (list every gate / size this one) and the caller already has the gate name from the list. Also
+// index-backed, and unlike the plain lane it needs the call graph too (ix.g). "" ⇒ no such gate: the
+// handler turns that into a -32602 naming the near-misses, never an empty-looking success.
+inline std::string flipText( const std::string& root, const std::string& gate, std::size_t maxRows,
+                             std::vector<std::string>& nearMissesOut, McpPageArgs page = {} )
+{
+    const McpIndex&                  ix  = getIndex( root );
+    const flipimpact::FlipResult     res = flipimpact::computeFlip( ix.ing, ix.g, root, {}, gate, page.limit );
+    if( !res.ok ) { nearMissesOut = res.nearMisses; return {}; }
+    return captureXml( [ & ]( std::FILE* f ) { flipimpact::writeFlip( f, res, ix.ing, root, mcpRowCap( page.limit, maxRows ), page.offset ); } );
+}
+
+// `doc_drift` verb: the markdown docs' checkable anchors vs the live index. Index-backed —
+// it needs both the crawled file list AND the symbol table, so it goes through getIndex() like `flags`.
+// M13: --doc-drift is in cli.h's honorsPaging set; writeDocDriftPage is the paged entry point.
+inline std::string docDriftText( const std::string& root, const std::string& filter, std::size_t maxPerDoc,
+                                 McpPageArgs page = {} )
+{
+    const McpIndex& ix = getIndex( root );
+    const docdrift::DriftResult res = docdrift::computeDocDrift( ix.ing, root, {}, filter );
+    return captureXml( [ & ]( std::FILE* f ) { docdrift::writeDocDriftPage( f, res, maxPerDoc, /*gateability=*/false, page.limit, page.offset ); } );
+}
+
+// build ing+graph for `root`, resolve `name`, return a JSON object: the symbol + its callers
+// (in-edges) and — unless referencingOnly — its callees (out-edges). "" if the symbol isn't found.
+// (find_symbol / find_referencing_symbols — the Serena/LocAgent agent verbs, answered from the CSR.)
+// H14/M13 (capture-audit 2026-09-04): this verb used to resolve ONE definition (resolveFocus), walk the CSR
+// in raw node order, and emit `{name,kind,file,line,handle}` rows under a `symbol` object — which meant an
+// MCP caller got, versus the CLI twin it is advertised as:
+//   * no `defs=`      — the CLI unions the neighbours of EVERY definition of the name and says how many
+//                       there were; this walked one and said nothing, so "26 callers" could silently be
+//                       one definition's share of a name with three.
+//   * no `count=`     — no un-windowed total, so no denominator for the rows served.
+//   * no test lens    — `hop_tested=`/`hop_untested=` on the root and `tested` per row, the exact partition
+//                       --test-gate is built on, were absent with nothing saying so.
+//   * no page 2       — the CLI pages (kCallHierarchyRowCap, --limit/--offset); this served an unbounded
+//                       first-and-only page.
+// It now runs callhierarchy.h's shared computation — the same resolution, the same union, the same
+// tier-then-path order — and renders it with the same disclosures, paged through the same pageview.h
+// window every other paged MCP verb uses. `page` defaults to {} ⇒ the default cap, exactly as the CLI's
+// un-paged call behaves. Gates: test/mcpattrparitycheck.sh, test/mcpcontractcheck.sh's paging arm.
+inline std::string symbolQueryJson( const std::string& root, const std::string& name, bool referencingOnly,
+                                    McpPageArgs page = {} )
+{
+    const McpIndex&     ix  = getIndex( root );
+    const IngestResult& ing = ix.ing;
+    const Graph&        g   = ix.g;
+
+    const CallHierarchyRows chRows = rw::callHierarchyRows( ing, g, name, /*wantCallers=*/referencingOnly );
+    if( chRows.matches.empty() )
+    {
+        return {};
+    }
+    // find_symbol serves BOTH directions from one call (the CLI needs two), so the caller-side rows are
+    // collected with a second pass in the callee direction — one computation each, never a hand-rolled walk.
+    const CallHierarchyRows chCallers = referencingOnly
+                                            ? CallHierarchyRows{}
+                                            : rw::callHierarchyRows( ing, g, name, /*wantCallers=*/true );
+    const std::vector<NodeId>& calledBy = referencingOnly ? chRows.rows : chCallers.rows;
+    const std::vector<NodeId>& calls    = chRows.rows;
+
+    // R-E fix (2026-08-19): root-relative "file" values + a "root" key. An agent that reads `file` here and
+    // `p=` from callers/callees in the same task must not be handed two path dialects for one tree.
+    const bool         sqSingleRoot = ing.realPaths.empty();
+    const std::string  sqRootPrefix = sqSingleRoot ? sarif::rootPrefixOf( root ) : std::string();
+
+    // A6: the tested/untested partition over the ROWS THIS ANSWER SERVES — computed once over the direction
+    // whose counts the root reports (`calledBy` for find_referencing_symbols, matching the CLI --callers
+    // root it twins), and reused per row so `tested` is the same predicate the CLI prints.
+    const HopTestedPartition chTested = computeHopTestedPartition( ing, g, referencingOnly ? calledBy : calls );
+
+    const auto symObj = [ & ]( NodeId id ) -> std::string
+    {
+        const Symbol& s = ing.symbols[id];
+        // T4: attach the stable content-handle so the agent can `fetch_body{handle}` instead of us re-sending
+        // the body. Names/signatures by default (this verb); bodies by handle on request.
+        // A6: `tested` is emitted only when true — the "absence-meaningful, never a literal false" convention
+        // every other tested= site follows, so an untested row costs zero bytes on either surface.
+        return std::string( "{\"name\":\"" ) + mcpdetail::jsonEscape( s.name )
+             + "\",\"kind\":\"" + symTag( s.kind )
+             + "\",\"file\":\"" + mcpdetail::jsonEscape( std::string( sqSingleRoot ? sarif::rootRelativeUri( ing.files[ s.fileId ], sqRootPrefix )
+                                                                                   : std::string_view( ing.files[ s.fileId ] ) ) )
+             + "\",\"line\":" + std::to_string( s.line )
+             + ",\"handle\":\"" + mcpdetail::jsonEscape( handleFor( ix, id ) ) + "\""
+             + ( rw::isTestedByReach( ing, chTested.testReach, id ) ? ",\"tested\":true" : "" )
+             + "}";
+    };
+    const auto rowArray = [ & ]( const std::vector<NodeId>& ids, const PageWindow& w ) -> std::string
+    {
+        std::string a = "[";
+        for( std::size_t i = w.begin; i < w.end; ++i )
+        {
+            if( i != w.begin ) { a += ","; }
+            a += symObj( ids[i] );
+        }
+        a += "]";
+        return a;
+    };
+
+    // The page window applies to the direction the root's count= describes; find_symbol's second array is
+    // windowed by the same limit so one `limit` never means two different sizes in one answer.
+    const int        rowCap    = effectiveRowCap( page.limit, rw::kCallHierarchyRowCap );
+    const PageWindow pwPrimary = pageWindow( referencingOnly ? calledBy.size() : calls.size(), rowCap, page.offset );
+    const PageWindow pwSecond  = pageWindow( calledBy.size(), rowCap, page.offset );
+    const std::size_t rowTotal = referencingOnly ? calledBy.size() : calls.size();
+    const bool  discloseCap    = ( pwPrimary.end - pwPrimary.begin ) < rowTotal;
+    char        pab[ kPageDisclosureCap ];
+
+    std::string out = "{";
+    if( sqSingleRoot )
+    {
+        out += "\"root\":\"" + mcpdetail::jsonEscape( root ) + "\",";
+    }
+    out += "\"symbol\":" + symObj( chRows.matches.front() );
+    // §P10.6 / A6, in the CLI's own key names: defs= = definitions the name resolved to (the rows below are
+    // the UNION of all of their neighbours), count= = the un-windowed row total, hop_tested/hop_untested =
+    // the partition over that full set.
+    const auto [ chNextSelector, chNextIsBare ] = callHierarchyNextSelector( ing, chRows, name, referencingOnly );
+    out += ",\"defs\":" + std::to_string( chRows.matches.size() )
+         + ",\"count\":" + std::to_string( rowTotal )
+         + ",\"hop_tested\":" + std::to_string( chTested.tested )
+         + ",\"hop_untested\":" + std::to_string( chTested.untested )
+         + declinedCallsKeyJson( chRows.declinedCalls )   // the CLI root's declined_calls=, for the direction count= describes
+         + nextFieldJson( nextFlag( referencingOnly ? "--uses=" : "--expand=", chNextSelector ) );   // P3 (L7): the CLI root's next= (mcpattrparitycheck)
+    if( !referencingOnly && chRows.bodylessDefs > 0 )
+    {
+        out += ",\"bodyless_defs\":" + std::to_string( chRows.bodylessDefs );
+    }
+    // H1: the decl→def widening's residue, the CLI root's unproven_defs=. These two verbs take the SAME
+    // `file:name` selectors through the SAME resolver, so an MCP client asking about `api.h:helper` met the
+    // identical silent zero the CLI did. Absent at zero, both directions, through the same spelling helper
+    // the CLI root uses, so the two surfaces cannot disagree about the number.
+    //
+    // NOT named in the tools/list key lists, and that is a decision, not an omission: a draft that added it
+    // to find_symbol's and find_referencing_symbols's descriptions took the manifest to 42,433 B against
+    // mcpmanifestcheck's 42,200 B per-session ceiling, and that gate's standing rule is that the ceiling
+    // moves for a DECLARED argument's obliged bytes and never for prose (it has a recorded precedent of
+    // deleting a 43 B clause rather than re-anchoring around it). The key travels self-named in the payload,
+    // which is where the disclosure has to be — the same posture bodyless_defs= already holds here.
+    out += unprovenDefsKeyJson( chRows.unprovenDefs );
+    out += pageDisclosure( pab, sizeof( pab ), pwPrimary.end - pwPrimary.begin, rowTotal, pwPrimary.end,
+                           page.limit, page.offset, discloseCap, kJsonPageSyntax );
+    out += ",\"calledBy\":" + rowArray( calledBy, referencingOnly ? pwPrimary : pwSecond );
+    if( !referencingOnly )
+    {
+        out += ",\"calls\":" + rowArray( calls, pwPrimary );
+    }
+    // §H4 §3.4: find_symbol / find_referencing_symbols are the MCP twins of --callees / --callers, so the
+    // calledBy/calls arrays are the SAME floor the CLI rows are. JSON carries no comment node, so the marker
+    // travels as the key alone; the wording that explains it lives in these two verbs' tools/list
+    // descriptions, which is where an MCP client reads prose.
+    //
+    // V3 L-6: that claim used to also name "the twinned XML surfaces", and it was only HALF true — the
+    // descriptions carried the floor prose but not the counting-unit half, so a JSON caller was pointed at a
+    // document that answered one of the two questions. Both halves are in the two descriptions now (mcp.h),
+    // and the cross-reference to the XML surfaces is gone, because a JSON client does not read them.
+    out += graphCountFloorAttrJson( g );   // M15: gauge + marker
+    out += "}";
+    return out;
+}
+
+// `grep` verb: parallel literal scan, each hit annotated with its enclosing symbol. V1-2:
+// this payload silently served a row cap with no disclosure — and the §A1 collection
+// split changed the served count (an undisclosed cap means an undisclosable change). Now the two grep
+// halves run separately so the payload can say what the CLI says: total= (all collected hits), shown=,
+// capped=, and hits_capped= (collection ceiling ⇒ total is a floor).
+//
+// Verifier N8: `page` is the request's limit/offset (mcpPageArgs, above) — grep was the only paged CLI verb
+// whose MCP twin reported `capped:true` at 100 hits with NO knob to raise or walk past it, so the honest
+// disclosure named a cut the caller could not do anything about. The window is the SAME pageview.h trio
+// (effectiveRowCap → pageWindow → pageDisclosure) the CLI --grep applies over the same fully-collected,
+// fully-sorted list, so page N here is byte-for-byte page N there. Defaulted to {} ⇒ the un-paged answer is
+// byte-identical to what it was, `files`/`total`/`order` included.
+// R1b (the 2026-08-12 usage mine), the CLI <enc> block's JSON twin: ONE entry per DISTINCT enclosing
+// symbol NAME of the served page, first-appearance order, `callers` the distinct-caller union off the
+// in-edge CSR the index already holds — zero new analysis, bounded by the page's own row cap. Row
+// semantics live in search.h's grepEnclosingRows (shared with the CLI emitter); this is serialization.
+// Returns "" or a leading-comma fragment the caller splices before its closing brace.
+inline std::string grepEnclosingJson( const IngestResult& ing, const Graph& g, std::span<const GrepHit> hits )
+{
+    const std::vector<GrepEncRow> encRows = grepEnclosingRows( ing, g, hits );
+    if( encRows.empty() )
+    {
+        return {};
+    }
+    std::string out = ",\"enclosing\":[";
+    bool        first = true;
+    for( const GrepEncRow& row : encRows )
+    {
+        if( !first )
+        {
+            out += ",";
+        }
+        first = false;
+        out += "{\"n\":\"" + mcpdetail::jsonEscape( row.chain ) + "\",\"callers\":" + std::to_string( row.callerCount );
+        if( row.defCount > 1 )
+        {
+            out += ",\"defs\":" + std::to_string( row.defCount );
+        }
+        if( row.cx > 0 )
+        {
+            out += ",\"cx\":" + std::to_string( row.cx );
+        }
+        out += "}";
+    }
+    out += "]";
+    return out;
+}
+
+// R1a, the zero-hit follow-up (shared grepZeroHitSuggestions — the CLI and the MCP verb cannot diverge):
+// an honest total:0 stays, and a labeled `suggest` object teaches the two next moves in this surface's
+// own spelling — `near` (did-you-mean) and the `for` verb (the grep→for conversion the mine shows never
+// happens unprompted). "" for non-word-like patterns: byte-identical to the pre-R1a answer.
+inline std::string grepSuggestJson( const IngestResult& ing, const std::string& pattern )
+{
+    const GrepZeroHitSuggestions sug = grepZeroHitSuggestions( ing, pattern, /*regex=*/false );
+    if( sug.near.empty() && !sug.offerFor )
+    {
+        return {};
+    }
+    std::string out = ",\"suggest\":{\"note\":\"suggestions, not matches — hits stays an honest zero\"";
+    if( !sug.near.empty() )
+    {
+        out += ",\"near\":\"" + mcpdetail::jsonEscape( sug.near ) + "\"";
+    }
+    if( sug.offerFor )
+    {
+        out += ",\"next_verb\":\"for\",\"next_task\":\"" + mcpdetail::jsonEscape( pattern ) + "\"";
+    }
+    out += "}";
+    return out;
+}
+
+// §R-J: the CLI <unindexed> twin (see main.cpp's emitGrepUnindexed) — the JSON "unindexed" array, present
+// only when non-empty (the same "absent means none" convention corpus_excluded/corpus_oversize already use),
+// lifted out for the same reason grepEnclosingJson/grepSuggestJson above were: pure serialization of an
+// already-collected list (search.h's grepCollectAux), so grepHitsJson's own body does not carry the loop.
+// §R-J: the CLI unindexed_hits=/unindexed_files_scanned=/unindexed_files_skipped=/unindexed_candidates_capped=
+// twins as one JSON key fragment — mirrors main.cpp's grepUnindexedAttrs (same conditions: hits= and
+// scanned= unconditional, the two skip keys only when non-zero/true), lifted out for the same reason
+// grepAuxJson below is. H4: unindexed_hits joins it on BOTH dialects at once — mcpclidiffcheck's LENS2 asks
+// that every fact the CLI root states be present here, and a completeness attribute is exactly the class of
+// fact a dialect may not drop.
+inline std::string grepUnindexedKeys( const GrepAuxCollection& aux )
+{
+    const std::uint32_t skipped = aux.filesSkippedOversize + aux.filesSkippedBinary + aux.filesUnreadable;
+    std::string          keys    = ",\"unindexed_hits\":" + std::to_string( aux.hits.size() );
+    keys += ",\"unindexed_files_scanned\":" + std::to_string( aux.filesScanned );
+    if( skipped > 0 )
+    {
+        keys += ",\"unindexed_files_skipped\":" + std::to_string( skipped );
+    }
+    if( aux.candidatesCapped )
+    {
+        keys += ",\"unindexed_candidates_capped\":true";
+    }
+    return keys;
+}
+
+// R-H span tiers: the CLI grepTierAttrs() twin (main.cpp), same conditions and same key names so the two
+// surfaces cannot report the same run differently (mcpclidiffcheck's LENS2 fact parity). Lifted out for the
+// same reason grepUnindexedKeys above was: a payload key fragment is a helper's job, not the verb body's.
+// `floorAlreadyEmitted` (N2): the CLI grepTierAttrs twin — tier_budget floors the root unless hits_capped already did.
+inline std::string grepTierKeys( const GrepTierReport& tier, bool floorAlreadyEmitted )
+{
+    if( !tier.hasDisclosure() )
+    {
+        return {};
+    }
+    std::string keys;
+    if( tier.suppressedComment > 0 )
+    {
+        keys += ",\"suppressed_comment\":" + std::to_string( tier.suppressedComment );
+    }
+    if( tier.suppressedString > 0 )
+    {
+        keys += ",\"suppressed_string\":" + std::to_string( tier.suppressedString );
+    }
+    if( std::strcmp( tier.emittedTier, "code" ) != 0 )
+    {
+        keys += std::string( ",\"tier\":\"" ) + tier.emittedTier + "\"";
+        // M17: the CLI grepTierAttrs() twin — same condition, same name. A confidence qualifier is exactly
+        // the class of fact a dialect may not drop (mcpclidiffcheck's LENS2), and an MCP-only agent has no
+        // CLI to re-ask from before trusting the label.
+        if( tier.unclassifiedHits > 0 )
+        {
+            keys += ",\"tier_partial\":true";
+        }
+    }
+    keys += ",\"tier_parsed\":" + std::to_string( tier.tieredFileCount );
+    // C5: the CLI grepTierAttrs() twin — unconditional there, unconditional here. A dialect that drops the
+    // qualifier drops it for good on this surface: an MCP-only agent has no CLI to re-ask from before
+    // trusting tier=. Gate: test/emittertruthcheck.sh (Z2b).
+    keys += ",\"tier_unclassified\":" + std::to_string( tier.unclassifiedHits );
+    if( tier.budgetHit != nullptr )
+    {
+        keys += std::string( ",\"tier_budget\":\"" ) + tier.budgetHit + "\"" + ( floorAlreadyEmitted ? "" : rw::kGraphCountFloorAttrJson );   // N2: the CLI twin's floor
+    }
+    return keys;
+}
+
+// parse_degraded routing (2026-08-30, mcpgrepdegradedcheck — the CLI <f> attribute's JSON twin): the note is
+// this dialect's legend channel (grepSuggestJson's own precedent), and it travels ONLY in an answer that
+// emitted the key — a clean answer stays byte-identical (the same gated-clause rule the CLI legend applies to
+// its parse_degraded sentence). Lifted out for the same reason grepTierKeys/grepUnindexedKeys above were: a
+// payload key fragment is a helper's job, not the verb body's. The predicate is model.h's fileParseDegraded —
+// the ONE rule the CLI emitter and the refusal clause already join, never a forked re-derivation.
+inline std::string grepDegradedNoteJson( const IngestResult& ing, std::span<const GrepHit> hits )
+{
+    const bool anyParseDegraded = std::any_of( hits.begin(), hits.end(), [ & ]( const GrepHit& h ) { return fileParseDegraded( ing, h.fileId ); } );
+    if( !anyParseDegraded )
+    {
+        return {};
+    }
+    return ",\"parse_degraded_note\":\"a hit carrying parse_degraded:true sits in a file whose parse holds ERROR/MISSING nodes"
+           " (the skipped verb itemizes err=/err_ratio=): symbols there may be unextracted, so read an absent in on such a hit as"
+           " UNKNOWN, not as file scope. Unmarked hits parsed clean, except that a file the ingest never parsed at all — doc-format,"
+           " binary-sniffed, unreadable — is also unmarked, the skipped verb's unmeasured class.\"";
+}
+
+// H4 (capture-audit 2026-09-04 — lens1 F1, lens2 M3, lens8 #12): an OBJECT, not a bare array. A bare array
+// is the one JSON shape that cannot carry its own disclosure, and this list needed three: how many hits it
+// holds, how many it printed, and whether that was a cut. Live pre-fix, `grep … limit:3` returned 3 hits
+// and 29 unindexed rows — 2,805 B for a three-row answer — because `limit` reached the indexed list only.
+// The keys are the CLI element's attributes verbatim (count/shown/capped) so the two dialects state the
+// same facts under the same names; `rows` holds what the window admitted.
+inline std::string grepAuxJson( const std::vector<GrepAuxHit>& hits, const PageWindow& window, bool singleRoot,
+                                const std::string& rootPrefix )
+{
+    if( hits.empty() )
+    {
+        return {};
+    }
+    const std::size_t shown = window.end - window.begin;
+    std::string       out   = ",\"unindexed\":{\"count\":" + std::to_string( hits.size() )
+                      + ",\"shown\":" + std::to_string( shown )
+                      + ",\"capped\":" + ( shown < hits.size() ? "true" : "false" )
+                      + ",\"rows\":[";
+    bool first = true;
+    for( std::size_t i = window.begin; i < window.end; ++i )
+    {
+        const GrepAuxHit& h = hits[i];
+        if( !first ) { out += ","; }
+        first = false;
+        out += "{\"file\":\"" + mcpdetail::jsonEscape( std::string( singleRoot ? sarif::rootRelativeUri( h.path, rootPrefix ) : std::string_view( h.path ) ) )
+             + "\",\"line\":" + std::to_string( h.line ) + "}";
+    }
+    out += "]}";
+    return out;
+}
+
+// The ONE reader for the MCP `in` argument, shared by the live `grep` verb and the `batch` grep sub-query
+// (wave-3 verifier P6-1/P6-2/P3-4). Two things it fixes at once:
+//   · a CLOSED value set is now enforced on BOTH dialects. `in:"Any"`, `in:"all"`, `in:"comments"` used to
+//     read as the default and silently return the tiered answer — in the direction that HIDES rows, which
+//     is precisely why the CLI twin refuses. The "this verb has no refusal channel per-argument" rationale
+//     was false: mcprefusal.h already registers the field, and the batch surface refuses loudly.
+//   · `in` reaches the batch arm at all. It previously took the defaulted GrepIn::Code with no hatch.
+// Absent reads as the default, as an OPTIONAL field must; only a PRESENT unknown spelling refuses.
+inline std::string grepInModeFromArg( std::string_view typed, GrepIn& out )
+{
+    out = GrepIn::Code;
+    if( typed.empty() || typed == "code" )
+    {
+        return {};
+    }
+    if( typed == "any" )
+    {
+        out = GrepIn::Any;
+        return {};
+    }
+    return mcprefuse::badValueRefusal( "in", typed );
+}
+
+inline std::string grepHitsJson( const std::string& root, const std::string& pattern, McpPageArgs page = {}, GrepIn grepInMode = GrepIn::Code )
+{
+    const McpIndex&            ix        = getIndex( root );
+    const IngestResult&        ing       = ix.ing;
+    constexpr int              kRowCap   = 100;
+    // R-H span tiers: the SAME filter, in the SAME position (after collection), as the CLI verb applies —
+    // search.h owns the policy precisely so these two surfaces cannot answer differently. `grepInMode` is
+    // the MCP `in` argument (the CLI --grep-in twin): the escape hatch has to exist here too, because an
+    // MCP-only agent that reads suppressed_comment= has no CLI to re-ask from. Counters ride the payload
+    // below under the CLI's own key names.
+    GrepTierReport             tierReport;
+    const GrepCollection       collected = grepApplySpanTiers( ing, grepCollect( ing, pattern, /*regex=*/false, /*noPrefilter=*/false ),
+                                                               grepInMode, tierReport );
+    const PageWindow           grepPage  = pageWindow( collected.raw.size(), effectiveRowCap( page.limit, kRowCap ), page.offset );
+    const std::size_t          rowCount  = grepPage.end - grepPage.begin;
+    const std::vector<GrepHit> hits      = grepEnrich( ing, std::span<const GrepRawHit>( collected.raw ).subspan( grepPage.begin, rowCount ), 0, 0 );
+
+    // §R-J: the CLI's unindexed_files_scanned=/unindexed block twin (search.h grepCollectAux) — literal-only,
+    // matching this verb. No --max-file-size equivalent on the MCP surface, so this uses the same
+    // kDefaultMaxFileBytes ceiling the CLI falls back to when --max-file-size was never passed.
+    const GrepAuxCollection aux = grepCollectAux( ing.crawlSkips, pattern, /*regex=*/false, kDefaultMaxFileBytes );
+
+    // §B6 M12: the two disclosures the CLI legend carries and this payload did not. `files` is the
+    // DENOMINATOR (how many distinct files the hits come from — hits sorted by file, so one pass counts
+    // them), and `order` states the ORDER, because the rows ARE reordered and a JSON array reads as
+    // "whatever order the tool found them in" unless it says otherwise (§A10.3, the same reason whereis
+    // states its ordering in full). Both are facts about this answer, so they ride in the answer.
+    std::uint32_t prevFile = UINT32_MAX;
+    std::size_t   filesMatched = 0;
+    for( const GrepRawHit& h : collected.raw )
+    {
+        if( h.fileId != prevFile )
+        {
+            ++filesMatched;
+            prevFile = h.fileId;
+        }
+    }
+
+    // N8: shown/capped (+ total/has_more/next_offset/offset/limit when paging) come from pageview.h's ONE
+    // disclosure under its JSON syntax row, not from a hand-written pair that would be a second vocabulary.
+    // `total` is emitted here only when the disclosure will NOT — un-paged it is grep's own row count and
+    // must stay (the CLI's <grep hits="T"> twin); paged, the disclosure carries it, and JSON cannot spell
+    // the same key twice the way the CLI's XML root spells both hits= and total=.
+    // R2 (capture-audit verify-wave1 2026-09-04): "paged" is the DISCLOSURE's own decision, asked of
+    // computePageDisclosure — not `limit/offset given`. M2 made the paging half ride whenever the listing
+    // was CUT (a default window that dropped rows is a page too), so the old spelling emitted `total` here
+    // AND inside the quintet on every bare cut answer: the duplicate key jsoncheck.sh #10 pins.
+    char       pagebuf[ kPageDisclosureCap ];
+    const bool isPaging = computePageDisclosure( rowCount, collected.raw.size(), grepPage.end, page.limit, page.offset,
+                                                 /*discloseCap=*/true ).paging;
+
+    // T1: the completeness claim, the SAME four conditions as the CLI emitter (main.cpp's emitGrepReport)
+    // minus the regex arm — this verb is literal-only, so every scan is a full end-to-end read. Appended
+    // after hits_capped so the historic key order other gates read is byte-untouched; absent when any
+    // condition fails (the floor vocabulary already covers partial answers).
+    // R-H adds the tier arm the CLI emitter also adds: a listing that held comment/string rows back did not
+    // print every hit it found, so it may not claim to be exhaustive.
+    const bool scanExhaustive  = collected.cleanScan();
+    const bool windowWhole     = grepPage.begin == 0 && grepPage.end == collected.raw.size();
+    const bool nothingHeldBack = tierReport.suppressedComment == 0 && tierReport.suppressedString == 0;
+
+    // R-H: the CLI tierAttr twin (helper above) — empty when nothing was held back.
+    // N2: hits_capped puts the floor on this root through the disclosure (L4's found-not-fixed MCP twin, closed here);
+    // tier_budget adds it when the disclosure did not — never both.
+    const std::string tierKeys = grepTierKeys( tierReport, /*floorAlreadyEmitted=*/collected.isBudgetReached );
+
+    // G1 (2026-08-15 harvest, report-memgraph §F6): `file` is root-relative when this is a single-root
+    // index (ing.realPaths empty — the same condition the CLI emitter gates on), reusing sarif.h's strip
+    // rather than re-deriving it (grepCollect's own rule: shared logic so the two surfaces cannot diverge).
+    // Multi-root already carries the compact `<label>/<relpath>` identity untouched.
+    const bool        singleRootJ = ing.realPaths.empty();
+    const std::string rootPrefixJ = singleRootJ ? sarif::rootPrefixOf( root ) : std::string();
+    const auto         pathForJ   = [ & ]( std::uint32_t fileId ) -> std::string_view
+    {
+        return singleRootJ ? sarif::rootRelativeUri( ing.files[ fileId ], rootPrefixJ ) : std::string_view( ing.files[ fileId ] );
+    };
+
+    std::string out = "{\"pattern\":\"" + mcpdetail::jsonEscape( pattern )
+                    // G1: mirrors the CLI <grep root="…"> — same condition (singleRootJ), same fact, right
+                    // after pattern like the CLI's attribute order (mcpclidiffcheck.sh's LENS2 fact-parity).
+                    + ( singleRootJ ? ( "\",\"root\":\"" + mcpdetail::jsonEscape( root ) + "\"" ) : "\"" )
+                    + ",\"files\":" + std::to_string( filesMatched )
+                    + ( isPaging ? std::string{} : ( ",\"total\":" + std::to_string( collected.raw.size() ) ) )
+                    + pageDisclosure( pagebuf, sizeof( pagebuf ), rowCount, collected.raw.size(), grepPage.end,
+                                      page.limit, page.offset, /*discloseCap=*/true, kJsonPageSyntax,
+                                      /*collectionCapped=*/collected.isBudgetReached )   // H8/N2: the cap hits_capped names floors this root (CLI parity)
+                    + ",\"hits_capped\":" + ( collected.isBudgetReached ? "true" : "false" )
+                    + ( scanExhaustive && windowWhole && nothingHeldBack ? ",\"complete\":true" : "" )
+                    // P3 (L7): the CLI grep root's next= — the same three-way rule (verbs_grep.h), mcpclidiffcheck LENS2
+                    + nextFieldJson( ( grepPage.end < collected.raw.size() || collected.isBudgetReached )
+                                         ? nextFlag( "--grep=", pattern ) + " --offset=" + std::to_string( grepPage.end ) + " --legend=compact"
+                                     : !collected.raw.empty() && grepPage.begin < collected.raw.size()
+                                         ? nextFlag( "--at=", std::string( pathForJ( collected.raw[ grepPage.begin ].fileId ) ) + ":" + std::to_string( collected.raw[ grepPage.begin ].line ) )
+                                         : nextFlag( "--for=", pattern ) )
+                    + tierKeys
+                    // G4 (2026-08-15 harvest, report-ugrep §F6): the CLI's corpus_excluded=/corpus_oversize=
+                    // twins — present only when non-zero, same condition as the CLI emitter.
+                    + ( ing.crawlSkips.excludedFiles > 0 ? ( ",\"corpus_excluded\":" + std::to_string( ing.crawlSkips.excludedFiles ) ) : std::string() )
+                    + ( !ing.skippedOversize.empty() ? ( ",\"corpus_oversize\":" + std::to_string( ing.skippedOversize.size() ) ) : std::string() )
+                    // …and the third one (2026-09-09, the tgrep head-to-head): the built-in crawl denylist's
+                    // whole-subtree prune, which neither of the two above ever counted. Same condition as the
+                    // CLI emitter (grepCorpusAttrs), so the two dialects cannot disagree about what was searched.
+                    + ( ing.crawlSkips.prunedDirs > 0 ? ( ",\"corpus_pruned_dirs\":" + std::to_string( ing.crawlSkips.prunedDirs ) ) : std::string() )
+                    // §R-J: unindexed_files_scanned=/unindexed_files_skipped=/unindexed_candidates_capped=
+                    // (helper above) — mcpclidiffcheck's LENS2 fact-parity arm requires scanned= at minimum.
+                    + grepUnindexedKeys( aux )
+                    + ",\"order\":\"SOURCE files before test/bench files before docs, then path and line\""
+                    + ",\"hits\":[";
+    bool first = true;
+    for( const GrepHit& h : hits )
+    {
+        if( !first )
+        {
+            out += ",";
+        }
+        first = false;
+        // in= honesty (G1): omit the key entirely rather than emit "in":"" when no symbol encloses the hit
+        // — an absent key reads as "not attributed", never "file scope" (the CLI's matching `in=` omission).
+        out += "{\"file\":\"" + mcpdetail::jsonEscape( std::string( pathForJ( h.fileId ) ) ) + "\",\"line\":" + std::to_string( h.line );
+        if( !h.enclosing.empty() )
+        {
+            out += ",\"in\":\"" + mcpdetail::jsonEscape( h.enclosing ) + "\"";
+        }
+        // parse_degraded routing (2026-08-30, mcpgrepdegradedcheck — the CLI <f> attribute's JSON twin):
+        // this dialect has no file rows to hang the fact on, so it rides each hit row instead.
+        if( fileParseDegraded( ing, h.fileId ) )
+        {
+            out += ",\"parse_degraded\":true";
+        }
+        out += "}";
+    }
+    out += "]";
+    // parse_degraded's in-band definition (helper above) — "" on a clean answer.
+    out += grepDegradedNoteJson( ing, std::span<const GrepHit>( hits ) );
+    // §R-J: the CLI <unindexed> twin (helper above) — appended AFTER "hits" for the same reason the R1
+    // block below is: existing key-order-sensitive gates read up through "hits" first.
+    // H4: the SAME window the indexed list obeyed, over this list's own length (the CLI emitter's auxPage
+    // twin) — `limit` reached only the hits array before, so a three-row page shipped 29 unindexed rows.
+    out += grepAuxJson( aux.hits, pageWindow( aux.hits.size(), effectiveRowCap( page.limit, kRowCap ), page.offset ),
+                        singleRootJ, rootPrefixJ );
+    // R1 (the 2026-08-12 usage mine): the CLI <enc>/<suggest> twins, appended AFTER "hits" so the
+    // historic key order three other gates read (files,total,shown,capped) is byte-untouched.
+    out += grepEnclosingJson( ing, ix.g, std::span<const GrepHit>( hits ) );
+    if( collected.raw.empty() )
+    {
+        out += grepSuggestJson( ing, pattern );
+    }
+    out += "}";
+    return out;
+}
+
+// `cochange` verb: the files that historically change together with `file` (the lockstep partners to
+// also edit). "" if the file isn't found. Shares cochangePartners() with the --cochange CLI.
+// H14/M13 (capture-audit 2026-09-04): this returned all 81 partners with no `shown`/`total`/`capped` and
+// no window disclosure, where the CLI serves 30 of 81 with `capped="1"` and names the 18-month window and
+// the sub-window denominator the numbers describe. Two failures in one: an MCP caller could not tell 81
+// from "a page of 81", and could not see WHICH window `commits=246` and every `together=` were counted
+// over. Both are now the CLI's own attributes under the CLI's own names, and the same pageview.h window
+// serves the rows, so `limit`/`offset` mean here what they mean everywhere else.
+inline std::string cochangePartnersJson( const std::string& root, const std::string& file, McpPageArgs page = {} )
+{
+    const McpIndex&     ix  = getIndex( root );
+    const IngestResult& ing = ix.ing;
+    const std::uint32_t fid = resolveFileSuffix( ing, file );
+    if( fid == UINT32_MAX )
+    {
+        return {};
+    }
+    std::uint32_t                commits    = 0;
+    std::uint32_t                subWindows = 0;
+    const std::vector<CoPartner> ps         = cochangePartners( root, ing, file, commits, /*scope=*/nullptr,
+                                                                /*onlyRoot=*/UINT32_MAX, &subWindows );
+    // §P8 vocabulary: the JSON sibling of the XML at= anchor the CLI --cochange now carries — same spelling
+    // and same null-on-a-non-git-root convention main.cpp's --quality-delta --json already established.
+    const std::string atVal  = gitstamp::stampAt( root );
+    const std::string atJson = atVal.empty() ? std::string( "null" ) : ( "\"" + atVal + "\"" );
+    // R-E fix (2026-08-19): root-relative file paths + the "root" key, the JSON siblings of the root= the CLI
+    // --cochange now carries. The first R-E landing converted the CLI arm alone, so the two dialects of one
+    // answer spelled their paths differently — the same divergence the at= note above exists to prevent.
+    const bool         ccSingleRoot = ing.realPaths.empty();
+    const std::string  ccRootPrefix = ccSingleRoot ? sarif::rootPrefixOf( root ) : std::string();
+    const auto         ccRel        = [ & ]( std::uint32_t f ) -> std::string
+    { return std::string( ccSingleRoot ? sarif::rootRelativeUri( ing.files[f], ccRootPrefix ) : std::string_view( ing.files[f] ) ); };
+    std::string out = "{";
+    if( ccSingleRoot )
+    {
+        out += "\"root\":\"" + mcpdetail::jsonEscape( root ) + "\",";
+    }
+    // window=/sub_windows= are the CLI root's own names and the CLI's own default: this surface has no
+    // --since, so the mined window is the 18-month default the shared core used. sub_windows= is the recur=
+    // denominator gitmine.h's own header forbids publishing recur= without.
+    const PageWindow ccPw = pageWindow( ps.size(), effectiveRowCap( page.limit, kCochangePartnerCap ), page.offset );
+    char             ccPab[ kPageDisclosureCap ];
+    out += "\"file\":\"" + mcpdetail::jsonEscape( ccRel( fid ) ) + "\",\"commits\":" + std::to_string( commits )
+         + ",\"window\":\"" + rw::defaultWindowLabel( root, "18mo" ) + "\",\"sub_windows\":" + std::to_string( subWindows )
+         + ",\"partners\":" + std::to_string( ps.size() )
+         + pageDisclosure( ccPab, sizeof( ccPab ), ccPw.end - ccPw.begin, ps.size(), ccPw.end,
+                           page.limit, page.offset, /*discloseCap=*/true, kJsonPageSyntax )
+         + ",\"at\":" + atJson + ",\"rows\":[";
+    bool first = true;
+    for( std::size_t partnerIndex = ccPw.begin; partnerIndex < ccPw.end; ++partnerIndex )
+    {
+        const CoPartner& p = ps[ partnerIndex ];
+        if( !first )
+        {
+            out += ",";
+        }
+        first = false;
+        char deg[ 16 ];  rw::formatTo( deg, sizeof( deg ), "{:.2f}", p.deg );
+        // §A9.3: the JSON sibling of the XML dep_capable= tell — surprising is false for a pair that could
+        // never have carried a static dependency, and dep_capable says WHY it is false.
+        out += "{\"file\":\"" + mcpdetail::jsonEscape( ccRel( p.fileId ) ) + "\",\"together\":" + std::to_string( p.together )
+             + ",\"deg\":" + deg + ",\"surprising\":" + ( p.surprising ? "true" : "false" )
+             + ",\"dep_capable\":" + ( p.depCapable ? "true" : "false" ) + "}";
+    }
+    out += "]}";
+    return out;
+}
+
+// `memory_recall` verb: the most relevant DOCS (memory notes / design docs) for a task, full bodies,
+// budgeted. Goes through recall.h's recallFor — the SAME rank-then-build call the CLI --recall verb makes,
+// arguments and all — so the two front doors of one verb cannot rank a query differently. They did until
+// this landed: this call site scored with `lexicalScores( ix.ing, …, task )`, i.e. pathFieldDefaultW 0 and
+// no root prefix, while the CLI passed 1 and the prefix, under the comment "Shares lexicalScores" that used
+// to sit here. A doc found only by its PATH was retrieved by the CLI and reported "no relevant documents"
+// over MCP. Registered in docs/EVALS.md §"--recall ranks by where the repo sits on disk"; gated by
+// test/recallparitycheck.sh. Returns a plain-text bundle. `redact` masks credential shapes in the recalled
+// doc bodies (A3-F3 — same seam contract as the CLI --recall).
+// H9: `maxTokens` is the ceiling in TOKENS — the unit `budget_tokens` is asked in, the unit the CLI's
+// --max-tokens is asked in, and the unit the header discloses. This used to take BYTES, converted at the
+// call site in mcp.h, which is how the two surfaces both lost the number they were applying.
+inline std::string recallText( const std::string& root, const std::string& task, int k, std::size_t maxTokens, RedactCounts* redact = nullptr )
+{
+    const McpIndex& ix = getIndex( root );
+    // docs (markdown) only; R-R root-relative separators AND root-relative path ranking — both from this
+    // one rootArg, exactly as the CLI derives its own. Empty for a multi-root index, whose ing.files
+    // already hold the labelled root-relative spelling.
+    return recallFor( ix.ing, ix.g.outOff, ix.g.outTargets, task, k, maxTokens, redact,
+                      ix.ing.realPaths.empty() ? std::string_view( root ) : std::string_view() ).text;
+}
+
+// `situational_awareness(diff)` verb (S5-D): for a DIFF — an explicit changed-file list in `diff`/`files`, OR
+// (when neither is given) the working-tree `git diff HEAD` — return the 5 facts as a JSON object:
+//   blast_radius   — files transitively reaching the changed set (with dependent-symbol count)
+//   tests_to_run   — the test files among the blast radius
+//   forgotten      — files that co-changed with the diff in past commits but are NOT in this diff
+//   hotspot_alert  — changed files with high cx×churn (Σ cognitive complexity × commits touching the file)
+//   modules_touched— the distinct top-level directories the diff hit
+// Hand-rolled JSON (same jsonEscape + manual string-building as the other verbs). `diffOrEmpty` empty ⇒ git
+// diff. Returns "" ONLY when git is genuinely unavailable (not a git repo / git not installed) — a clean
+// working tree (zero changed files) returns a VALID result with all-empty arrays and a note field.
+// H6 (lens 6 F1): the MCP twin of --situ's FILE-list refusal. `situational_awareness{files:"src/nosuch.h"}`
+// used to answer all-empty arrays with a green `_fresh: ok` — the same false zero the CLI arm printed, and
+// the worse of the two, because a JSON result reads as an ANSWER to every caller that only checks for an
+// `error` key. Same text as the CLI (situ.h::fileListRefusalText) with the MCP field name in place of the
+// flag. Empty ⇒ the list is fine (or absent, i.e. the git-diff default).
+inline std::string situationFileListRefusal( const std::string& root, const std::string& diffOrEmpty )
+{
+    if( diffOrEmpty.empty() )
+    {
+        return {};
+    }
+    const IngestResult& ing = getIndex( root ).ing;
+    return fileListRefusalText( ing, "", "files", root, diffOrEmpty, changedMaskFromListChecked( ing, diffOrEmpty ) );
+}
+
+// The decl/def-partner array plus the co-change window/commit floor, as ONE fragment: situationDiffJson is
+// already over the complexity bar and a nameable fact gets a name rather than another inline block. Emits
+// `,"decl_def_partners":[…],"cochange_window":"…","cochange_commits":N` — the leading comma is the caller's
+// `]` closing the array before it, so the two halves of the seam are read together.
+template <typename PathRelFn>
+inline std::string declDefAndWindowJson( const SituationFacts& facts, PathRelFn pathRel )
+{
+    std::string out = ",\"decl_def_partners\":[";
+    bool        first = true;
+    for( const DeclDefPartner& dp : facts.declDef )
+    {
+        if( !first )
+        {
+            out += ",";
+        }
+        first = false;
+        out += "{\"file\":\"" + mcpdetail::jsonEscape( std::string( pathRel( dp.fileId ) ) ) + "\",\"shared_symbols\":"
+             + std::to_string( dp.shared ) + "}";
+    }
+    return out + "],\"cochange_window\":\"" + mcpdetail::jsonEscape( facts.coWindow ) + "\",\"cochange_commits\":"
+         + std::to_string( facts.coCommits );
+}
+
+// C1 F-10 (2026-09-10): --situ joined cli.h's honorsPaging set (its blast-radius and co-change sections
+// window), so this twin takes limit/offset too — M13's rule, derived by test/mcpcontractcheck.sh (G) from
+// kPagingHonoringVerbs. THE DEFAULT IS DIFFERENT ON PURPOSE, and it is the honest one: the CLI report caps
+// those two listings at 8 because it is a screen an agent reads inline, while this payload is machine-read
+// and has always served EVERY row. An absent limit therefore still serves every row — this adds relief for
+// a caller who wants less, never a new cut — and the two arrays are the only ones windowed: tests_to_run and
+// hotspot_alert are the answer, exactly as in the CLI twin.
+inline std::string situationDiffJson( const std::string& root, const std::string& diffOrEmpty, McpPageArgs page = {} )
+{
+    const McpIndex&     ix  = getIndex( root );
+    const IngestResult& ing = ix.ing;
+
+    std::vector<char> changed;
+    bool isCleanTree = false;
+    if( !diffOrEmpty.empty() )
+    {
+        changed = changedMaskFromList( ing, diffOrEmpty );
+    }
+    else
+    {
+        auto [ mask, ok ] = gitDiffChangedMask( root, ing );
+        if( !ok )
+        {
+            return {}; // git unavailable (not a repo) → caller reports error
+        }
+        changed = std::move( mask );
+        // ok=true + all-zero mask = clean working tree — fall through to computeSituationFacts which returns
+        // all-empty arrays; set isCleanTree so we can add an explanatory note to the JSON result.
+        const bool anyChanged = std::any_of( changed.begin(), changed.end(), []( char c ) { return c != 0; } );
+        isCleanTree = !anyChanged;
+    }
+
+    const SituationFacts facts = computeSituationFacts( root, ing, ix.g, changed );
+
+    // R-E (2026-08-17 harvest): same single-root condition every other verb's root= carries (sarif.h) — the
+    // CLI text twin (situ.h::writeSituation) states the SAME fact on its own leading "root: …" line.
+    const bool         situJSingleRoot = ing.realPaths.empty();
+    const std::string  situJRootPrefix = situJSingleRoot ? sarif::rootPrefixOf( root ) : std::string();
+    // L-D: the STORED-path form is the primitive (an unindexed sibling has no fileId); the fileId form is it.
+    const auto          situJPathRelStr = [ & ]( std::string_view p ) -> std::string_view
+    {
+        return situJSingleRoot ? sarif::rootRelativeUri( p, situJRootPrefix ) : p;
+    };
+    const auto          situJPathRel   = [ & ]( std::uint32_t f ) -> std::string_view
+    {
+        return situJPathRelStr( ing.files[f] );
+    };
+
+    const auto fileObj = [ & ]( std::uint32_t f ) -> std::string
+    { return std::string( "{\"file\":\"" ) + mcpdetail::jsonEscape( std::string( situJPathRel( f ) ) ) + "\"}"; };
+
+    // §B6 M11: the run= hint index, from the SAME source --affected/--situ/--test-gate/--pr-context read
+    // (testmap.h). runFieldJson is that header's JSON call shape, so "absent means NOT DERIVABLE" — the
+    // load-bearing half of the rule — is decided in one place for every emitter rather than re-decided here.
+    const TestRunnerIndex runners( ing, root );
+    const auto            jsonEsc = []( std::string_view sv ) { return mcpdetail::jsonEscape( std::string( sv ) ); };
+
+    // M10: this verb reads git (the diff itself, plus an 18-month co-change mine below) and, before this
+    // fix, carried no anchor at all — same gap the CLI text twin (writeSituation) had. "at":null (never a
+    // fake sha) on a non-git root, mirroring writeTestGateReportJson's own at= convention in this file.
+    const std::string situJAtVal  = gitstamp::stampAt( root );
+    const std::string situJAtJson = situJAtVal.empty() ? std::string( "null" ) : ( "\"" + situJAtVal + "\"" );
+
+    std::string out = "{\"at\":" + situJAtJson + ",";
+    if( situJSingleRoot )
+    {
+        out += "\"root\":\"" + mcpdetail::jsonEscape( root ) + "\",";
+    }
+    out += "\"changed_files\":[";
+    {
+        bool first = true;
+        for( std::uint32_t f : facts.changed )
+        {
+            if( !first )
+            {
+                out += ",";
+            }
+            first = false;
+            out += fileObj( f );
+        }
+    }
+
+    // §B6 M11: each blast-radius row carries the dependent-SYMBOL count that already ORDERS this list. The
+    // payload used to emit {"file":...} alone, so the agent got a ranked blast radius with no magnitude and
+    // could not tell a file contributing 300 dependent symbols from one contributing 1 — while the CLI text
+    // report has printed "(N dependent symbols)" on every such line all along.
+    const PageWindow situJBlast   = pageWindow( facts.blastRadius.size(), page.limit, page.offset );
+    const PageWindow situJForgot   = pageWindow( facts.forgotten.size(),   page.limit, page.offset );
+
+    // ── PAGING DISCLOSURE for the TWO windowed arrays (CodeRabbit #127 / 3985249704) ─────────────────
+    // Both windows above cut rows, and the payload said so about neither: a caller could not tell that
+    // rows were omitted, nor construct a next request. This is --test-gate's exact shape (§B7.1, situ.h's
+    // writeTestGateReportJson) because it is the same situation — TWO INDEPENDENT listings in one report,
+    // which pageview.h rule 6 answers with the rule-1 noun-prefixed exception rather than a bare `shown`
+    // that would be ambiguous next to two arrays. So:
+    //   * shown_blast_radius / blast_radius_capped and shown_forgotten / forgotten_capped — the pair per
+    //     LISTING, DERIVED from the rows this document actually emits, not asserted;
+    //   * forgotten_total, because the second listing has no other key carrying its row population;
+    //   * the paging half (total / has_more / next_offset / offset / limit) from pageview.h's ONE
+    //     disclosure under the JSON syntax row, describing the PRIMARY listing — blast_radius, the array
+    //     it precedes. blast_radius's own total is that `total`; a second spelling of it would be the
+    //     duplicate key jsoncheck #10 pins.
+    // pagingDisclosure emits NOTHING when no window applied, so a bare call (this verb's default is
+    // unbounded) is byte-unchanged apart from the four derived counts, which are always present.
+    const std::size_t situJBlastShown  = situJBlast.end  - situJBlast.begin;
+    const std::size_t situJForgotShown = situJForgot.end - situJForgot.begin;
+    char              situJPageJson[ kPageDisclosureCap ];
+    pagingDisclosure( situJPageJson, sizeof( situJPageJson ), facts.blastRadius.size(), situJBlast.end,
+                      page.limit, page.offset, kJsonPageSyntax );
+    out += "],\"shown_blast_radius\":" + std::to_string( situJBlastShown )
+         + ",\"blast_radius_capped\":" + ( situJBlastShown < facts.blastRadius.size() ? "true" : "false" )
+         + ",\"shown_forgotten\":" + std::to_string( situJForgotShown )
+         + ",\"forgotten_capped\":" + ( situJForgotShown < facts.forgotten.size() ? "true" : "false" )
+         + ",\"forgotten_total\":" + std::to_string( facts.forgotten.size() )
+         + situJPageJson
+         + ",\"blast_radius\":[";
+    {
+        bool first = true;
+        for( std::size_t i = situJBlast.begin; i < situJBlast.end; ++i )
+        {
+            if( !first )
+            {
+                out += ",";
+            }
+            first = false;
+            out += "{\"file\":\"" + mcpdetail::jsonEscape( std::string( situJPathRel( facts.blastRadius[i] ) ) )
+                 + "\",\"dependent_symbols\":" + std::to_string( facts.blastDependents[i] ) + "}";
+        }
+    }
+
+    // §B6 M11: each test row carries its run= hint. This verb hands the agent an OBLIGATION ("run these")
+    // and was the one emitter of the five that withheld the command, so the obligation could not be
+    // discharged without guessing a runner. An ABSENT run field means NOT DERIVABLE, never a guessed suite
+    // command — that rule lives in testmap.h's runHint and is not re-decided here.
+    out += "]";
+    out += graphCountFloorAttrJson( ix.g );   // H5/M15: blast_radius[].dependent_symbols is read off the name-based CSR — a floor, with the gauge
+    out += ",\"tests_to_run\":[";
+    // E1: grouped where no runner is derivable — "test" is then an ARRAY of paths (testmap.h's seam)
+    out += testRowsJoined( runners, testRowsOutOf( facts.tests, situJPathRel ), TestRowShape{ RowDialect::Json, "test" }, jsonEsc, "," );
+
+    // F3: the decl/def partners of the changed set — the header/impl relationship the blast_radius array
+    // above cannot carry, because a header does not transitively depend on the source that implements it.
+    // F2: and the window the co-change zero below was mined in — a JSON reader that only sees an empty
+    // `forgotten` array cannot tell "no partners" from "the window mined nothing", and this surface is the
+    // one where that reads most like an answer.
+    // L-D: the same lexical siblings the CLI report's [1] section lists — the ONE list here whose members
+    // may not be indexed at all (an unindexed .inl has no fileId), so they carry the STORED spelling through
+    // the string relativizer rather than the fileId one. Served whole, like every other array in this payload.
+    std::string situJSibs = ",\"siblings\":[";
+    {
+        bool first = true;
+        for( const std::string& p : facts.siblings.paths )
+        {
+            if( !first )
+            {
+                situJSibs += ",";
+            }
+            first = false;
+            situJSibs += "{\"file\":\"" + mcpdetail::jsonEscape( std::string( situJPathRelStr( p ) ) ) + "\"}";
+        }
+    }
+    // Review of #219: siblings_total used to be the length of the array beside it — a tautology a reader
+    // cannot act on. This payload's standing rule is that an absent limit serves EVERY row (see the header
+    // above), so the honest form is not a cap but the PAIR pageview.h rule 1 asks for: the population, and
+    // an explicit statement that nothing was cut. `false` is emitted, never omitted — an absent
+    // siblings_capped would be exactly the silence this fixes.
+    situJSibs += "],\"siblings_total\":" + std::to_string( facts.siblings.paths.size() )
+              +  ",\"siblings_capped\":false";
+    if( facts.siblings.unindexedRowsFloor )
+    {
+        // …and the population itself is a FLOOR when the crawl's unsupported-extension ROW list was cut:
+        // a sibling no grammar can read may simply never have been rowed. Rides the EMPTY list too.
+        situJSibs += ",\"siblings_unindexed_rows_floor\":true";
+    }
+    out += "]" + declDefAndWindowJson( facts, situJPathRel ) + situJSibs + ",\"forgotten\":[";
+    {
+        bool first = true;
+        for( std::size_t i = situJForgot.begin; i < situJForgot.end; ++i )
+        {
+            const auto& [ f, deg ] = facts.forgotten[i];
+            if( !first )
+            {
+                out += ",";
+            }
+            first = false;
+            char d[ 16 ];  rw::formatTo( d, sizeof( d ), "{:.2f}", deg );
+            out += "{\"file\":\"" + mcpdetail::jsonEscape( std::string( situJPathRel( f ) ) ) + "\",\"cochange_degree\":" + d + "}";
+        }
+    }
+
+    out += "],\"hotspot_alert\":[";
+    {
+        bool first = true;
+        for( const auto& [ f, score ] : facts.hotspots )
+        {
+            if( !first )
+            {
+                out += ",";
+            }
+            first = false;
+            out += "{\"file\":\"" + mcpdetail::jsonEscape( std::string( situJPathRel( f ) ) ) + "\",\"score\":" + std::to_string( score ) + "}";
+        }
+    }
+
+    out += "],\"modules_touched\":[";
+    {
+        bool first = true;
+        for( const std::string& m : facts.modulesTouched )
+        {
+            if( !first )
+            {
+                out += ",";
+            }
+            first = false;
+            out += "\"" + mcpdetail::jsonEscape( m ) + "\"";
+        }
+    }
+    out += "]";
+
+    // §M9 (W3FIX): the §B7.3 blind-spot disclosure the XML --situ prints under its [2] section, and which
+    // --test-gate already carries in BOTH dialects. This verb hands the agent the same tests_to_run obligation
+    // off the same traversal and disclosed nothing, so an empty array read as "nothing tests this" rather than
+    // "nothing that is a CALL EDGE tests this" — a shell harness runs the compiled binary as a subprocess,
+    // which is not an edge. Same counter, same source of truth (testmap.h::scriptGatesUnmodelledCount) and the
+    // same key name writeTestGateReportJson uses, so this is a disclosure the dialects already shared — never
+    // a second number.
+    out += ",\"script_gates_unmodelled\":" + std::to_string( scriptGatesUnmodelledCount( ing ) );
+
+    // clean working tree (git diff HEAD returned 0 files) — append a note so callers can distinguish this
+    // valid-but-empty result from a populated one, mirroring how the CLI --situ says "0 changed files".
+    if( isCleanTree )
+    {
+        out += ",\"note\":\"0 changed files — working tree is clean (git diff HEAD returned nothing to analyze)\"";
+    }
+
+    out += "}";
+    return out;
+}
+
+// The @FILE:LINE rebind the NAME-matching scan verbs' payload fns share (2026-08-30 decision round): a
+// resolvable line-seed's ONE innermost enclosing definition — the SEED's own def, exactly the CLI twin's
+// resolveAllByNameQualified @-tier semantics, never the bare-name union (for `owners` the union's
+// lowest-id pick could name the WRONG file). kNoNode when sym is not a seed, or the seed faults — the
+// dispatch guards (qualifiedSelectorRefusal) refuse faulted seeds upstream with the shared at-diagnosis.
+inline NodeId atSeedDefOr( const IngestResult& ing, std::string_view sym )
+{
+    if( sym.empty() || sym.front() != '@' )
+    {
+        return kNoNode;
+    }
+    const AtSeed seed = resolveAtSeed( ing, sym.substr( 1 ) );
+    return seed.fault == AtFault::None ? seed.chain.back() : kNoNode;
+}
+
+// `mentions` verb: which DOCS (markdown plans/designs) name this code symbol in a `backtick` — the doc↔code
+// link (out of the call graph). Shares g.mentions with the --mentions CLI.
+// An @FILE:LINE line-seed REBINDS via atSeedDefOr (its contract above) and the answer discloses the
+// rebound name as "sym" beside the as-typed "symbol" echo.
+// M13: --mentions is in cli.h's honorsPaging set; this twin was pinned to page 1. Same pageview.h window,
+// same disclosure keys, so a paging loop written against the CLI terminates here too.
+inline std::string mentionsJson( const std::string& root, const std::string& symbol, McpPageArgs page = {} )
+{
+    const McpIndex&           ix      = getIndex( root );
+    const IngestResult&       ing     = ix.ing;
+    const NodeId              seedDef = atSeedDefOr( ing, symbol );
+    if( seedDef == kNoNode && !symbol.empty() && symbol.front() == '@' )
+    {
+        return {}; // faulted seed — refused upstream; this arm only defends dispatch drift
+    }
+    const std::string         seedSym = seedDef == kNoNode ? std::string() : ing.symbols[ seedDef ].name;
+    const std::vector<NodeId> defs    = seedDef == kNoNode ? resolveAllByName( ing, symbol )
+                                                           : std::vector<NodeId>{ seedDef };
+    if( defs.empty() )
+    {
+        return {};
+    }
+    std::vector<NodeId> docs;
+    for( NodeId d : defs )
+    {
+        if( d < ix.g.mentions.size() )
+        {
+            for( NodeId dn : ix.g.mentions[d] )
+            {
+                docs.push_back( dn );
+            }
+        }
+    }
+    std::sort( docs.begin(), docs.end() );  docs.erase( std::unique( docs.begin(), docs.end() ), docs.end() );
+
+    // §A8.4 (same fix as CLI --mentions): one entry per FILE via the shared collapse — the old payload
+    // emitted one entry per markdown SECTION, duplicating "file" values up to 3x. docs=/sections= mirror
+    // the XML root's disclosures; mentions= and l= mirror the XML row attrs.
+    const std::vector<MentionFileRow> fileRows = collapseMentionsToFileRows( ing, docs );
+    // R-E fix (2026-08-19): root-relative "file" values + the "root" key — the JSON siblings of the root=
+    // the CLI --mentions now carries. Converted with the CLI arm this time, not one release behind it.
+    const bool         mnSingleRoot = ing.realPaths.empty();
+    const std::string  mnRootPrefix = mnSingleRoot ? sarif::rootPrefixOf( root ) : std::string();
+    std::string out = "{";
+    if( mnSingleRoot )
+    {
+        out += "\"root\":\"" + mcpdetail::jsonEscape( root ) + "\",";
+    }
+    out += "\"symbol\":\"" + mcpdetail::jsonEscape( symbol ) + "\",";
+    if( !seedSym.empty() )
+    {
+        out += "\"sym\":\"" + mcpdetail::jsonEscape( seedSym ) + "\","; // the @-seed's rebound definition name
+    }
+    const PageWindow mnPw = pageWindow( fileRows.size(), effectiveRowCap( page.limit, kUseSiteRowCap ), page.offset );
+    char             mnPab[ kPageDisclosureCap ];
+    out += "\"docs\":" + std::to_string( fileRows.size() )
+         + ",\"sections\":" + std::to_string( docs.size() )
+         + pageDisclosure( mnPab, sizeof( mnPab ), mnPw.end - mnPw.begin, fileRows.size(), mnPw.end,
+                           page.limit, page.offset, /*discloseCap=*/false, kJsonPageSyntax )
+         + ",\"files\":[";
+    bool first = true;
+    for( std::size_t mnRowIndex = mnPw.begin; mnRowIndex < mnPw.end; ++mnRowIndex )
+    {
+        const MentionFileRow& row = fileRows[ mnRowIndex ];
+        if( !first )
+        {
+            out += ",";
+        }
+        first = false;
+        out += "{\"file\":\"" + mcpdetail::jsonEscape( std::string( mnSingleRoot ? sarif::rootRelativeUri( ing.files[ row.fileId ], mnRootPrefix )
+                                                                                : std::string_view( ing.files[ row.fileId ] ) ) )
+             + "\",\"mentions\":" + std::to_string( row.mentions ) + "}";
+    }
+    out += "]}";
+    return out;
+}
+
+// `for` verb: task lens — the BM25/--for ranked, signatures-only inventory of building blocks
+// relevant to `task`, framed for reuse. Reuses the warm McpIndex + the same lexicalScores +
+// packSignatures/packLego/packCompose pipeline the CLI --for uses; captured via open_memstream.
+// Returns the full <ctx>…</ctx> XML as a string (matches G4 — valid XML document). "for" is a
+// C++ keyword so the function is named forTaskText(). `redact` masks credential shapes in the
+// emitted doc comments (A3-F3 — same seam contract as the CLI --for); null under --no-redact.
+//
+// ── NO CAP PARAMETER, DELIBERATELY (round-4 finding F-03) ───────────────────────────────────────────
+// This function used to take `int topK` and both call sites — the `for` dispatch arm and the `batch`
+// sub-verb — fed it the SERVER-WIDE `--top-k`, whose default is 200. That is the ranked MAP's row cap; the
+// --for lens is documented to ignore it (cli.h honorsTopK) and the CLI accordingly serves a 40-symbol head.
+// So the `: 40` fallback was dead code and every MCP `for` call ran a 5x wider candidate pool than its CLI
+// twin — dropped_positive="169" vs "11" on the same task over this repo, plus a substantially different
+// served symbol set. The `for` tool schema exposes no cap either, so no argument could reach the CLI's
+// behavior. The parameter is GONE rather than defaulted: a knob only ever fed the wrong value is not fixed
+// by giving it a better default, and removing it is what makes the two dialects unable to drift again.
+// M13 (capture-audit 2026-09-04): `budgetTokens` is the MCP twin of the CLI `--for --token-budget=N`.
+// It was absent — `explore` and `from_trace` both declared a budget and `for` did not, so an MCP agent
+// working under a context ceiling could bound the big bundle but not the small one. 0 keeps the shipped
+// default (kForPayloadBudgetBytes) and the answer byte-identical; a value converts through the SAME
+// tokens-to-bytes rate the CLI --for uses, and is disclosed as budget_tokens= on the root exactly as the
+// CLI now discloses it (H9).
+// R1 (terminality round A, verify-wave1) — PRICE THE `for` BUNDLE, AND LABEL AN OVERSHOT CEILING.
+// F5 (see the lens= declaration inside forTaskText) moved this twin from "est_tokens DECLARED ABSENT" to
+// "est_tokens SERVED", and a served price makes the second half of the family rule bind: a caller who states
+// a ceiling gets the price and, when the price exceeds it, the attribute saying so — never a number it is
+// left to compare on its own. mcpforparitycheck arm (5) wrote that disjunction for exactly this landing and
+// was RED on 4b722433 at four of its five rungs (budget_tokens=900 → est_tokens=1997, 1097 over, no label).
+// The predicate is the CLI twin's (verbs_for.h F2: est_tokens > budget_tokens) and the JSON twin's, in this
+// dialect's own spelling; the legend sentence is the shared rw::kOverCeilingLegend, so no third wording.
+//
+// WHY IT DISCLOSES RATHER THAN TRIMS. This bundle is shaped by budgetBytesForTokens( budgetTokens ) — a
+// kMinBytesPerToken(2.36) allowance — and priced at kBytesPerTokenDefault(2.50), so a bundle that genuinely
+// fills its byte budget prices ~6% past the token ceiling. METHODOLOGY §9 #2: a ceiling bounds the tail,
+// never the head; dropping a ranked row to fund the label that describes the ranked rows is the inversion.
+// Charged AFTER the sigs budget for the same reason the pricing itself is (mcpConfidenceExemptBytes).
+// The legend clause rides ONLY on a labelled document, so a bundle inside its budget keeps every byte it
+// had, and the re-price after the insert is monotone — the clause widens a document that is already over
+// and can never bring it back under. A free function, not inline code: forTaskText is one of the largest
+// bodies in this file and this step is a whole contract of its own.
+// R2-L2p (independent review, 2026-09-19): the MCP twin of the CLI's sectionsStubNote splice (verbs_for.h
+// finishForLensHeaderPriced, `spliceBefore( header, " -->", /*fromEnd=*/true, … )`) — same shared clause text
+// (rw::kForSectionStubLegend), inserted into forTaskText's finished document iff `stubbed` (the caller's
+// mcpLegoWillStub || mcpComposeWillStub) is true. A free function for the same reason priceForTaskRoot just
+// below is one: forTaskText is already one of the largest bodies in this file, and every branch this needs
+// belongs in its own small contract rather than inline in that function — `stubbed` false is the overwhelmingly
+// common path and costs forTaskText nothing but a call.
+//
+// `doc` here is the FULLY ASSEMBLED document (header + sigs + lego/compose + routes + tail) — headerStr itself
+// was fwritten into the memstream long before mcpLegoWillStub/mcpComposeWillStub even exist, so there is no
+// header string left to mutate in place, only the flushed document. `doc.find( " -->" )` — first occurrence,
+// not last — is safe here for the same reason it is safe for priceForTaskRoot's own kOverCeilingLegend splice
+// just below: the header's own closing comment is the ONLY place "-->" can appear in this document at this
+// point (every rendered row's text is escapeXml'd, which turns '<'/'>' into entities, so raw "-->" cannot leak
+// in from a symbol name, path or task string), and nothing has spliced anything before it yet. The caller runs
+// this BEFORE priceForTaskRoot so the clause's bytes are part of the est_tokens price exactly as the CLI's own
+// version is (finishForLensHeaderPriced splices sectionsStubNote before its price fixpoint, not after).
+inline void spliceForSectionStubLegend( std::string& doc, bool stubbed )
+{
+    if( !stubbed )
+    {
+        return;
+    }
+    const std::size_t legendAt   = doc.find( " -->" );
+    const std::size_t sizeBefore = doc.size();
+    // ASSUME, not VALIDATE: not external input — `stubbed` is only ever true once the header above has
+    // already been fully built and fwritten (its closing " -->" is unconditionally emitted by ctxRootOpen's
+    // own comment), so the boundary is provably present, not merely hoped for.
+    ASSUME( legendAt != std::string::npos, "spliceForSectionStubLegend: a section stubbed but the header's closing \"-->\" was not found to carry the legend" );
+    if( legendAt != std::string::npos )
+    {
+        doc.insert( legendAt, rw::kForSectionStubLegend );
+    }
+    ENSURES( doc.size() == sizeBefore + rw::kForSectionStubLegend.size(),
+             "spliceForSectionStubLegend: a section stubbed but the legend clause was not spliced into the returned document" );
+}
+
+inline void priceForTaskRoot( std::string& doc, std::size_t budgetTokens )
+{
+    if( doc.empty() )
+    {
+        return;
+    }
+    std::size_t estTokens = 0;
+    std::string rootAttrs = rw::pricedRootAttr( doc.size(), rw::kBytesPerTokenDefault, 0, &estTokens );
+    if( budgetTokens > 0 && estTokens > budgetTokens )
+    {
+        const std::size_t legendEnd = doc.find( " -->" );
+        if( legendEnd != std::string::npos )
+        {
+            doc.insert( legendEnd, rw::kOverCeilingLegend );
+            rootAttrs = rw::pricedRootAttr( doc.size(), rw::kBytesPerTokenDefault, 0, &estTokens );
+        }
+        rootAttrs += " over_ceiling=\"1\"";
+    }
+    rw::spliceRootAttrs( doc, rootAttrs );
+}
+
+inline std::optional<std::string> forTaskText( const std::string& root, const std::string& task, RedactCounts* redact = nullptr,
+                                std::size_t budgetTokens = 0, bool noRoute = false,
+                                McpPageArgs page = {},   // L-W: limit/offset select the FILE PAGE (forpage.h), the CLI --for --limit twin
+                                const std::string& sections = std::string() )   // L2 (round-1 lever B1): the CLI --sections=
+                                                        // twin — "" (the default) collapses <lego>/<compose> to a counted
+                                                        // stub; "lego", "compose" or "lego,compose" opts back into the
+                                                        // pre-stub render (mcp.h validates the closed set before this call)
+{
+    const std::size_t forBudgetBytes = budgetTokens > 0 ? budgetBytesForTokens( budgetTokens )
+                                                        : kForPayloadBudgetBytes;
+    const McpIndex&          ix        = getIndex( root );
+    const IngestResult&      ing       = ix.ing;
+    // Routing is the DEFAULT here, exactly as for the CLI --for: a deterministic confidence-gated
+    // query-shape classifier picks name-exact vs subtoken+body BM25, so an identifier query lands the
+    // symbol (recall@1 ~99% vs ~77% plain) while conceptual queries keep the subtoken+body behavior
+    // (lexical.h chooseForRanker). MCP-only agents get the same optimization the CLI ships.
+    // `noRoute` is the MCP twin of the CLI --no-route (2026-09-10 audit F-R1-07): the router is not asked,
+    // so the ranker is the plain subtoken+body default, and — exactly as verbs_for.h does under the flag —
+    // the query-shape demotion, the mention anchor and the co-change prior are all skipped, because each of
+    // them is part of the routed reading. A default-constructed RouteChoice IS that reading: SubtokenBody,
+    // no reason, no anchors, so there is no route= to disclose and ctxRootOpen omits the attribute, which is
+    // byte-for-byte what the CLI emits under --no-route.
+    const RouteChoice        rc        = noRoute ? RouteChoice{} : chooseForRanker( ing, task );
+    // NOT const: LB-A's relevance floor narrows it below, once every boost has landed on lensRank. The
+    // MaxScore pruning bound two stanzas down consumes the PRE-floor value, which is the safe direction —
+    // a bound computed for a larger K can only keep more candidates, never fewer.
+    int                      forTopN   = kForLensDefaultTopN;   // F-03: the ONE cap, shared with the CLI lens (serialize.h)
+    // H2 (B0 r2): the MCP `for` bundle reads only the top-forTopN of this rank plus every interface
+    // (packLego) — same exact MaxScore pruning contract as the CLI --for (byte-identical output).
+    std::vector<char> ifaceExact( ing.symbols.size(), 0 );
+    for( std::size_t i = 0; i < ix.g.implementors.size() && i < ifaceExact.size(); ++i )
+    {
+        if( !ix.g.implementors[i].empty() )
+        {
+            ifaceExact[i] = 1;
+        }
+    }
+    // Query SHAPE + §P4 tier de-prioritization — same classifier, same multiplier, same order (before the
+    // mention anchor) as the CLI --for. This dialect always routes, so the shape is always asked for and
+    // the disclosure always has a route= to ride in.
+    const queryshape::Verdict shape   = queryshape::classify( task );
+    const std::vector<float>  tierMul = rankTierSymbolMultipliersShaped( ing, !noRoute && shape.fires() );
+    // deep-tail: this bundle now serves the file-grain tail, a full-distribution consumer — the H2
+    // MaxScore prune bound is 0 (exhaustive) here for the same reason the CLI --for passes
+    // fullDistribution (a pruned tail would make total= mode-dependent and its order incomplete).
+    // L-W: the term evidence behind the subtoken pass rides out for coverage= and the file page — the CLI
+    // twin's computeLensRanking makes the same two calls (one exhaustive subtoken pass on the identifier route).
+    LexTermEvidence    mcpEvidence;
+    std::vector<float> lensRank  = ( rc.which == LexMode::NameExact )
+                                       ? lexicalScoresNameExactRanked( ing, task, &tierMul )
+                                       : lexicalScoresTiered( ing, ix.g.outOff, ix.g.outTargets, task, /*pruneTopK=*/0, &ifaceExact, &tierMul,
+                                                              0, 0, {}, &mcpEvidence );
+    if( rc.which == LexMode::NameExact )
+    {
+        lexicalScoresTiered( ing, ix.g.outOff, ix.g.outTargets, task, /*pruneTopK=*/0, nullptr, &tierMul, 0, 0, {}, &mcpEvidence );
+    }
+
+    // B8 (query-mention anchoring): same default-on contract as the CLI --for — files / dotted modules /
+    // Scope.symbols literally NAMED in the task text are lifted to just below the top hit (the measured #1
+    // competitor-win bucket; bench/headtohead). Pure string extraction + in-memory matching (no I/O),
+    // inert (byte-identical) when the text names nothing indexed. CODECORTEX_NO_MENTION=1 (the shared
+    // ablation env) disables it here too. Runs BEFORE the co-change prior, same as the CLI.
+    std::string   mentionNote;
+    std::uint32_t mentionAnchored = 0;   // §L10b (wave-2 merge): the CLI twin's lr.anchorLifts — mention_anchored= on the root
+    // The CLI twin's lr.capAttrs: the INDEXING caps that cut this ranking, same names, same order, so the
+    // two surfaces cannot disagree about what was dropped (mention.h CapDisclosure). "" unless one bit.
+    std::string   capAttrs;
+
+    // input blow-up guard disclosure (lexical.h kMaxUniqueQueryTerms/dedupeQueryTerms) — same channel and
+    // same attribute names as the CLI twin (verbs_for.h computeLensRanking), so a capped task reads
+    // identically on both surfaces.
+    std::string termsCapNote;
+    {
+        CapDisclosure termsCap;
+        termsCap.note( "terms_capped", "terms_total", mcpEvidence.termsCapped, mcpEvidence.termsSeenTotal );
+        absorbCapDisclosure( termsCap, termsCapNote, capAttrs );
+    }
+
+    if( !noRoute && !std::getenv( "CODECORTEX_NO_MENTION" ) )
+    {
+        MentionBoostInfo mentionInfo;
+        if( applyMentionBoost( ing, task, lensRank, &mentionInfo ) )
+        {
+            char nb[ 220 ];
+            rw::formatTo( nb, sizeof( nb ), " [mention anchor: {} file{} + {} symbols named in the task, score lifted to within 5% of the top score; "
+                           "mention_anchored= on the root repeats this total]",
+                           mentionInfo.fileCount, mentionInfo.fileCount == 1 ? "" : "s", mentionInfo.symbolCount );
+            mentionNote     = nb;
+            mentionAnchored = mentionInfo.fileCount + mentionInfo.symbolCount;   // §A4f: the same count the CLI candidates root emits
+        }
+        absorbCapDisclosure( mentionInfo.caps, mentionNote, capAttrs );
+    }
+
+    // B3 (co-change prior boost) — OPT-IN, EXPERIMENTAL, same contract as CLI --cochange-boost: files that
+    // historically change WITH the top-ranked files promote their best symbols into the lower bundle (never
+    // displacing the seeds). Default OFF — honest numbers in cli.h: held-out multi-file +0.0pp on Python
+    // LocBench at warm p50 +19%; revisit on the C++ history eval. Mined per request (one `git log -500
+    // --name-only` popen; the .git walk-up guard makes non-git roots free) rather than cached on McpIndex:
+    // history moves when HEAD moves, which the mtime/content staleness stamp does not watch. The MCP verb
+    // has no per-call flags — CODECORTEX_COCHANGE=1 (the shared opt-in env) enables it here.
+    // Inert without usable history (depth-1 / non-git ⇒ support threshold unreachable ⇒ byte-identical output).
+    std::string boostNote;
+    if( !noRoute && std::getenv( "CODECORTEX_COCHANGE" ) && hasEnclosingGitRepo( root ) )
+    {
+        CommitWindowCensus coCensus;   // the kCoBoostMaxFilesPerCommit census (gitmine.h)
+        const auto coSets = gitRecentCommitFileSets( root, ing, kCoBoostCommitWindow, kCoBoostMaxFilesPerCommit, UINT32_MAX, &coCensus );
+        CoBoostInfo boostInfo;
+        // NOT guarded by coSets.empty(): applyCoChangeBoost records the commit-cap census BEFORE its own
+        // empty check and then returns false, so calling it unconditionally is what makes the cap honest.
+        // coSets is empty exactly when EVERY commit exceeded kCoBoostMaxFilesPerCommit -- the case where the
+        // cap bit hardest -- and a `!coSets.empty() &&` short-circuit meant coboost_commits_capped was the
+        // one disclosure never emitted at 100% drop. The return value still gates the boost NOTE alone.
+        if( applyCoChangeBoost( ing, coSets, lensRank, &boostInfo, &coCensus ) )
+        {
+            char nb[ 200 ];
+            rw::formatTo( nb, sizeof( nb ), " [cochange boost: promoted {} symbols in {} files that historically change with the top seeds (last {} commits)]",
+                           boostInfo.boostedSymbolCount, boostInfo.boostedFileCount, kCoBoostCommitWindow );
+            boostNote = nb;
+        }
+        absorbCapDisclosure( boostInfo.caps, boostNote, capAttrs );
+    }
+
+    // R5 (doc-mention surfacing) — same default-on, route-agnostic contract as the CLI --for: a doc
+    // that names one of the task's top-resolved symbols in a `backtick` (g.mentions, the same edges the
+    // `mentions` MCP verb reads) is lifted into the bundle, strictly below that symbol's own score.
+    // CODECORTEX_NO_DOC_MENTION=1 disables it here too (the shared ablation env, same as CODECORTEX_NO_MENTION).
+    std::string   docMentionNote;
+    std::uint32_t docMentions = 0;   // §L10b (wave-2 merge): the CLI twin's lr.docMentionCount — doc_mentions= on the root
+    if( !std::getenv( "CODECORTEX_NO_DOC_MENTION" ) )
+    {
+        DocMentionBoostInfo docMentionInfo;
+        if( applyDocMentionBoost( ix.g, lensRank, &docMentionInfo ) )
+        {
+            char nb[ 220 ];
+            rw::formatTo( nb, sizeof( nb ), " [doc mentions: {} doc{} discussing {} top-ranked symbol{} surfaced; doc_mentions= on the root repeats the doc count]",
+                           docMentionInfo.docCount, docMentionInfo.docCount == 1 ? "" : "s",
+                           docMentionInfo.anchorCount, docMentionInfo.anchorCount == 1 ? "" : "s" );
+            docMentionNote = nb;
+            docMentions    = docMentionInfo.docCount;
+        }
+        absorbCapDisclosure( docMentionInfo.caps, docMentionNote, capAttrs );
+    }
+
+    // LB-A (r10 §5) — THE RELEVANCE FLOOR, the CLI --for's own call (serialize.h relevanceFloorCut): one
+    // bundle-composition contract may not have two behaviours. lensRank is final at this point.
+    auto [ flooredTopN, floorNote ] = relevanceFloorCut( lensRank, forTopN );
+    forTopN = flooredTopN;
+
+    // L-W: the FILE PAGE — the same ranking, the same evidence, the same renderer as the CLI --for --limit=N
+    // (forpage.h), so the two dialects cannot serve a different page. Its own <files> root; nothing below runs.
+    const std::string_view mcpRootArg = ing.realPaths.empty() ? std::string_view( root ) : std::string_view();
+    if( page.limit > 0 || page.offset > 0 )
+    {
+        const ForFilePage filePage = computeForFilePage( ing, lensRank, mcpEvidence );
+        // PR #215 review item 4: this page composed "routed: " + rc.reason by hand and so answered in a spelling
+        // row 6 retired everywhere else — a parity break with the CLI page AND with this server's own bundle two
+        // functions down. ONE producer (filter.h routeNoteOf), same call as every other site.
+        const std::string pageRootOpen = ctxRootOpen( task, routeNoteOf( rc, shape, noRoute ), mcpRootArg );
+        return renderForFilePageXml( ing, filePage, ForPageRenderParts{ task, pageRootOpen, forCoveragePct( mcpEvidence, topLensId( lensRank ) ),
+                                                                        page.limit, page.offset, mcpRootArg, /*compactLegend=*/false } );
+    }
+
+    // H14 (capture-audit 2026-09-04): the ROUTING TRUST GAUGE. The CLI --for root carries
+    // confidence=/margin_pct= — "is this ranked head sharp, or is it flat and therefore a starting point
+    // rather than an answer" — and this twin carried neither, on the surface whose whole job is to route an
+    // agent. It is a pure function of the finished lensRank (lexical.h's adaptiveCut → deriveForConfidence,
+    // the CLI's own call with the CLI's own arguments), so there was never a cost reason for the omission.
+    const AdaptiveCut   mcpForCut = adaptiveCut( lensRank, 5, std::size_t( forTopN ), /*scanFullDistribution=*/true );
+    // T14 (docs/research/adaptive-short-query.md): same homonym-pool decline gate as the CLI --for twin
+    // (lexical.h isAdaptiveHomonymDecline) — this bundle is disclosure-only (it never narrows the served
+    // set on this statistic, see the H14 note above), but confidence= must still not claim "high" on a
+    // cliff driven by tie-break order rather than relevance. Routed through the SAME isNameExactRouteTag
+    // predicate emitCandidates uses and runForLens now uses too (review rv-t14a.md finding 1: three
+    // independent checks of "is this name-exact" is how the CLI one drifted into answering a different
+    // question under --no-route) — this call site already had the right FACT (rc.which is SubtokenBody by
+    // construction when noRoute defaulted rc, see RouteChoice's own default), just its own bespoke read of
+    // it; synthesize the same three-state tag verbs_for.h's routeTag carries so all three read one string.
+    const char* const   mcpRouteTag        = noRoute ? "no-route" : ( rc.which == LexMode::NameExact ? "name-exact" : "subtoken+body" );
+    const bool          mcpHomonymDecline = isAdaptiveHomonymDecline( isNameExactRouteTag( mcpRouteTag ), mcpForCut, 5 );
+    ForConfidence       mcpForConf = deriveForConfidence( mcpForCut, forTopN, mcpHomonymDecline );
+    // THE BUNDLE'S RESOLVED SURFACE (top-N by lensRank — the set <sigs> selects), shared by the compose
+    // view, the B6.3 route view and (§P3) the <lego> scope filter. Same order the CLI --for uses. Hoisted
+    // above the header (L-W): the thin verdict reads it.
+    const std::size_t   S = ing.symbols.size();
+    std::vector<NodeId> lensSurfaceIds( S );
+    for( NodeId i = 0; i < NodeId( S ); ++i )
+    {
+        lensSurfaceIds[i] = i;
+    }
+    std::sort( lensSurfaceIds.begin(), lensSurfaceIds.end(),
+               [ &lensRank ]( NodeId a, NodeId b ) { return lensRank[a] != lensRank[b] ? lensRank[a] > lensRank[b] : a < b; } );   // id tiebreak → deterministic (most lens scores tie at 0)
+    lensSurfaceIds.resize( std::min<std::size_t>( std::size_t( forTopN ), S ) );
+    // L-W: coverage= joins the pair on this root on a THIN answer only (present-only, the CLI twin's rule in
+    // forpage.h) — same clause, same byte exemption (mcpConfidenceExemptBytes reads the sizes below); the same
+    // verdict puts the widening page on the r=1 row's next=.
+    const int         mcpCoverage   = forCoveragePct( mcpEvidence, topLensId( lensRank ) );
+    const bool        mcpThin       = forAnswerIsThin( mcpCoverage, distinctFilesOf( ing, lensSurfaceIds ) );
+    const std::string mcpTopRowNext = mcpThin ? forWidenNext( task ) : std::string();
+    if( mcpThin && mcpCoverage >= 0 )
+    {
+        mcpForConf.attrs += " coverage=\"" + std::to_string( mcpCoverage ) + "\"";
+        mcpForConf.note  += kForCoverageLegend;
+    }
+
+    const std::vector<char>  impure    = computeImpure( ing, ix.g );
+
+    // fan-in counts: in-degree per node (how many symbols call this one — the "reuse" metric)
+    std::vector<std::uint32_t> fanIn( S, 0 );
+    {
+        const auto* ro = ix.g.inEdges.rowOffsets();
+        for( std::size_t i = 0; i < S; ++i )
+        {
+            fanIn[i] = ro[i + 1] - ro[i];   // in-degree = callers of symbol i
+        }
+    }
+
+    rw::MemoryStream stream;
+    std::FILE* const mem = stream.open();
+    if( !mem )
+    {
+        return std::nullopt;   // the answer buffer could not be opened: an internal error, never "not found"
+    }
+
+    // G4: task and rc.reason are agent-controlled and land verbatim in an XML comment below — a "-->" run
+    // would close the comment early and inject XML, and any "--" run alone breaks strict xmllint parsing.
+    // W3FIX M3: the dash collapse was the ONLY scrub here, so an agent-supplied C0 byte, invalid UTF-8
+    // sequence or newline still broke the document — xmlCommentText (serialize.h) is the ONE scrub for all
+    // three, shared with the CLI --for twin so the two dialects cannot diverge on hostile input.
+    const std::string safeTask = xmlCommentText( task );
+    // L1 (density audit 2026-08-08): rc.reason no longer needs a comment-scrubbed copy — it rides ONLY in
+    // the route= attribute (ctxRootOpen escapes it), same single-copy contract as the CLI --for twin
+    // (test/routeoncecheck.sh).
+    // H1 (B0 r2): the MCP `for` bundle enforces the same GLOBAL default payload budget as the CLI --for
+    // (serialize.h kForPayloadBudgetBytes). Lego + compose are rendered into memory FIRST so the <sigs>
+    // budget is the exact remainder; emission ORDER is unchanged (header, sigs, lego, compose, </ctx>),
+    // and when nothing trims the bytes are identical to the pre-H1 path.
+    // ── verifier FINDING E4 (2026-08-19): the CLI --for answered with `src/main.cpp` and disclosed root=;
+    //    its MCP twin answered the same question with the absolute path and disclosed nothing. Same
+    //    single-root condition, the same rootArg threaded into the same three emitters the CLI passes it to
+    //    (ctxRootOpen / packSignatures / packLego), and the same shared legend clause on the tail of the
+    //    header comment — so the two dialects stay byte-consistent on what they say and what they explain.
+    const std::string_view flRootArg = ing.realPaths.empty() ? std::string_view( root ) : std::string_view();
+    // T3 disclosure (test/fordisclosurecheck.sh #4): this verb serves the LAZY-BODY posture — signatures
+    // plus fetch_body handles, never inline bodies — and says so the way the CLI's auto bundle does:
+    // bundle= on the ctx root plus a legend clause naming the way to a body. The attribute-free root is
+    // reserved for the caller-CHOSEN opt-out (--signatures-only, pre-T3 byte-identical by registration);
+    // a posture the TOOL chose for the caller must be disclosed, or an MCP agent reading this bundle
+    // cannot tell "no bodies exist for this task" from "this dialect never serves them".
+    // §L10b + verify-wave2 F6: same trim as the CLI --for twin (verbs_for.h) — no leading " [" and no
+    // trailing "]"; the value lands only in route=, where the attribute quote is the delimiter.
+    const std::string mcpForAtAttrStr = gitstamp::atAttr( root );   // M10's at=, computed once: spliced onto the root AND exempted from the sigs charge below
+    std::string rootOpenStr = ctxRootOpen( task, routeNoteOf( rc, shape, noRoute ),   // row 6: the route CODE, ONE producer (filter.h)
+                                           flRootArg );   // §B1.7: same root attrs as the CLI twin (no route= under no_route, as --no-route)
+    if( !rootOpenStr.empty() && rootOpenStr.back() == '>' )
+    {
+        // Attribute ORDER matches the CLI twin's: confidence/margin_pct, then at=, then this dialect's own
+        // bundle=/budget_tokens= — the §P8 "one element name, one attribute order, both surfaces" rule.
+        rootOpenStr.insert( rootOpenStr.size() - 1, mcpForConf.attrs );
+        rootOpenStr.insert( rootOpenStr.size() - 1, mcpForAtAttrStr );
+        // §L10b (landed on this twin at the wave-2 merge, lane-L10b.md "found, not fixed" #1): the machine
+        // form of mentionNote/docMentionNote, EACH present only when its own note fired — the CLI twin's
+        // exact rule and attribute order (verbs_for.h mentionDocAttrsStr), so test/mcpattrparitycheck.sh
+        // sees the same root on both surfaces.
+        // Gated on the COUNTS, not the note strings — the CLI twin's own change in the cap-disclosure lane:
+        // a note can now carry a cap clause on a run that anchored nothing, and a fabricated "0" is what
+        // non-negotiable #3 forbids.
+        if( mentionAnchored > 0 )
+        {
+            rootOpenStr.insert( rootOpenStr.size() - 1, " mention_anchored=\"" + std::to_string( mentionAnchored ) + "\"" );
+        }
+        if( docMentions > 0 )
+        {
+            rootOpenStr.insert( rootOpenStr.size() - 1, " doc_mentions=\"" + std::to_string( docMentions ) + "\"" );
+        }
+        rootOpenStr.insert( rootOpenStr.size() - 1, capAttrs );   // "" unless a cap bit — an empty insert is a no-op
+        rootOpenStr.insert( rootOpenStr.size() - 1, " bundle=\"sigs\"" );
+        if( budgetTokens > 0 )   // M13/H9: the ceiling this bundle was shaped against, named where the CLI names it
+        {
+            rootOpenStr.insert( rootOpenStr.size() - 1, " budget_tokens=\"" + std::to_string( budgetTokens ) + "\"" );
+        }
+        // H14: the DECLARED omission. This dialect serves no git pass (a per-request `git log` on a
+        // long-lived server is a cost the CLI does not pay) and no quality pass, so the three lens columns
+        // the CLI rows carry are absent here — which used to make this bundle serve MORE rows than the CLI
+        // under the same byte cap, with nothing on the screen saying why. Naming them is the contract:
+        // absent-and-declared is an answer, absent-and-silent is a hole. Gate: test/mcpattrparitycheck.sh,
+        // whose lens= arm ALSO fails if a name here is one this dialect does emit.
+        // F5 (terminality round A 2026-09-05): est_tokens= is NO LONGER on this declaration. It joined it at
+        // the wave-2 merge on the reasoning "this bundle is shaped by the server's payload byte cap and is
+        // never priced" — but the bundle is fully rendered in memory before it is returned, so it CAN be
+        // priced, and declaring an absence is honest about a hole, not an answer: a client handed no number
+        // cannot budget the call it just paid for (merge-wave2 "found, not fixed" #2). It is now served, on
+        // the delivered bytes, through the same pricedRootAttr fixpoint every other priced root uses — see
+        // the splice at the end of this function.
+        rootOpenStr.insert( rootOpenStr.size() - 1, " lens=\"churn,amp,tested\"" );
+    }
+    // Read off the BUILT root open, never re-derived from noRoute: the two must agree, and only one of them is
+    // what the caller actually receives.
+    const bool  mcpForRouteAttrOn = rootOpenStr.find( " route=\"" ) != std::string::npos;
+    // PRESENT-ONLY, ON BOTH DIALECTS (CodeRabbit, PR #215, second round). The CLI lens made both droppable
+    // readings present-only — sc= when a row this bundle could serve carries a scope, route= when the root
+    // carries the attribute — while this twin appended kForIdRouteLegend UNCONDITIONALLY, so a scope-free answer
+    // DEFINED an attribute that no row carried; and the exemption ledger below hand-built the same decision a
+    // second time, which is the four-sites-one-rule drift rw::forIdRouteLegendParts exists to close. Same rule
+    // and the same deliberate OVER-approximation as the CLI twin (verbs_for.h forScPresent): read off the RANKED
+    // SET, before the header is built, because the header built here is the one this dialect serves — the trim
+    // ladder may still drop the only scoped row, and a reading with nothing to define costs 29 B while the
+    // reverse costs a reader an attribute with no definition anywhere in the document.
+    bool mcpForScPresent = false;
+    for( std::size_t i = 0; i < ing.symbols.size() && !mcpForScPresent; ++i )
+    {
+        mcpForScPresent = lensRank[i] > 0 && rw::hasScopeAttr( ing.symbols[i] );
+    }
+    // ONE decision, read twice below: appended into the header here, subtracted from the sigs charge there.
+    const rw::ForIdRouteLegendParts mcpIdRouteParts = rw::forIdRouteLegendParts( /*legendOn=*/true, mcpForScPresent, mcpForRouteAttrOn );
+    // R2-AF (round 2, S4): the SAME resolver the CLI twin calls (rw::forNamedHeaderRows, mention.h) — one
+    // resolution, both surfaces. Rows are emitted right after headerStr is flushed, below; the legend
+    // clause (present-only, never ceiling-dropped — this dialect has no ceiling ladder at all) goes here.
+    const std::vector<rw::ForNamedHeaderRow> mcpForHdrRows = rw::forNamedHeaderRows( ing, task );
+    std::string headerStr = rootOpenStr
+                          + "<!-- codecortex lens for \"" + safeTask + "\"" + termsCapNote + mentionNote + boostNote + docMentionNote + floorNote
+                          + std::string( rw::kMcpForBuildingBlocksLegend )
+                          + std::string( mcpIdRouteParts.sc )      // row 6: sc= — the CLI twin's exact clause, on the CLI twin's presence rule
+                          // …and the route= code, present-only, exactly as the CLI twin appends it (forRouteAttrPresent):
+                          // this dialect drops route= under no_route, and a reading with no attribute beside it is noise.
+                          + std::string( mcpIdRouteParts.route )
+                          + std::string( rw::kMcpForBundleSigsLegend )
+                          + std::string( mcpForConf.note )
+                          // No "--" anywhere in this clause: it rides inside an XML comment, where a double
+                          // hyphen is ill-formed (G4), so the CLI verb is named without its dashes.
+                          + std::string( rw::kMcpForLensColumnsLegend )
+                          + std::string( rw::kForFileTailLegend )   // deep-tail: r= + <tail> definitions, the CLI twin's exact clause (sigs-charge-exempt below)
+                          + ( mcpForHdrRows.empty() ? std::string() : std::string( rw::kForHdrLegend ) )   // R2-AF: present-only
+                          + " -->"
+                          // r2-LO: at= rides this root (mcpForAtAttrStr) and was defined nowhere in the document — the CLI twin passes
+                          // its at= condition here and this twin did not. Its 24 B are exempt from the sigs charge below, so the served
+                          // rows are byte-identical to the answer that left at= undefined.
+                          + rw::forRootRelPathsLegendShort( !flRootArg.empty(), !mcpForAtAttrStr.empty() );   // W3-S item 5: closes the gap this comment used to record
+    // W3-S item 5 (2026-08-19): both --for dialects now carry rw::kForRootRelPathsLegendShort (graphlegend.h)
+    // — the SAME short spelling, appended here exactly as the CLI twin (forLensHeaderText, main.cpp) does,
+    // so byte-consistency between the two dialects (this file's own standing contract) still holds. See that
+    // function's own comment for why a shorter wording, not the shared 18-verb kRootRelPathsLegend, closes
+    // this gap: this lens's ceiling is the one place the full 159 B clause measurably does not fit.
+    const auto renderToString = [ ]( auto&& emitFn ) -> std::string { return captureXml( emitFn ); };
+
+    // §P3: same scope + identity the CLI --for embeds — the MCP bundle must not carry wider scope (interfaces
+    // this task never reached) or less identity (p= on every row) than its CLI twin.
+    std::vector<std::vector<NodeId>> legoScoped = legoImplementorsOnSurface( ing, ix.g.implementors, lensSurfaceIds );
+    // L2 (round-1 lever B1): each renderer's OWN pre-cap row count, captured by the SAME call that renders
+    // the real body — see verbs_for.h's identical CLI-twin comment for the full rationale.
+    std::size_t legoPreCapCount = 0, composePreCapCount = 0;
+    std::string legoStr = renderToString( [ & ]( std::FILE* m2 ) { packLego( m2, ing, legoScoped, lensRank, 12, redact, &impure, kNoNode, /*withPaths=*/true, flRootArg, {}, &legoPreCapCount ); } );
+    std::string composeStr, routeStr;
+    if( !ix.g.composeEdges.empty() )
+    {
+        composeStr = renderToString( [ & ]( std::FILE* m2 )
+                                     { packCompose( m2, ing, ix.g.composeEdges, lensSurfaceIds, &composePreCapCount ); } );
+    }
+    if( !ix.g.routeEdges.empty() )
+    {
+        routeStr = renderToString( [ & ]( std::FILE* m2 )
+                                   { packRoutes( m2, ing, ix.g.routeEdges, lensSurfaceIds ); } ); // B6.3
+    }
+    // deep-tail: the tail legend's bytes are exempt from the sigs charge, exactly as the CLI twin exempts
+    // them — charging a disclosure against the ranked head is what the D2/confidence precedents forbid.
+    // CONFIDENCE + at= (wave-2 merge, capture-audit 2026-09-04): the CLI twin's exemption (verbs_for.h
+    // confidenceExemptBytes), applied here for the CLI's own reason — a disclosure's contract is DISCLOSURE
+    // ONLY, and charging its bytes against the ranked head drops a tail <d> row to pay for it. Measured at
+    // the merge: two lanes' root disclosures (mention_anchored=/doc_mentions= with their note wording, and
+    // the est_tokens= lens declaration) grew this header by 125 B on this repo's src, and the bundle lost one
+    // ranked row the CLI still served (test/mcpforparitycheck.sh (2), two of four conceptual tasks). The
+    // header bytes stay real downstream (the payload is what it is); only the sigs allowance stops paying.
+    const std::size_t mcpConfidenceExemptBytes = mcpForConf.attrs.size() + mcpForConf.note.size() + mcpForAtAttrStr.size();
+    // Row 6 (2026-09-12): the sc=/route= reading (kForIdRouteLegend, appended above) is exempt on the same contract —
+    // charged, it grew this header by 259 B and dropped one ranked row the CLI still served (mcpforparitycheck (2),
+    // two of four conceptual tasks: the exact regression the paragraph above records for the 125 B of 2026-09-04).
+    // …and the SAME decision the append made, so the ledger can never subtract a clause the header never wrote
+    // (the CLI twin's own idRouteParts ledger, verbs_for.h, for the identical reason).
+    const std::size_t mcpIdRouteExemptBytes = mcpIdRouteParts.bytes();
+    const std::size_t mcpAtLegendExemptBytes = !flRootArg.empty() && !mcpForAtAttrStr.empty() ? rw::kForAtStampProse.size() : 0;   // r2-LO, above
+    const std::size_t fixedBytes = headerStr.size() - rw::kForFileTailLegend.size() - mcpConfidenceExemptBytes - mcpIdRouteExemptBytes - mcpAtLegendExemptBytes
+                                 + legoStr.size() + composeStr.size() + routeStr.size() + 6;   // + "</ctx>"
+    const std::size_t sigsBudget = forBudgetBytes > fixedBytes ? forBudgetBytes - fixedBytes : 1;   // ≥1: 0 = "no budget"
+
+    // L3: field-notes surfacing — parity with the CLI --for lens. loadNoteIndex reads root/.codecortex_notes (a
+    // small file); nullptr when EMPTY so the bundle stays byte-identical when there is nothing to surface.
+    const notes::NoteIndex        noteIndex = notes::loadNoteIndex( root );
+    const notes::NoteIndex* const notesPtr  = noteIndex.empty() ? nullptr : &noteIndex;
+
+    // A2 (survey card, 2026-09-03): sigs render into their OWN buffer (rather than streaming straight into
+    // `mem` the way this call used to) so droppedPositive is known BEFORE headerStr is written — headerStr,
+    // once flushed to `mem`, cannot be edited retroactively (the same reason the CLI twin's degrade path
+    // never gets the attribute). Byte-for-byte the same content this call always produced.
+    std::size_t mcpDroppedPositive = 0;
+    bool        mcpSigsCapped      = false;   // did the H1 ladder trim <sigs>? — decides the budget_bytes= disclosure below
+    std::vector<rw::NodeId> mcpShownIds;   // lane 2: the sigs rows actually emitted — the tail excludes these files, not the whole surface
+    std::string sigsStr = renderToString( [ & ]( std::FILE* m2 )
+    {
+        packSignatures( m2, ing, lensRank, forTopN, 0 /* no byte budget in MCP (0 = unlimited) */, true, &fanIn, &impure, redact,
+                        nullptr, nullptr, nullptr, nullptr,   // Q3 lens vectors — the MCP verb has no git/clone pass (as before)
+                        /*rankAdaptivePayload=*/true,         // B0.3: same rank-adaptive payload rule as the CLI --for lens
+                        sigsBudget,                           // H1: global payload budget (trim ladder; payload="capped" marker)
+                        notesPtr,                             // L3: field-notes surfacing (inert when null)
+                        flRootArg,                            // R-E: root-relative p=, same argument the CLI twin passes
+                        /*hasRelevanceFloor=*/true,           // LB-A: shrink past the zero-score tail, never pad
+                        &mcpDroppedPositive,                  // A2: exact count, see droppedPositiveCount (serialize.h)
+                        &mcpShownIds,                         // lane 2: see verbs_for.h shownSigIds
+                        &mcpSigsCapped,                       // the ladder's own verdict — see the budget_bytes= splice below
+                        mcpTopRowNext );                      // L-W: the widening page on a thin answer, else the body
+    } );
+    // A2: same insert-before-"-->" splice as the CLI twin (verbs_for.h) — absent entirely on the (overwhelming)
+    // no-drop path, so headerStr's bytes are unchanged there (byte-identical to the pre-A2 output). Bare
+    // spelling (no bracket note), same economy and same reasoning as the CLI twin — byte-consistent between
+    // the two dialects, the way every other --for header fragment in this function already is.
+    if( mcpDroppedPositive > 0 )
+    {
+        const std::size_t closeAt = headerStr.rfind( " -->" );
+        if( closeAt != std::string::npos )
+        {
+            char nb[ 40 ];
+            rw::formatTo( nb, sizeof( nb ), " dropped_positive=\"{}\"", mcpDroppedPositive );
+            headerStr.insert( closeAt, nb ); // else: unexpected shape, header left as-is
+        }
+    }
+    // budget_bytes= — the CLI twin's disclosure (verbs_for.h, where the full argument lives), on this
+    // surface for the §P8 reason every other fragment in this function is: one element name, one attribute
+    // order, both surfaces. This dialect is budgeted by DEFAULT exactly as the CLI is (forBudgetBytes above
+    // is kForPayloadBudgetBytes when the caller passed no budget_tokens), and it disclosed the cut
+    // (<sigs capped="1">) without naming what did the cutting. Same two conditions as the CLI: the ladder
+    // actually fired, and the caller named no ceiling of their own — so exactly one ceiling rides a trimmed
+    // bundle. Same clause text, so the two dialects say the same sentence. Spliced AFTER the sigs render,
+    // like dropped_positive= above, so sigsBudget and therefore the served row set are untouched; est_tokens
+    // is spliced onto the finished document further down and so prices these bytes.
+    if( mcpSigsCapped && budgetTokens == 0 )
+    {
+        const std::size_t rootCloseAt = headerStr.find( "><!--" );
+        if( rootCloseAt != std::string::npos )
+        {
+            headerStr.insert( rootCloseAt, " budget_bytes=\"" + std::to_string( rw::kForPayloadBudgetBytes ) + "\"" );
+        }
+        const std::size_t closeAt = headerStr.rfind( " -->" );
+        if( closeAt != std::string::npos )
+        {
+            headerStr.insert( closeAt, rw::kForBudgetBytesNote );
+        }
+    }
+    // L3 follow-up (CodeRabbit 4053600616): same splice shape as dropped_positive=/budget_bytes= above — absent
+    // entirely on a clean read. `noteIndex.degraded` is read here (not through notesPtr, which is nulled on an
+    // EMPTY index even when the read itself was not clean — see notesPtr's own comment above).
+    if( noteIndex.degraded )
+    {
+        const std::size_t rootCloseAt = headerStr.find( "><!--" );
+        if( rootCloseAt != std::string::npos )
+        {
+            headerStr.insert( rootCloseAt, std::string( rw::notes::kNotesDegradedAttr ) );
+        }
+        const std::size_t closeAt = headerStr.rfind( " -->" );
+        if( closeAt != std::string::npos )
+        {
+            headerStr.insert( closeAt, " [" + std::string( rw::notes::kNotesDegradedReading ) + "]" );
+        }
+    }
+    std::fwrite( headerStr.data(), 1, headerStr.size(), mem );
+    // R2-AF (round 2, S4): first rows inside the root, right after the legend — the CLI twin's exact rule
+    // (verbs_for.h renderForHdrRowsXml), duplicated here rather than shared because main.cpp includes this
+    // file (mcp.h, line 48) before verbs_for.h (line 525) — the render is ~10 lines over the SAME resolver
+    // (rw::forNamedHeaderRows, mention.h), which is the part a divergence would actually cost.
+    if( !mcpForHdrRows.empty() )
+    {
+        const std::string mcpHdrRootPrefix = flRootArg.empty() ? std::string() : rw::sarif::rootPrefixOf( flRootArg );
+        const auto         mcpHdrRel        = [ & ]( std::uint32_t f ) -> std::string
+        {
+            return flRootArg.empty() ? std::string( ing.files[f] ) : std::string( rw::sarif::rootRelativeUri( ing.files[f], mcpHdrRootPrefix ) );
+        };
+        std::vector<char> mcpHdrEsc;
+        std::string       mcpHdrXml;
+        for( const rw::ForNamedHeaderRow& row : mcpForHdrRows )
+        {
+            // same local invariant as the CLI twin's renderForHdrRowsXml (verbs_for.h): the resolver
+            // (rw::forNamedHeaderRows, mention.h) is the only producer of these ids.
+            ASSUME( row.partnerFile < ing.files.size() && row.namedFile < ing.files.size() );
+            mcpHdrXml += "<hdr p=\"";
+            mcpHdrXml += rw::escapeXml( mcpHdrRel( row.partnerFile ), mcpHdrEsc );
+            mcpHdrXml += "\" of=\"";
+            mcpHdrXml += rw::escapeXml( mcpHdrRel( row.namedFile ), mcpHdrEsc );
+            mcpHdrXml += "\"/>";
+        }
+        std::fwrite( mcpHdrXml.data(), 1, mcpHdrXml.size(), mem );
+    }
+    // §P3 × §P4 (parity with the CLI --for): narrow the lego block to the files the budget-trimmed sigs
+    // actually kept and re-render (a byte-subset of what the budget already charged for) — reads sigsStr
+    // directly now rather than re-slicing it back out of the flushed memstream buffer.
+    if( !legoStr.empty() && narrowLegoToRenderedSigs( ing, legoScoped, sigsStr ) )
+    {
+        legoStr = renderToString( [ & ]( std::FILE* m2 ) { packLego( m2, ing, legoScoped, lensRank, 12, redact, &impure, kNoNode, /*withPaths=*/true, flRootArg, {}, &legoPreCapCount ); } );   // R-R: the re-render dropped the root its first render (above) passed
+    }
+    // R2-L2' (round-2, priced re-registration of L2/B1): the CLI twin's exact stub substitution
+    // (verbs_for.h) — same rule, same restoring spelling (kept as the CLI flag form: this dialect's next=
+    // is already CLI-flag-shaped everywhere else, e.g. the r=1 row's --expand=FILE:NAME, so the two
+    // surfaces do not need two spellings), and the SAME shared size gate (rw::priceSectionStub,
+    // serialize.h). This surface has no buffered/degrade-path split (renderToString always renders whole),
+    // so hasRenderedBytes is always true here and the size gate always has a true length to price.
+    //
+    // R2-L2p (independent review, 2026-09-19): mcpLegoWillStub/mcpComposeWillStub decide the SAME collapse
+    // the CLI twin discloses via kForSectionStubLegend (verbs_for.h finishForLensHeaderPriced), but this
+    // block used to just swap legoStr/composeStr for their stubs and never carried that clause anywhere —
+    // an MCP caller got a stubbed section with no legend explaining the cut. mcpSectionsWillStub survives
+    // this block's scope so the splice below (after `out` is assembled, mirroring priceForTaskRoot's own
+    // late-insertion technique for kOverCeilingLegend) knows whether to add it.
+    bool mcpSectionsWillStub = false;
+    {
+        const bool mcpWantLego    = sectionsWant( sections, "lego" );
+        const bool mcpWantCompose = sectionsWant( sections, "compose" );
+        const bool mcpLegoCandidate    = !legoStr.empty()    && !mcpWantLego;
+        const bool mcpComposeCandidate = !composeStr.empty() && !mcpWantCompose;
+        if( mcpLegoCandidate || mcpComposeCandidate )
+        {
+            std::string sectionsNextMcp = nextFlag( "--for=", task );
+            sectionsNextMcp += ' ';
+            sectionsNextMcp += nextFlag( "--sections=", "lego,compose" );
+            const SectionStubPricing legoPricing    = mcpLegoCandidate
+                ? priceSectionStub( "lego",    legoPreCapCount,    sectionsNextMcp, /*hasRenderedBytes=*/true, legoStr.size() )
+                : SectionStubPricing{};
+            const SectionStubPricing composePricing = mcpComposeCandidate
+                ? priceSectionStub( "compose", composePreCapCount, sectionsNextMcp, /*hasRenderedBytes=*/true, composeStr.size() )
+                : SectionStubPricing{};
+            const bool mcpLegoWillStub    = mcpLegoCandidate    && legoPricing.collapse;
+            const bool mcpComposeWillStub = mcpComposeCandidate && composePricing.collapse;
+            // postcondition of the rule itself, checked BEFORE the swap below discards the original size:
+            // whichever section actually collapses is, by construction, smaller than what it replaced.
+            ENSURES( !mcpLegoWillStub    || legoPricing.stubXml.size()    < legoStr.size(),
+                     "R2-L2' MCP twin: a lego stub collapsed without being smaller than the section it replaced" );
+            ENSURES( !mcpComposeWillStub || composePricing.stubXml.size() < composeStr.size(),
+                     "R2-L2' MCP twin: a compose stub collapsed without being smaller than the section it replaced" );
+            if( mcpLegoWillStub )
+            {
+                legoStr = legoPricing.stubXml;
+            }
+            if( mcpComposeWillStub )
+            {
+                composeStr = composePricing.stubXml;
+            }
+            // R2-L2p: same truth table as the CLI's `if( legoWillStub || composeWillStub ) sectionsStubNote = …`
+            // (verbs_for.h ~2858): the legend rides iff at least one section actually collapsed.
+            mcpSectionsWillStub = mcpLegoWillStub || mcpComposeWillStub;
+        }
+    }
+    std::fwrite( sigsStr.data(), 1, sigsStr.size(), mem );
+    std::fwrite( legoStr.data(), 1, legoStr.size(), mem );
+    std::fwrite( composeStr.data(), 1, composeStr.size(), mem );
+    std::fwrite( routeStr.data(), 1, routeStr.size(), mem );   // B6.3
+    // DEEP-TAIL d2, MCP twin: the same shared walk + renderer the CLI --for uses (serialize.h), from the
+    // same resolved surface — the fixed default budget regime, so the tail rides on top (default row cap)
+    // and the ranked head above stays byte-identical to a tail-less bundle.
+    {
+        std::vector<char> tailEsc;
+        const std::string tailStr = renderFileTailXml( computeFileTail( ing, lensRank, mcpShownIds, flRootArg ),
+                                                       kForFileTailShownCap, tailEsc );
+        std::fwrite( tailStr.data(), 1, tailStr.size(), mem );
+    }
+    rw::emitRaw( mem, "</ctx>" );
+    std::optional<std::string> answer = mcpAnswerText( stream );
+    if( !answer )
+    {
+        return std::nullopt;   // the buffer lost bytes: the same internal error as the failed open above
+    }
+    std::string out = std::move( *answer );
+    // R2-L2p: the legend clause disclosing a stubbed lego/compose section (kForSectionStubLegend) — the
+    // whole contract lives in spliceForSectionStubLegend above; `stubbed` false (the overwhelming common
+    // path) returns immediately and costs this function nothing but the call. Done BEFORE priceForTaskRoot
+    // so the clause's bytes are part of the est_tokens price exactly as the CLI's own version is.
+    spliceForSectionStubLegend( out, mcpSectionsWillStub );
+    // F5 (terminality round A 2026-09-05): PRICE the bundle instead of declaring it unpriced. The document is
+    // complete here, so this is the same measurement the CLI twin makes over its own (deliberately different)
+    // bytes: pricedRootAttr's ≤4-pass fixpoint at kBytesPerTokenDefault, spliced onto the <ctx> root by the
+    // shared splicer — no second estimator, and no number that could disagree with the CLI's for the same
+    // reason the CLI's could disagree with itself. Charged AFTER the sigs budget on purpose: a disclosure's
+    // contract is disclosure only, and charging its ~18 bytes against the ranked head would drop a row to pay
+    // for the attribute that describes the head — the same exemption mcpConfidenceExemptBytes already makes.
+    // r2-LO: a completeness attribute this bundle carries and its own legend never spells (at=, ccx=, next=) gets its compact
+    // reading — BEFORE pricing, so est_tokens= prices the bytes served, and after the sigs budget, so the rows are unchanged.
+    closeRosterGaps( out );
+    priceForTaskRoot( out, budgetTokens );   // R1: est_tokens=, and over_ceiling="1" when it exceeds budgetTokens
+    return out;
+}
+
+// `lego` verb: the TARGETED interface→impls "Lego" view for ONE named interface/base — its signature,
+// method contract (where sound), and EVERY implementor (own-language only), with p= file paths. Mirrors
+// the CLI --lego=TYPE exactly (same packLego + resolveFocus + <lego> schema). `type` may be "file:name"
+// to disambiguate a same-named type across languages. Returns the <ctx><lego>…</lego></ctx> XML as a
+// string, or "" ONLY when `type` does not resolve to any symbol at all (caller reports "not found").
+//
+// D8 fix: a resolved type with ZERO implementors is NOT the same failure as "not found" — packLego now
+// emits that interface's own contract with implementors="0" (the honest "nothing snaps in here yet"
+// signal, same as the CLI). Previously this function pre-empted packLego with its own empty-implementors
+// check and returned "" for BOTH cases, which is exactly the conflated message the caller downstream had
+// to guess at ("type not found or has no implementors"); removing that check lets the two cases produce
+// genuinely different, unambiguous outcomes.
+inline std::string legoText( const std::string& root, const std::string& type, RedactCounts* redact )
+{
+    const McpIndex&     ix           = getIndex( root );
+    const IngestResult& ing          = ix.ing;
+    std::size_t         unprovenDefs = 0;   // H1: the decl→def residue, the CLI --lego's unproven_defs= — same resolver, same helpers
+    const NodeId        focus        = resolveFocus( ing, type, &unprovenDefs );
+    if( focus == kNoNode )
+    {
+        return {};
+    }
+
+    const std::vector<char> impure = computeImpure( ing, ix.g );
+    const std::vector<float> flat( ing.symbols.size(), 0.f );
+
+    return captureXml( [ & ]( std::FILE* mem )
+    {
+        // H5: the same legend the CLI --lego prints, and (issue #66) the same adjacent clause defining the
+        // graph_unindexed= the root below carries — CLI and MCP are one wording by construction. H1: the unproven_defs=
+        // clause rides as its own comment beside the closed literal, exactly as on the CLI.
+        rw::emitTo( mem, "<ctx>{}{}{}", kLegoLegend, graphUnindexedLegendComment( ix.g.unindexedFiles > 0 ).c_str(),
+                    unprovenDefsVerbComment( UnprovenDefsVerb::Lego, unprovenDefs > 0, "<!-- codecortex lego: " ).c_str() );
+        packLego( mem, ing, ix.g.implementors, flat, 1, redact, &impure, focus, /*withPaths=*/true,
+                  ing.realPaths.empty() ? std::string_view( root ) : std::string_view(),    // R-R: root-relative <iface p=>
+                  unprovenDefsAttrXml( unprovenDefs ) + graphCountFloorAttrXml( ix.g ) );    // H1 + M15: residue, gauge, marker
+        rw::emitRaw( mem, "</ctx>" );
+    } );
+}
+
+// `owners` verb: bus-factor analysis — recency-weighted author ownership per file (or per the file
+// that defines `symbolName` when non-empty). Reuses gitFileAuthors() from gitmine.h.
+// Returns the owners XML text (same shape as --owners CLI output) as a string,
+// or "" when git is unavailable / no history (caller converts to an error response).
+// §P6.4: CLI/MCP parity — authors=1 files fold into one <uniform/> row here too (gitmine.h's
+// countUniformOwnership/ownershipRowsToPrint, shared with main.cpp's --owners), same 75KB-of-identical-
+// rows problem applies to an MCP client's context window just as much as a terminal. No `detail` plumbing
+// on this path yet (the MCP request shape here carries no such field) — always collapsed, matching the
+// CLI's own default.
+// M13: --owners is in cli.h's honorsPaging set; this twin served every row and named no window.
+inline std::optional<std::string> ownersText( const std::string& root, const std::string& symbolName, McpPageArgs page = {} )
+{
+    const McpIndex&     ix  = getIndex( root );
+    const IngestResult& ing = ix.ing;
+
+    // optional symbol→file restriction (mirrors --owners=SYM CLI logic)
+    std::uint32_t onlyFileId  = UINT32_MAX;
+    std::size_t   symDefCount = 0;      // §B11.3-class: how many definitions the pick below discarded
+    std::string   seedSym;              // @-seed rebind: the rebound definition's name, disclosed as sym=
+    const NodeId  seedDef     = atSeedDefOr( ing, symbolName );   // the seed's OWN def+file — see its contract
+    if( seedDef != kNoNode )
+    {
+        onlyFileId  = ing.symbols[ seedDef ].fileId;
+        symDefCount = 1;                // the seed names ONE place, so exactly one definition is covered
+        seedSym     = ing.symbols[ seedDef ].name;
+    }
+    else if( !symbolName.empty() && symbolName.front() == '@' )
+    {
+        return std::string{}; // faulted seed — refused upstream; this arm only defends dispatch drift
+    }
+    else if( !symbolName.empty() )
+    {
+        const std::vector<NodeId> defs = resolveAllByName( ing, symbolName );
+        if( defs.empty() )
+        {
+            return std::string{}; // symbol not found → caller sends -32602
+        }
+        // ONE of N definitions — the lowest node id — and the report then covers that definition's file
+        // alone under files="1", while callers/uses/impact/mentions on the same name all disclose defs=.
+        onlyFileId  = ing.symbols[ defs[0] ].fileId;
+        symDefCount = defs.size();
+    }
+
+    const std::vector<FileOwnership> ownerships = gitFileAuthors( root, ing, onlyFileId );
+    if( ownerships.empty() )
+    {
+        return std::string{}; // git unavailable or no history → caller sends error
+    }
+
+    rw::MemoryStream stream;
+    std::FILE* const mem = stream.open();
+    if( !mem )
+    {
+        return std::nullopt;   // the answer buffer could not be opened: an internal error, never "not found"
+    }
+
+    const int          cap          = int( ownerships.size() );
+    const std::size_t  uniformCount = countUniformOwnership( ownerships, cap );
+    const auto          printRows    = ownershipRowsToPrint( ownerships, cap, /*detail=*/false );
+
+    std::vector<char> owEsc;
+    // §B6 M12: the files=-DEPTH collision clause, ported from the CLI legend. This element spells `files=`
+    // twice with two different meanings — the ROOT's is how many files were ANALYSED, the <uniform/> fold's
+    // is how many of them collapsed into that one row — and the CLI defuses it in words while the MCP twin
+    // shipped the identical ambiguity undefused. The name is deliberately NOT renamed (both meanings are
+    // load-bearing on the CLI side); the disclosure is what travels.
+    rw::emitRaw( mem, "<!-- codecortex owners: recency-weighted author ownership (half-life=6mo). "
+                       "bf=1 = one person holds >80% of weighted commits (bus-factor risk); "
+                       "authors=1 files fold into <uniform/> below. "
+                       "files= means two different things by DEPTH here and is deliberately not renamed: on the ROOT it is how "
+                       "many files were ANALYSED; on the <uniform/> fold it is how many of them collapsed into that one row. "
+                       "With a symbol, of= echoes it and defs= is how many DEFINITIONS that name has: this report covers the "
+                       "file holding the FIRST of them (lowest node id), so defs= above 1 means the other definitions' files "
+                       "were NOT analysed. An @FILE:LINE seed rebinds to the innermost definition enclosing that line "
+                       "(sym= names it) and covers exactly that definition's file -->" );
+    // §P8: the SAME <owners> element the CLI emits, so it takes the same at=. Stamping only the CLI half
+    // would re-create, inside one element name, the two-shapes-one-spelling problem this round removes.
+    // §B11.3-class: and the same of=/defs= fold disclosure, for the same reason.
+    std::vector<char>  owSymEsc;
+    // the @-seed rebind disclosure sits between of= (the seed as typed) and defs=, the same slot the CLI
+    // --owners twin uses — §P8: one element name, one attribute order, both surfaces.
+    const std::string  owSeedAttr = seedSym.empty() ? std::string{}
+                                                    : " sym=\"" + std::string( escapeXml( seedSym, owSymEsc ) ) + "\"";
+    const std::string  owSymAttr  = symbolName.empty()
+                                  ? std::string{}
+                                  : " of=\"" + std::string( escapeXml( symbolName, owSymEsc ) ) + "\"" + owSeedAttr
+                                  + " defs=\"" + std::to_string( symDefCount ) + "\"";
+    // R-E fix (2026-08-19): the same root-relative p= + root= the CLI --owners now emits, in the same slot
+    // (root= before at=, so at= stays LAST — the r26 placement rule). The first R-E landing converted the CLI
+    // arm alone and left this one spelling absolute paths, which is the divergence the §P8 note above forbids.
+    const bool         owSingleRoot = ing.realPaths.empty();
+    const std::string  owRootPrefix = owSingleRoot ? sarif::rootPrefixOf( root ) : std::string();
+    std::vector<char>  owRootEsc;
+    const std::string  owRootAttr   = owSingleRoot ? ( " root=\"" + std::string( rw::escapeXml( root, owRootEsc ) ) + "\"" ) : std::string();
+    // M13: the same window the CLI --owners applies, over the SAME already-selected row list, so `limit`
+    // and `offset` mean here exactly what they mean there.
+    const PageWindow owPw = pageWindow( printRows.size(), effectiveRowCap( page.limit, kCallHierarchyRowCap ), page.offset );
+    char             owPab[ kPageDisclosureCap ];
+    rw::emitTo( mem, "<owners files=\"{}\"{}{}{}{}>", ownerships.size(), owSymAttr.c_str(),
+                  pageDisclosure( owPab, sizeof( owPab ), owPw.end - owPw.begin, printRows.size(), owPw.end,
+                                  page.limit, page.offset, /*discloseCap=*/false ),
+                  owRootAttr.c_str(), gitstamp::atAttr( root ).c_str() );
+    if( uniformCount > 0 )
+    {
+        rw::emitTo( mem, "<uniform authors=\"1\" bf=\"1\" share=\"1.00\" files=\"{}\"/>", uniformCount );
+    }
+    for( std::size_t owRowIndex = owPw.begin; owRowIndex < owPw.end; ++owRowIndex )
+    {
+        const std::size_t    i   = printRows[ owRowIndex ];
+        const FileOwnership& ow  = ownerships[i];
+        const AuthorScore&   top = ow.authors[0];
+        const auto ep = rw::escapeXml( owSingleRoot ? sarif::rootRelativeUri( ing.files[ ow.fileId ], owRootPrefix )
+                                                    : std::string_view( ing.files[ ow.fileId ] ), owEsc );
+        rw::emitTo( mem, "<f p=\"{}\" authors=\"{}\" bf=\"{}\"", std::string_view( ep.data(), ep.size() ), ow.uniqueAuthors, int( ow.busFactor ) );
+        const auto em = rw::escapeXml( top.email, owEsc );
+        rw::emitTo( mem, " top=\"{}\" share=\"{:.2f}\"/>", std::string_view( em.data(), em.size() ), top.share );
+    }
+    rw::emitRaw( mem, "</owners>" );
+    return mcpAnswerText( stream );   // nullopt = the buffer lost bytes (dispatch answers -32603), "" stays not-found
+}
+
+// ─── flagship-reflex verbs (exemplar / impact / uses / path — the write-moment + is-it-safe reflexes) ──────
+//
+// Each mirrors the identically-named CLI flag, reusing the SAME underlying computation over the warm McpIndex.
+// The XML-producing ones (exemplar) return the same <ctx>-wrapped XML the other read verbs (for/lego/owners)
+// return; the graph-query ones (impact/uses/path) return the same XML fragment the CLI emits. All are read
+// verbs → an unresolved symbol returns "" and the dispatcher maps that to the standard not-found error, never
+// a silent empty result. Deterministic: every ranking/sort carries an id tie-break, matching the CLI.
+
+// `exemplar` verb (Q7 write-moment reflex): the repo's BEST-IN-CLASS instance of what the agent is about to
+// write, as an imitation target (signature + body). `kindOrTask` is either a kind token
+// (fn|method|class|struct|iface|var) or a TASK string whose top lexical match donates its kind. Returns the
+// <ctx><exemplar>…</exemplar></ctx> XML with the winner's body (via packBodies), or "" (caller → not-found
+// error) when no candidate of the kind exists / no symbol matches the task. `redact` masks credential shapes
+// in the emitted body (A3-F3 — same seam contract as the CLI --exemplar); null under --no-redact.
+//
+// §B6 M2 [BROKEN] — this verb used to be a HAND-ROLLED clone of a selector that stopped existing at A3-F5,
+// carrying a source comment asserting an identity ("IDENTICAL … sort") that had been false ever since. The
+// clone had no ccx CEILING (invariant 1), no fixture penalty (invariant 2) and no task-to-kind CONFIDENCE
+// gate (invariant 3), so `low_confidence=` and `over_ccx_bar=` were structurally unreachable on this surface
+// and a nonsense task came back as a confident pick from a bench script where the CLI flags it and falls
+// back to fn. Its `candidates=` also counted ALL of the kind (3408) against the CLI's post-ceiling ELIGIBLE
+// set (3338) — one attribute name, two populations. It now calls selectExemplar (exemplar.h), the same
+// function main.cpp calls, so there is one selector and the divergence class is gone rather than resynced.
+inline std::optional<std::string> exemplarText( const std::string& root, const std::string& kindOrTask, RedactCounts* redact = nullptr )
+{
+    const McpIndex&     ix  = getIndex( root );
+    const IngestResult& ing = ix.ing;
+    const Graph&        g   = ix.g;
+
+    // the selector's two inputs, built exactly as the CLI builds them: tested= from computeQMetrics, fan-in
+    // from the in-edge CSR row lengths.
+    const QMetrics             qm = computeQMetrics( ing, g );
+    const std::size_t          S  = ing.symbols.size();
+    std::vector<std::uint32_t> fanIn( S, 0 );
+    {
+        const auto* ro = g.inEdges.rowOffsets();
+        for( std::size_t i = 0; i < S; ++i )
+        {
+            fanIn[i] = ro[i + 1] - ro[i];
+        }
+    }
+
+    const ExemplarPick pick = selectExemplar( ing, g, fanIn, qm.tested, kindOrTask );
+    if( pick.winner == kNoNode )
+    {
+        return std::string{}; // no candidate of the kind / task matched nothing → caller reports not-found
+    }
+
+    const auto fin = [ & ]( NodeId i ) -> std::uint32_t { return ( i < fanIn.size() )    ? fanIn[i]    : 0u; };
+    const auto ts  = [ & ]( NodeId i ) -> std::uint8_t  { return ( i < qm.tested.size() ) ? qm.tested[i] : std::uint8_t( 0 ); };
+
+    // emit the same <ctx><exemplar>…</exemplar></ctx> shape the other read verbs return (G4 valid XML), with
+    // the SAME degrade attributes the CLI emits — low_confidence= and over_ccx_bar= are the two facts the
+    // clone could never state, so they are the point of the fix, not decoration.
+    const Symbol&     wsym = ing.symbols[ pick.winner ];
+    std::vector<char> esc;
+    const auto ex = [ & ]( std::string_view s ) -> std::string { return std::string( escapeXml( s, esc ) ); };
+    // G4: collapse '--' runs so the comment can't terminate early. W3FIX M3: same shared scrub as the CLI twin —
+    // a '\n' in kindOrTask is a legal XML char escapeXml passes through, and a raw newline outside CDATA is a
+    // G4 breach whichever dialect emitted it.
+    const std::string reqNote = xmlCommentText( kindOrTask );
+    const std::string kindNote = pick.fromTask ? ( " (task -> kind=" + std::string( symTag( pick.targetKind ) )
+                                                   + ( pick.lowConfidence ? ", low-confidence: weak match, fell back to fn" : "" ) + ")" )
+                                               : std::string();
+
+    rw::MemoryStream stream;
+    std::FILE* const mem = stream.open();
+    if( !mem )
+    {
+        return std::nullopt;   // the answer buffer could not be opened: an internal error, never "not found"
+    }
+    rw::emitRaw( mem, "<ctx>" );
+    // §B6 M13: the rule is exemplar.h's kExemplarSelectionRule, rendered — not restated here in a fourth wording.
+    rw::emitTo( mem, "<!-- codecortex exemplar for \"{}\"{}: the repo's best-in-class {} to imitate — {}. "
+                       "Copy its shape, not its text. -->",
+                  ex( reqNote ).c_str(), kindNote.c_str(), symTag( pick.targetKind ), kExemplarSelectionRule );
+    // R-E fix (2026-08-19): the CLI twin went root-relative and this one did not, so ONE exemplar came back
+    // p="src/infra/fastmath.h:51" on the CLI and the same file spelled as a full absolute path over MCP — the
+    // one-answer-two-surfaces contract mcptranchecheck.sh exists to hold. Same single-root condition, same
+    // helper, and the same root= disclosure the CLI twin now carries.
+    const bool         exSingleRoot = ing.realPaths.empty();
+    const std::string  exRootPrefix = exSingleRoot ? sarif::rootPrefixOf( root ) : std::string();
+    const std::string  exRootAttr   = exSingleRoot ? ( " root=\"" + ex( root ) + "\"" ) : std::string();
+    rw::emitTo( mem, "<exemplar kind=\"{}\" candidates=\"{}\" n=\"{}\" p=\"{}:{}\" in=\"{}\" ccx=\"{}\"{}{}{}{}>",
+                  symTag( pick.targetKind ), pick.candidateCount, ex( wsym.name ).c_str(),
+                  ex( exSingleRoot ? sarif::rootRelativeUri( ing.files[ wsym.fileId ], exRootPrefix ) : std::string_view( ing.files[ wsym.fileId ] ) ).c_str(), wsym.line,
+                  fin( pick.winner ), wsym.ccx, exRootAttr.c_str(), ts( pick.winner ) ? " tested=\"1\"" : "",
+                  pick.lowConfidence ? " low_confidence=\"1\"" : "",
+                  pick.overCcxBar    ? " over_ccx_bar=\"1\"" : "" );
+    packBodies( mem, ing, { pick.winner }, 0 /* no byte budget in MCP (0 = unlimited) */, g.outOff, g.outTargets, false, redact,
+                /*ranges=*/nullptr, /*noteIndex=*/nullptr, /*outEmitted=*/nullptr, /*truncateOversizedFirst=*/true,
+                /*withFileContext=*/false, exSingleRoot ? std::string_view( root ) : std::string_view() );
+    rw::emitRaw( mem, "</exemplar></ctx>" );
+    return mcpAnswerText( stream );   // nullopt = the buffer lost bytes (dispatch answers -32603), "" stays not-found
+}
+
+// `impact` verb (is-it-safe-to-change-X reflex): the transitive blast radius of SYM — every symbol that
+// (transitively) reaches SYM via calls, ranked by PageRank (id tie-break). Reuses resolveAllByName +
+// transitiveCallers + rankGraph, exactly as the CLI --impact. Returns the <impact>…</impact> XML fragment, or
+// "" (caller → not-found error) when SYM has no in-corpus definition.
+//
+// §B6 M4: `page` is the request's limit/offset (mcpPageArgs, above), applied through the SAME
+// pageWindow/effectiveRowCap/pageDisclosure trio the CLI --impact uses — so the 40-row display default is a
+// default here too rather than a ceiling, and a paged answer carries the total=/has_more=/next_offset=
+// half that lets a caller's loop terminate. Defaulted to {} ⇒ byte-identical to the un-paged answer.
+inline std::optional<std::string> impactText( const std::string& root, const std::string& symbol, McpPageArgs page = {} )
+{
+    const McpIndex&     ix  = getIndex( root );
+    const IngestResult& ing = ix.ing;
+    const Graph&        g   = ix.g;
+
+    // resolveAllByNameQualified — the SAME resolver the CLI --impact uses (byte-identical on a bare
+    // name/canonical id), so this twin finally accepts file:name AND the @FILE:LINE line-seed too.
+    // H1: the decl→def residue, the CLI --impact's unproven_defs= — same resolver, same helpers, so the two surfaces
+    // cannot disagree about the number.
+    std::size_t               unprovenDefs = 0;
+    const std::vector<NodeId> seeds        = resolveAllByNameQualified( ing, symbol, &unprovenDefs );
+    if( seeds.empty() )
+    {
+        return std::string{}; // symbol not found → caller reports not-found
+    }
+
+    const std::vector<NodeId> reach = transitiveCallers( g, seeds );
+    const auto [ rank, prIters, prConverged ] = rankGraph( g );
+    const RankDisclosure      prD{ prIters, prConverged, true };   // W2-F: CLI --impact discloses this; so does its twin
+    std::vector<NodeId>       show  = reach;
+    std::sort( show.begin(), show.end(), [ & ]( NodeId a, NodeId b ) { return rank[a] != rank[b] ? rank[a] > rank[b] : a < b; } );
+
+    // A6: the identical isTestSymbol-seeded lens the CLI --impact now runs (graph.h::testSymbolForwardReach)
+    // — mcpclidiffcheck compares root-attribute SETS between the two surfaces, so radius_tested=/
+    // radius_untested= have to ride here too, over the same un-windowed reach set.
+    const std::vector<char> impTestReach   = testSymbolForwardReach( ing, g );
+    const std::size_t       radiusTested   = countTestedIn( ing, impTestReach, reach );
+    const std::size_t       radiusUntested = reach.size() - radiusTested;
+    // The CLI --impact's declined_calls=, by the same call over the same set (graph.h declinedCallsNaming).
+    std::vector<NodeId>     declineTargets( reach );
+    declineTargets.insert( declineTargets.end(), seeds.begin(), seeds.end() );
+    const std::size_t       declinedCalls  = declinedCallsNaming( g, declineTargets );
+
+    std::vector<char> esc;
+    const auto ex = [ & ]( std::string_view s ) -> std::string { return std::string( escapeXml( s, esc ) ); };
+
+    rw::MemoryStream stream;
+    std::FILE* const mem = stream.open();
+    if( !mem )
+    {
+        return std::nullopt;   // the answer buffer could not be opened: an internal error, never "not found"
+    }
+    // §H4 §3.4: the opener AND the paging clause AND the floor/counting-unit tail now come from the shared
+    // constants (src/graphlegend.h + src/pageview.h), so this legend is byte-identical to the CLI --impact
+    // one. It was NOT before: this copy carried an abridged paging clause with no limit="0" definition —
+    // exactly the §B4 echo-site divergence the shared-constant rule exists to stop.
+    // LB-H: the import tier's clause rides here too — the CLI legend and this one are byte-identical by
+    // rule, and an attribute the MCP root now carries has to be defined where the caller meets it.
+    rw::emitTo( mem, "{}{}. {}{}{}{}{}{}{}{}-->", kImpactLegendOpen, kPageRaiseCapClause, kImpactImportTierLegend,
+                  kTestedRowLegend, kImpactTestedPartitionLegend,   // A6
+                  kTestedLensBlindSpotLegend,                       // F-02: rides with the partition, byte-identical to the CLI twin
+                  unprovenDefsVerbLegend( UnprovenDefsVerb::Impact, unprovenDefs > 0 ).c_str(),   // H1: exactly when the root carries unproven_defs=, as on the CLI
+                  declinedCallsLegend( declinedCalls > 0 ),         // exactly when the root carries declined_calls=, as on the CLI
+                  graphCountDisclosure( g.unindexedFiles > 0 ).c_str(), renderDisclosure( prD, DiscloseAs::LegendClause ).c_str() );
+    // r27-emitters §P2.1: the listing is capped at 40 by rank. Without shown=/capped= a 40-row answer to
+    // "is it safe to change X?" reads as the WHOLE blast radius when it can be 3% of it. Same attributes,
+    // same meaning as the CLI --impact — the two surfaces must not diverge on an honesty marker.
+    // §B6 M4: the window and the disclosure now come from the shared pageview.h trio, exactly as they do on
+    // the CLI arm, instead of a hand-rolled 40-row slice with a hand-rolled shown=/capped= pair.
+    const PageWindow  ipw       = pageWindow( show.size(), effectiveRowCap( page.limit, 40 ), page.offset );
+    const std::size_t shownRows = ipw.end - ipw.begin;
+    char              ipab[ kPageDisclosureCap ];
+    // R-E fix (2026-08-19): root-relative p= + root=, exactly as the CLI --impact now emits them. The first
+    // R-E landing converted the CLI arm alone, so mcpclidiffcheck's attribute-set lens went red (CLI has
+    // root=, MCP does not) and every row answered the same question in a different path dialect.
+    const bool         imSingleRoot = ing.realPaths.empty();
+    const std::string  imRootPrefix = imSingleRoot ? sarif::rootPrefixOf( root ) : std::string();
+    const std::string  imRootAttr   = imSingleRoot ? ( " root=\"" + ex( root ) + "\"" ) : std::string();
+    // LB-H: ONE derivation, shared with the CLI arm (graph.h::impactImportTier) — mcpclidiffcheck compares
+    // the two surfaces' attribute sets, and an honesty marker that lands on one of them is the §B4 class.
+    const ImportTier imports = impactImportTier( ing, seeds );
+    rw::emitTo( mem, "<impact of=\"{}\" defs=\"{}\" reaches=\"{}\"{}{} radius_tested=\"{}\" radius_untested=\"{}\"{}{}{}{}{}{}>",
+                  ex( symbol ).c_str(), seeds.size(), reach.size(), unprovenDefsAttrXml( unprovenDefs ).c_str(),   // H1: where the CLI root carries it
+                  imports.xmlAttrs.c_str(), radiusTested, radiusUntested, declinedCallsAttrXml( declinedCalls ).c_str(), imRootAttr.c_str(),
+                  pageDisclosure( ipab, sizeof( ipab ), shownRows, show.size(), ipw.end, page.limit, page.offset, true ),
+                  graphCountFloorAttrXml( g ).c_str(), renderDisclosure( prD, DiscloseAs::XmlAttrs ).c_str(),   // M15: gauge + marker
+                  nextAttrXml( nextFlag( "--safe-delete=", symbol ) ).c_str()  );   // P3 (L7): the CLI twin's next=, same root attribute set (mcpclidiffcheck)
+    for( std::size_t i = ipw.begin; i < ipw.end; ++i )
+    { const Symbol& s = ing.symbols[ show[i] ];
+      const std::string_view rp = imSingleRoot ? sarif::rootRelativeUri( ing.files[ s.fileId ], imRootPrefix ) : std::string_view( ing.files[ s.fileId ] );
+      // A6: tested="1" only (never a literal 0) — see kTestedRowLegend.
+      rw::emitTo( mem, "<s t=\"{}\" n=\"{}\" p=\"{}:{}\"{}/>", symTag( s.kind ), ex( s.name ).c_str(), ex( rp ).c_str(), s.line,
+                    isTestedByReach( ing, impTestReach, show[i] ) ? " tested=\"1\"" : ""  ); }
+    // the import tier's rows, after the symbol rows and under their own tag — a different unit, so a
+    // different element (see the CLI arm and kImpactImportTierLegend for why they are never one number).
+    emitImportRowsXml( mem, ing, std::span<const std::uint32_t>( imports.files ).first( imports.shown ), imRootPrefix,
+                       std::span<const char>( imports.lazy ).first( imports.shown ) );
+    rw::emitRaw( mem, "</impact>" );
+    return mcpAnswerText( stream );   // nullopt = the buffer lost bytes (dispatch answers -32603), "" stays not-found
+}
+
+// `uses` verb (ABS-3): the use-site index for SYM — the resolvable places its name is REFERENCED (call/read/
+// write/import/extends), not just calls, with p="file:line" + the enclosing symbol. Reference-name-based (same
+// heuristic level as call edges). external="1" when SYM has no in-corpus definition. Reuses the identical
+// reference-scan + deterministic sort as the CLI --uses. Always returns a valid <uses> fragment — a name with
+// zero use-sites is a real answer (count="0"), NOT an error, so this verb does not degrade to "".
+// V2-1: the MCP surface has no file:name selector — a qualified spelling used to fall
+// through as an unresolvable bare name and come back external="1" ("no definition in the indexed tree")
+// for a symbol with real in-tree defs: the false-claim class this round exists to kill. ONE helper (both
+// dispatch sites — the server's tools/call arm and the batch verb — must refuse identically; the first
+// landing guarded only one of them, which is exactly the clone-seam drift pageview.h warns about).
+// §B6 M6: the BARE-NAME half of the same class, which the V2-1 guard left one notch open. A name with no
+// in-corpus definition AND no use-site at all came back external="1" count="0" — and this verb's own legend
+// glosses external= as "stdlib/third-party", so a TYPO received the most confident-sounding answer the verb
+// can give, on the surface with no did-you-mean, while the CLI refuses exactly this shape ("matched no
+// indexed definition") with a near-miss. The guard mirrors the CLI's predicate exactly: it fires only when
+// defs AND sites are both empty, so external="1" WITH real use-sites stays a valid answer — that genuinely
+// is a third-party name, and it is the case the attribute exists for.
+//
+// Returns the refusal message, or "" when the spelling is fine to answer.
+// §B11.1 — the V2-1 SENTENCE, hoisted so a verb joins the guard by calling it rather than by someone
+// remembering to copy a paragraph. `uses` had it; `owners` and `mentions` take the identical `symbol` field
+// through the identical bare-name resolver and answered a qualified spelling with a bare not-found about a
+// symbol that plainly exists — the CLI half of that same asymmetry is §B11.1's headline. The MCP policy is
+// unchanged and is the one V2-1 decided: qualified selectors are CLI-only HERE, and the refusal says so and
+// hands back both retries. Returns "" when the spelling is answerable.
+//
+// Fires only when the whole spelling resolves to NOTHING and its bare tail resolves to SOMETHING — so an
+// ObjC selector, a name that genuinely contains a colon, and a qualified spelling that does resolve are all
+// left alone, and a spelling whose tail is not a symbol either falls through to the caller's own not-found.
+inline std::string qualifiedSelectorRefusal( const IngestResult& ing, const std::string& symbol, std::string_view cliFlag )
+{
+    if( !symbol.empty() && symbol.front() == '@' )
+    {
+        // @FILE:LINE line-seed on a NAME-matching scan verb (owners/mentions — uses intercepts its own
+        // @-arm before this helper and rebinds instead). A faulted seed refuses with the shared
+        // at-diagnosis; a resolvable one is ANSWERABLE — the 2026-08-30 decision round replaced the
+        // first landing's pass-the-name-yourself refusal (which handed the resolved name back as a
+        // retry) with the rebind itself: the payload fns (mentionsJson/ownersText) resolve the seed to
+        // its ONE enclosing definition and disclose the rebound name, so the one call carries the answer
+        // (one-step-smart-defaults), never a re-run hint.
+        const AtSeed seed = resolveAtSeed( ing, std::string_view( symbol ).substr( 1 ) );
+        if( seed.fault != AtFault::None )
+        {
+            return mcprefuse::notFound( ing, "symbol", symbol );
+        }
+        return {};
+    }
+
+    const std::size_t lastColon = symbol.rfind( ':' );
+    if( lastColon == std::string::npos || lastColon + 1 >= symbol.size() )
+    {
+        return {};
+    }
+
+    const std::string bareName = symbol.substr( lastColon + 1 );
+    if( !resolveAllByName( ing, symbol ).empty() )
+    {
+        return {}; // the whole spelling IS a name
+    }
+    if( resolveAllByName( ing, bareName ).empty() )
+    {
+        return {}; // the bare half is not a symbol either
+    }
+
+    return "qualified file:name selectors are CLI-only on this verb — pass the bare name '" + bareName
+         + "' (the union across its defs), or use the CLI form `codecortex <dir> " + std::string( cliFlag ) + symbol
+         + "` for the narrowed answer";
+}
+
+// Issue #164 option (b), folded out of usesSelectorRefusal so that function stays under the quality-delta
+// bars (F8/nice-to-have): the "::" refusal fires only when the whole spelling RESOLVES to at least one
+// def and at least one of those defs is not Elixir. An all-Elixir resolution is answerable on both
+// surfaces without narrowing — usesText/collectUseSites already match it through the Elixir resolver
+// (elixirDefs, mirrored in resolveUsesSelector) — so refusing it would reintroduce the exact silent
+// count="0" this verb exists to fix, for a population that never had it (elixirsemanticcheck). Unlike the
+// prior shape, this no longer consults resolveFieldSelector first: the CLI's own precedence
+// (memberUsesArm) only looks at fields once defs is empty, so a "::" spelling that resolves to a SYMBOL
+// refuses here regardless of also matching a field name.
+inline std::string qualifiedColonSelectorRefusal( const IngestResult& ing, const std::string& symbol )
+{
+    if( symbol.find( "::" ) == std::string::npos )
+    {
+        return {};
+    }
+    const std::vector<NodeId> defs = resolveAllByName( ing, symbol );
+    if( defs.empty() )
+    {
+        return {}; // does not resolve as a whole spelling — falls through to the generic refusal below
+    }
+    bool allElixir = true;
+    for( NodeId n : defs )
+    {
+        if( n >= ing.symbols.size() || ing.symbols[ n ].lang != Lang::Elixir )
+        {
+            allElixir = false;
+            break;
+        }
+    }
+    if( allElixir )
+    {
+        return {}; // main's byte-identical answer for this population
+    }
+    const std::string bareName = symbol.substr( symbol.rfind( ':' ) + 1 );
+    return "qualified '::' selectors are CLI-only on this verb — pass the bare name '" + bareName
+         + "' (the union across its defs), or use the CLI form `codecortex <dir> --uses=" + symbol
+         + "` for the narrowed answer";
+}
+
+inline std::string usesSelectorRefusal( const IngestResult& ing, const std::string& symbol )
+{
+    if( !symbol.empty() && symbol.front() == '@' )
+    {
+        // @FILE:LINE: a faulted seed refuses with the shared at-diagnosis (mcprefuse::notFound's @-arm);
+        // a resolvable one is answerable — usesText rebinds it to the seed's definition name and serves
+        // that name's union answer.
+        const AtSeed seed = resolveAtSeed( ing, std::string_view( symbol ).substr( 1 ) );
+        if( seed.fault != AtFault::None )
+        {
+            return mcprefuse::notFound( ing, "symbol", symbol );
+        }
+        return {};
+    }
+
+    const std::size_t lastColon = symbol.rfind( ':' );
+    if( lastColon != std::string::npos && lastColon + 1 < symbol.size() )
+    {
+        // Issue #164, option (b): a RESOLVING "::" spelling (canonical id or Scope::name) is the one
+        // qualified shape the CLI answers and this verb cannot narrow — its scan is name-wide with no
+        // narrowing machinery, so serving it is the silent count="0" the CLI just fixed. Refuse with the
+        // retry instead, the way a file:name spelling already refuses below. A non-resolving "::" spelling,
+        // and an all-Elixir resolution, both fall through to the shared refusal / no-op below (byte-identical).
+        if( const std::string colonRefusal = qualifiedColonSelectorRefusal( ing, symbol ); !colonRefusal.empty() )
+        {
+            return colonRefusal;
+        }
+        return qualifiedSelectorRefusal( ing, symbol, "--uses=" );   // "" when the qualified spelling resolves
+    }
+
+    if( !resolveAllByName( ing, symbol ).empty() )
+    {
+        return {}; // it has a definition — a normal answer
+    }
+    // member-variable round (card A3): no symbol — a FIELD? One owner answers (usesText); several owners refuse
+    // with the Owner.field spellings (the CLI arm's rule, same message, MCP retry syntax); an unserved language
+    // refuses by name, as on the CLI.
+    if( const std::vector<FieldId> fields = resolveFieldSelector( ing, symbol ); !fields.empty() )
+    {
+        return memberOwnerRefusal( ing, fields, symbol, "symbol=" );   // "" for one owner — a member answer
+    }
+    if( const std::string unserved = memberSelectorUnservedRefusal( ing, symbol ); !unserved.empty() )
+    {
+        return unserved;
+    }
+
+    // no definition: refuse ONLY if it also has no use-site (early-exit scan — one match is enough to prove
+    // this is a real external name rather than a typo).
+    for( const Reference& r : ing.references )
+    {
+        if( r.calleeName != symbol )
+        {
+            continue;
+        }
+        if( r.isCompose || r.isDocLink )
+        {
+            continue; // type edge / doc mention — not a use-site
+        }
+        if( r.lang == Lang::Markdown )
+        {
+            continue; // markdown wikilink — not a code use-site
+        }
+        return {};                                   // external="1" with real sites: a valid answer, not a typo
+    }
+    return mcprefuse::notFound( ing, "symbol", symbol,
+                                "no indexed definition and no use-site under that spelling — external names with "
+                                "real use-sites are answered with external=\"1\", this one has neither" );
+}
+
+// The @FILE:LINE rebind the name-matching scan verbs serve through: a resolvable line-seed becomes the
+// innermost enclosing definition's NAME (the site scan matches names, so the raw @-spec would silently
+// match nothing); anything else — a plain name, or a faulted seed the dispatch guards already refused —
+// passes through unchanged. The returned view aliases either the input or a symbol name owned by `ing`.
+inline std::string_view atSeedNameOr( const IngestResult& ing, std::string_view sym )
+{
+    const NodeId seedDef = atSeedDefOr( ing, sym );   // shared with the scan verbs' payload fns
+    return seedDef != kNoNode ? std::string_view( ing.symbols[ seedDef ].name ) : sym;
+}
+
+// nullopt when the answer buffer failed (at the open, or a write lost inside it): the callers answer an internal error,
+// because an empty text result would read as a successful, empty answer.
+inline std::optional<std::string> usesText( const std::string& root, const std::string& symbol, McpPageArgs page = {} )
+{
+    const McpIndex&        ix   = getIndex( root );
+    const IngestResult&    ing  = ix.ing;
+    // @FILE:LINE line-seed (the CLI --uses' @-arm, mirrored): serve the seed's definition NAME's union
+    // answer; of= keeps echoing the seed as typed, and fault cases are refused upstream (usesSelectorRefusal).
+    const std::string_view sym  = atSeedNameOr( ing, symbol );
+
+    const std::vector<NodeId> defs     = resolveAllByName( ing, sym );
+    const bool                external = defs.empty();
+
+    // member-variable round (card A3): no symbol but ONE field → the per-site renderer the CLI arm prints (fielduses.h).
+    if( const std::vector<FieldId> fields = defs.empty() ? resolveFieldSelector( ing, sym ) : std::vector<FieldId>{}; fields.size() == 1 )
+    {
+        return renderFieldUses( ing, fields[ 0 ], FieldUsesArgs{ symbol, ing.realPaths.empty(), root, page.limit, page.offset, ix.g } );
+    }
+
+    struct UseSite { std::uint32_t fileId; std::uint32_t line; RefRole role; std::string in; };
+    std::vector<UseSite> sites;
+    const ElixirResolver elixirResolver( ing );
+    // CLI parity (mcpclidiffcheck): the Elixir resolver path is gated on the selector's ELIXIR definitions —
+    // the CLI's resolveUsesSelector filters exactly this way, off the RAW selector, before the @-seed rebind.
+    // Gating on `defs` instead would take the resolver path for an Elixir reference whose calleeName merely
+    // matches a definition in another language: reachesAny then matches nothing and the use-site disappears
+    // here while the CLI still reports it through the name filter — a surface divergence, not a narrowing.
+    std::vector<NodeId> elixirDefs = resolveAllByNameQualified( ing, symbol );
+    std::erase_if( elixirDefs, [ & ]( NodeId node ) { return ing.symbols[ node ].lang != Lang::Elixir; } );
+    for( const Reference& r : ing.references )
+    {
+        const bool elixirPath = ( r.lang == Lang::Elixir && !elixirDefs.empty() );
+        if( elixirPath ? !elixirResolver.reachesAny( r, elixirDefs ) : r.calleeName != sym )
+        {
+            continue;
+        }
+        if( r.isCompose || r.isDocLink )
+        {
+            continue; // type edge / doc mention — not a use-site
+        }
+        if( r.lang == Lang::Markdown )
+        {
+            continue; // markdown wikilink — not a code use-site
+        }
+        std::string in;
+        if( r.fromSymbol != kNoNode && r.fromSymbol < ing.symbols.size() )
+        {
+            const Symbol& fs = ing.symbols[ r.fromSymbol ];
+            // R-R: same root the <u p=…> beside it strips, so in_id= and p= agree on the spelling
+            in = canonicalIdForEmit( ing, fs, ing.realPaths.empty() ? std::string_view( root ) : std::string_view() );
+        }
+        sites.push_back( { r.fileId, r.line, r.role, std::move( in ) } );
+    }
+    // LB-G (r10 §5): TIER before path and the CLI --uses' own default site cap. mcpclidiffcheck LENS 1
+    // pins the two surfaces' root-attribute sets equal, so a cap on one and not the other is a divergence.
+    const std::vector<std::uint8_t> tierOfFile = pathTierIndexOver( ing, sites, [ ]( const UseSite& u ) { return u.fileId; } );
+    std::sort( sites.begin(), sites.end(), [ & ]( const UseSite& a, const UseSite& b )
+               {
+        if( const int c = compareTierThenPath( ing, tierOfFile, a.fileId, b.fileId ); c != 0 ) { return c < 0;
+}
+        if( a.line   != b.line ) {   return a.line < b.line;
+}
+        if( a.role   != b.role ) {   return std::uint8_t( a.role ) < std::uint8_t( b.role );
+}
+        return a.in < b.in; } );
+
+    const PageWindow  upw           = pageWindow( sites.size(), effectiveRowCap( page.limit, kUseSiteRowCap ), page.offset );
+    const std::size_t upageRows     = upw.end - upw.begin;
+    const bool        usDiscloseCap = upageRows < sites.size();
+    char              upab[ kPageDisclosureCap ];
+    const char* const upage         = pageDisclosure( upab, sizeof( upab ), upageRows, sites.size(), upw.end,
+                                                      page.limit, page.offset, usDiscloseCap );
+
+    std::vector<char> esc;
+    const auto ex = [ & ]( std::string_view s ) -> std::string { return std::string( escapeXml( s, esc ) ); };
+
+    rw::MemoryStream stream;
+    std::FILE* const mem = stream.open();
+    if( !mem )
+    {
+        return std::nullopt;
+    }
+    // §H4 §3.4 item 2: the opener is the SHARED one (src/graphlegend.h) — this copy and the CLI's were the
+    // same false "every use-site of SYM" promise emitted twice, and a fix applied to one of two echo sites
+    // is the §B4 failure family. The BODY deliberately stays surface-specific: the CLI legend documents the
+    // qualified-selector attributes, which this verb has no selector for and does not emit.
+    rw::emitTo( mem, "{}"
+                       "Reference-name-based (same heuristic level as call edges) — verify in source if a name is overloaded. "
+                       "external=\"1\" means SYM has no definition in the indexed tree under ANY spelling (stdlib/third-party); "
+                       "qualified file:name and \"::\" spellings whose bare name IS defined refuse instead (the CLI uses verb narrows them). "
+                       "{}{}-->{}", kUsesLegendOpen,
+                  capLegendClause( computePageDisclosure( upageRows, sites.size(), upw.end,
+                                                          page.limit, page.offset, usDiscloseCap ).active ),
+                  graphCountDisclosure( ix.g.unindexedFiles > 0 ).c_str(),
+                  rootRelPathsLegend( ing.realPaths.empty() )  );   // R-E fix: the CLI --uses legend carries the
+                                                                   // identical clause — floormarkcheck (4) pins
+                                                                   // the two disclosure tails byte-identical.
+    // R-E fix (2026-08-19): root-relative p= + root=, exactly as the CLI --uses now emits them (same finding
+    // as impactText above — the first R-E landing converted only the CLI arm).
+    const bool         usSingleRoot = ing.realPaths.empty();
+    const std::string  usRootPrefix = usSingleRoot ? sarif::rootPrefixOf( root ) : std::string();
+    const std::string  usRootAttr   = usSingleRoot ? ( " root=\"" + ex( root ) + "\"" ) : std::string();
+    rw::emitTo( mem, "<uses of=\"{}\" defs=\"{}\" external=\"{}\" count=\"{}\"{}{}{}>",
+                  ex( symbol ).c_str(), defs.size(), external ? 1 : 0, sites.size(), usRootAttr.c_str(), upage, graphCountFloorAttrXml( ix.g ).c_str()  );   // of= echoes the selector as TYPED (an @-seed stays an @-seed)
+    for( std::size_t siteIndex = upw.begin; siteIndex < upw.end; ++siteIndex )
+    {
+        const UseSite& u = sites[ siteIndex ];
+        const std::string_view up = usSingleRoot ? sarif::rootRelativeUri( ing.files[ u.fileId ], usRootPrefix ) : std::string_view( ing.files[ u.fileId ] );
+        rw::emitTo( mem, "<u role=\"{}\" p=\"{}:{}\"", refRoleTag( u.role ), ex( up ).c_str(), u.line );
+        if( !u.in.empty() )
+        {
+            rw::emitTo( mem, " in_id=\"{}\"", ex( u.in ).c_str() ); // §P8: MCP twin of the CLI --uses rename
+        }
+        rw::emitRaw( mem, "/>" );
+    }
+    rw::emitRaw( mem, "</uses>" );
+    return mcpAnswerText( stream );
+}
+
+// `affected` verb (lane/t10-mcp-coverage): the tests-to-run reflex, MCP twin of --affected=F1,F2|SYM. Calls
+// testmap.h::writeAffectedReport — the SAME renderer the CLI arm calls (verbs_change.h::runAffected) — so the
+// two surfaces answer byte-identical <affected>…</affected> XML for the same seed set; nothing here re-derives
+// the traversal or hand-copies the legend. Only the REFUSAL composition is surface-specific (this verb's own
+// idiom, JSON-RPC error text, rather than the CLI's stderr + did-you-mean), exactly as impactText/usesText
+// above already split resolution failure from the shared answer.
+struct McpAffectedResult
+{
+    std::optional<std::string> text;         // nullopt only on an internal buffer failure — never a plain refusal
+    bool                        badSelector = false;   // `spec`'s bad item matched neither an indexed path nor a symbol
+    std::string                 badItem;
+    bool                        noSeeds     = false;   // resolved, but zero seed symbols — spec named nothing to seed from
+};
+
+inline McpAffectedResult affectedText( const std::string& root, std::string_view spec )
+{
+    const McpIndex&     ix         = getIndex( root );
+    const IngestResult& ing        = ix.ing;
+    const Graph&        g          = ix.g;
+    const bool           singleRoot = ing.realPaths.empty();   // same single-root test every other MCP verb uses
+
+    rw::MemoryStream stream;
+    std::FILE* const mem = stream.open();
+    if( !mem )
+    {
+        return { std::nullopt, false, {}, false };
+    }
+    const AffectedReportResult r = writeAffectedReport( mem, ing, g, root, spec, singleRoot );
+    if( !r.ok )
+    {
+        // Nothing was written to `mem` on this path (writeAffectedReport's own contract) — the stream closes
+        // unfinished in MemoryStream's destructor, exactly the "unfinished: nobody to tell" case it documents.
+        return { std::string{}, r.badSelector, r.badItem, r.noSeeds };
+    }
+    return { mcpAnswerText( stream ), false, {}, false };
+}
+
+// `path` verb: the shortest directed CALL path from `from` to `to` (does A reach B, and how?). Reuses
+// resolveFocus + shortestPath, exactly as the CLI --path=A,B. Returns the <path>…</path> XML fragment (with
+// reachable="0" hops="0" and no <s> children when B is NOT reachable from A — a valid answer, not an error),
+// or "" (caller → not-found error) when EITHER endpoint fails to resolve.
+inline std::optional<std::string> pathText( const std::string& root, const std::string& from, const std::string& to )
+{
+    const McpIndex&     ix  = getIndex( root );
+    const IngestResult& ing = ix.ing;
+    const Graph&        g   = ix.g;
+
+    // r27-emitters §P2.10: resolve EVERY def of each endpoint and run ONE multi-source BFS (shortestPathAny),
+    // exactly as the CLI --path now does. Binding `from` to the lowest-NodeId def reported reachable="0" for
+    // paths that plainly exist, and the answer never said which def it had picked.
+    // H1: each endpoint's decl→def residue, summed onto the root exactly as the CLI --path sums it.
+    std::size_t               srcUnprovenDefs = 0;
+    std::size_t               dstUnprovenDefs = 0;
+    const std::vector<NodeId> srcDefs         = resolveAllByNameQualified( ing, from, &srcUnprovenDefs );
+    const std::vector<NodeId> dstDefs         = resolveAllByNameQualified( ing, to, &dstUnprovenDefs );
+    const std::size_t         unprovenDefs    = srcUnprovenDefs + dstUnprovenDefs;
+    if( srcDefs.empty() || dstDefs.empty() )
+    {
+        return std::string{}; // an endpoint not found → caller reports not-found
+    }
+
+    const std::vector<NodeId> pth     = shortestPathAny( g, srcDefs, dstDefs );
+    const NodeId              srcUsed = pth.empty() ? srcDefs.front() : pth.front();
+    const NodeId              dstUsed = pth.empty() ? dstDefs.front() : pth.back();
+
+    std::vector<char> esc;
+    const auto ex = [ & ]( std::string_view s ) -> std::string { return std::string( escapeXml( s, esc ) ); };
+    // R-E (2026-08-17 harvest): same single-root condition every other verb's root= uses (sarif.h) — the
+    // CLI twin (main.cpp runPath) computes the identical condition so the two dialects cannot diverge.
+    const bool         ptSingleRoot = ing.realPaths.empty();
+    const std::string  ptRootPrefix = ptSingleRoot ? sarif::rootPrefixOf( root ) : std::string();
+    const auto loc = [ & ]( NodeId n ) -> std::string
+    { const Symbol& s = ing.symbols[n];
+      const std::string_view rp = ptSingleRoot ? sarif::rootRelativeUri( ing.files[ s.fileId ], ptRootPrefix ) : std::string_view( ing.files[ s.fileId ] );
+      return ex( rp ) + ":" + std::to_string( s.line ); };
+
+    rw::MemoryStream stream;
+    std::FILE* const mem = stream.open();
+    if( !mem )
+    {
+        return std::nullopt;   // the answer buffer could not be opened: an internal error, never "not found"
+    }
+    const std::string ptRootAttr = ptSingleRoot ? ( " root=\"" + ex( root ) + "\"" ) : std::string();
+    // R-E fix (2026-08-19): the same shared root-relative clause the CLI --path twin now leads with — this
+    // verb has no legend of its own either, and the two dialects must not differ on what they explain.
+    // H5: the same brief floor legend + marker the CLI --path prints (verbs_navigate.h) — one wording, two transports.
+    rw::emitTo( mem, "<!-- codecortex path: one DIRECTED call path from= to to= (each <s> a hop); reachable= is 0 and hops= 0 when the "
+                       "graph holds none. {}{}-->{}", unprovenDefsVerbLegend( UnprovenDefsVerb::Path, unprovenDefs > 0 ).c_str(),
+                  graphCountFloorBrief( g.unindexedFiles > 0 ).c_str(), rootRelPathsLegend( ptSingleRoot ) );
+    rw::emitTo( mem, "<path from=\"{}\" to=\"{}\" from_p=\"{}\" to_p=\"{}\" from_defs=\"{}\" to_defs=\"{}\"{} reachable=\"{}\" hops=\"{}\"{}{}",
+                  ex( from ).c_str(), ex( to ).c_str(), loc( srcUsed ).c_str(), loc( dstUsed ).c_str(),
+                  srcDefs.size(), dstDefs.size(), unprovenDefsAttrXml( unprovenDefs ).c_str(),   // H1: as the CLI root carries it
+                  pth.empty() ? 0 : 1, pth.empty() ? std::size_t( 0 ) : pth.size() - 1, ptRootAttr.c_str(),
+                  graphCountFloorAttrXml( g ).c_str()  );   // M15: gauge + marker
+    if( pth.empty() )
+    {
+        rw::emitTo( mem, " hint=\"no directed call path — try the connect verb on {},{} (undirected: finds a shared caller), or uses/impact for non-call references\"",
+                      ex( from ).c_str(), ex( to ).c_str() );
+    }
+    rw::emitRaw( mem, ">" );
+    for( NodeId n : pth )
+    { const Symbol&           s  = ing.symbols[n];
+      const std::string_view  rp = ptSingleRoot ? sarif::rootRelativeUri( ing.files[ s.fileId ], ptRootPrefix ) : std::string_view( ing.files[ s.fileId ] );
+      rw::emitTo( mem, "<s t=\"{}\" n=\"{}\" p=\"{}:{}\"/>", symTag( s.kind ), ex( s.name ).c_str(), ex( rp ).c_str(), s.line ); }
+    rw::emitRaw( mem, "</path>" );
+    return mcpAnswerText( stream );   // nullopt = the buffer lost bytes (dispatch answers -32603), "" stays not-found
+}
+
+// §B6 M8: `path_between`'s not-found refusal, shared by both arms. The old wording — "path endpoint not
+// found (from and/or to did not resolve)" — named neither WHICH endpoint failed nor what was typed, on the
+// one verb that takes TWO symbols, so the caller had to re-probe both to learn which half to fix. This
+// names the failing endpoint(s), echoes each spelling, and offers each one's own near-miss. Returns "" when
+// both resolve: a refusal builder that can claim a failure that did not happen is worse than one that
+// returns nothing.
+inline std::string pathEndpointRefusal( const IngestResult& ing, const std::string& from, const std::string& to )
+{
+    const bool fromOk = !resolveAllByNameQualified( ing, from ).empty();
+    const bool toOk   = !resolveAllByNameQualified( ing, to ).empty();
+    if( fromOk && toOk )
+    {
+        return {};
+    }
+
+    // the near-miss clause for ONE endpoint, without re-stating "symbol not found" per side (this refusal
+    // already said it once, for both).
+    const auto endpoint = [ & ]( std::string_view which, const std::string& spelling ) -> std::string
+    {
+        std::string part = std::string( which ) + "='" + spelling + "'";
+        if( !spelling.empty() && spelling.front() == '@' )
+        { // an @FILE:LINE endpoint: the at-diagnosis is the actionable half, a name near-miss is noise
+            return part + mcprefuse::atSeedClause( ing, spelling );
+        }
+        const std::string near = didYouMean( ing, spelling );
+        if( !near.empty() && near != spelling )
+        {
+            part += " (did you mean '" + near + "'?)";
+        }
+        return part;
+    };
+
+    std::string msg = "path endpoint not found: ";
+    if( !fromOk )
+    {
+        msg += endpoint( "from", from );
+    }
+    if( !fromOk && !toOk )
+    {
+        msg += ", ";
+    }
+    if( !toOk )
+    {
+        msg += endpoint( "to", to );
+    }
+    msg += " — the other endpoint is fine; fix only the named one";
+    if( !fromOk && !toOk )
+    {
+        msg = msg.substr( 0, msg.rfind( " — " ) ); // both failed: no "the other" to speak of
+    }
+    return msg;
+}
+
+// ─── `connect` — the SHARED <connect> emitter (CLI --connect and the MCP verb write the SAME bytes) ────────
+//
+// "My task touches these N symbols - how do they RELATE, and which intermediaries matter?" Emits the
+// connectSubgraph() result: per connected group the terminals <t>, the
+// Steiner intermediaries <s> (with sig= - the intermediary is the thing the agent did NOT name and most
+// needs to recognise), and the call edges <e f= t=/> in TRUE caller->callee direction; singleton groups
+// land in <unconnected> (honest partitions, never a silent empty). Graph-structured dependency navigation
+// beats flat retrieval on exactly this moment (CodeCompass, arXiv 2602.20048); returning the CONNECTING
+// subgraph rather than a top-K set is the DeepDiscovery direction (arXiv 2606.22906).
+//
+// --max-tokens trim order (§4, decided): (1) drop the Steiner sig= bodies -> name-only, (2) drop whole
+// MST legs longest-first (ties: lower (termA,termB) pair first - the core's own cap rule) and stamp
+// truncated="paths", (3) NEVER drop a terminal or the <unconnected> block - they are the contract.
+// Deterministic throughout: every list arrives id-/(from,to)-sorted from the core; the leg-rebuild BFS
+// visits a sorted adjacency; trimming drops from a sorted order. Lives here (not serialize.h) because
+// serialize.h deliberately never includes graph.h, and main.cpp includes mcp.h - one emitter, two callers
+// (the CLI hands stdout, the MCP verb an open_memstream: the path_between pattern without duplication).
+namespace connectemit
+{
+    // rebuild ONE group's node/edge union from its RETAINED legs, by BFS over the group's own (undirected)
+    // edge set. Used only when --max-tokens dropped a leg (the fast path emits the core's union verbatim).
+    // Deterministic: adjacency sorted ascending by neighbour id; first-discovered prev[] wins.
+    struct GroupUnion { std::vector<NodeId> nodes; std::vector<ConnectEdge> edges; };
+
+    // legRetained arrives as a span: the caller's mask is an inline rw::SmallVec, and this seam only reads it.
+    inline GroupUnion rebuildFromLegs( const ConnectGroup& grp, std::span<const char> legRetained )
+    {
+        GroupUnion u;
+        u.nodes = grp.terminals;                                   // terminals are ALWAYS present
+
+        // group-local adjacency from the group's true-direction edges; both directions walkable.
+        struct Nb { NodeId to; bool viaOut; };                     // viaOut: the stored edge is (node -> to)
+        HashMap<NodeId, std::vector<Nb>> adj;
+        for( const ConnectEdge& e : grp.edges )
+        {
+            adj[ e.from ].push_back( { e.to,   true  } );
+            adj[ e.to   ].push_back( { e.from, false } );
+        }
+        for( auto& [ n, v ] : adj )
+        {
+            std::sort( v.begin(), v.end(), []( const Nb& a, const Nb& b ) noexcept
+                       { return a.to != b.to ? a.to < b.to : a.viaOut > b.viaOut; } );
+        }
+
+        for( std::size_t li = 0; li < grp.paths.size(); ++li )
+        {
+            if( !legRetained[li] )
+            {
+                continue;
+            }
+            const NodeId srcT = grp.paths[ li ].termA, dstT = grp.paths[ li ].termB;
+
+            // BFS srcT -> dstT over the group subgraph (tiny: <= core node cap), prev + discovery channel.
+            HashMap<NodeId, NodeId> prev;
+            HashMap<NodeId, char>   viaOut;
+            std::vector<NodeId>     q;  q.push_back( srcT );  prev[ srcT ] = srcT;
+            bool found = ( srcT == dstT );
+            for( std::size_t head = 0; head < q.size() && !found; ++head )
+            {
+                const auto it = adj.find( q[ head ] );
+                if( it == adj.end() )
+                {
+                    continue;
+                }
+                for( const Nb& nb : it->second )
+                {
+                    if( prev.find( nb.to ) != prev.end() )
+                    {
+                        continue;
+                    }
+                    prev[ nb.to ] = q[ head ];  viaOut[ nb.to ] = nb.viaOut ? 1 : 0;
+                    if( nb.to == dstT ) { found = true; break; }
+                    q.push_back( nb.to );
+                }
+            }
+            if( !found )
+            {
+                continue; // defensive: leg unwalkable in the trimmed union -> skip
+            }
+
+            for( NodeId cur = dstT; cur != srcT; cur = prev[ cur ] )
+            {
+                u.nodes.push_back( cur );
+                const NodeId p = prev[ cur ];
+                if( viaOut[cur] )
+                {
+                    u.edges.push_back( { p, cur } ); // p CALLS cur (true direction)
+                }
+                else
+                {
+                    u.edges.push_back( { cur, p } ); // cur CALLS p
+                }
+            }
+        }
+        const auto edgeLess = []( const ConnectEdge& a, const ConnectEdge& b ) noexcept
+        { return a.from != b.from ? a.from < b.from : a.to < b.to; };
+        const auto edgeEq   = []( const ConnectEdge& a, const ConnectEdge& b ) noexcept
+        { return a.from == b.from && a.to == b.to; };
+        std::sort( u.nodes.begin(), u.nodes.end() );
+        u.nodes.erase( std::unique( u.nodes.begin(), u.nodes.end() ), u.nodes.end() );
+        std::sort( u.edges.begin(), u.edges.end(), edgeLess );
+        u.edges.erase( std::unique( u.edges.begin(), u.edges.end(), edgeEq ), u.edges.end() );
+        return u;
+    }
+}   // namespace connectemit
+
+// §P9.3 — the --connect header comment, hoisted OUT of the fprintf so its byte length is a compile-time
+// fact instead of a guessed constant. It was guessed at 128 B; it is ~397 B, so the header comment ALONE
+// exceeded the est_tokens the verb printed, and the verb under-reported its own document by ~1.7-1.9x.
+// serialize.h:524 had already decided the rule for the map family — "the REPORTED est_tokens must cover
+// the whole payload the caller receives" — and this is that same rule applied to the one verb that had a
+// hand-written estimate of its own. Edit the text and the estimate follows automatically; that coupling is
+// the whole point of the constant. (G4: an XML comment may not contain a double hyphen.)
+inline constexpr char kConnectHeader[] =
+    "<!-- codecortex connect: minimal joining subgraph over N task symbols (metric-closure 2-approx Steiner;"
+    " search is undirected so SHARED-CALLER joins are found, every <e f= t=/> keeps its TRUE caller->callee"
+    " direction; graph-structured navigation per CodeCompass, arXiv 2602.20048). Call edges are name-based:"
+    " dynamic dispatch / callbacks may hide connections. counts_floor=\"1\": every graph-derived count here (nodes=,"
+    " edges=, groups=) is a FLOOR, never a total; read a zero as \"none found\", never as \"none exists\"."
+    " graph_ambiguous=/graph_unresolved= are the whole graph's resolver gauge (calls split over several defs / calls"
+    " whose in-repo defs were all language-filtered), the map header's ambiguous=/unresolved=."
+    " defs= on a terminal row = that NAME has N definitions and the lowest-id one was used (a C/C++ declaration without"
+    " a body yields to the lowest-id definition of its scope that has one); qualify with file:name"
+    " to pick another. Steiner rows never carry it."
+    " connects= on a Steiner row = how many DISTINCT symbols that intermediary joins (its callers plus its"
+    " callees, the undirected view this search walks), so you can see how much the join actually explains;"
+    " hub=\"1\" says connects= is at or above hub_floor= on the root, and hub_floor= is DERIVED from this graph,"
+    " not tuned: the smallest D with D(D-1)/2 > edges, the degree at which one node alone joins more distinct"
+    " symbol pairs than the whole call graph has edges. Read a hub=\"1\" join as \"the only join found is a symbol"
+    " that connects that many other things\", never as a relationship. Equal-distance joins are resolved by the"
+    " LOWER connects= (node id only breaks a remaining tie), so the answer does not depend on file order."
+    " max_tokens= is the token ceiling this bundle was SHAPED against (the max_tokens flag; absent = none"
+    " was asked for); est_tokens= is what it cost, truncated=\"paths\" says the shaping had to cut, and"
+    " over_ceiling=\"1\" says est_tokens exceeds max_tokens anyway (the trim ran out of things to drop before it"
+    " reached the ceiling; the bundle is then complete, not further trimmed) -->";
+
+// The root element's own bytes: the <connect ...> start-tag PLUS the </connect> close. It is
+// self-referential (the start-tag's length depends on the digits of the number it carries), so it is
+// BOUNDED rather than measured — a wide start-tag with every counter at five digits and truncated="paths"
+// present, plus the 10-byte close. Over-covering slightly is the safe direction: an estimate that
+// UNDER-reports is the defect being fixed here, one that over-reports merely trims a little earlier.
+inline constexpr std::size_t kConnectRootBytes = 285;   // H5/M15: + counts_floor="1" (17 B) + graph_ambiguous=/graph_unresolved= (≤ 59 B); A6: + hub_floor= (≤ 18 B);
+                                                        // #66: + graph_unindexed= (≤ 25 B at five digits) — this bound may only ever be raised, per the note below.
+                                                        // 200 was already short of the widest start tag it claims to bound (that spelling measures ~228 B
+                                                        // before hub_floor=), and short is the ONE direction this constant may not be — re-derived by
+                                                        // counting the wide spelling attribute by attribute, then rounded up for the next attribute's margin.
+
+// The ONE estimator both the trim-loop fit check and the printed est_tokens go through. Never inline the
+// arithmetic at a call site again: two copies of this formula is exactly how the payload-only scope bug
+// survived (the printed number and the budget decision must be the same number, by construction).
+// `extraBytes` — R-E fix (2026-08-19): the bytes this document carries that the two constants above do not
+// bound, i.e. the root= attribute's own length (an absolute crawl root is easily 50+ bytes, and kConnectRootBytes
+// is a start-tag bound from before root= existed) plus the shared root-relative legend comment when it is
+// emitted. The first R-E landing added root= to the start tag and left the estimator alone, which is exactly
+// the UNDER-report kConnectRootBytes' own comment says must never happen. Passed, never re-derived, so the
+// trim-loop's fit check and the printed est_tokens still cannot disagree.
+inline std::size_t connectEstTokens( std::size_t payloadBytes, std::size_t extraBytes = 0 ) noexcept
+{
+    const double wholeDocumentBytes = double( payloadBytes ) + double( sizeof( kConnectHeader ) - 1 )
+                                    + double( kConnectRootBytes ) + double( extraBytes );
+    return std::size_t( wholeDocumentBytes / kBytesPerTokenDefault + 0.5 );
+}
+
+inline void packConnect( std::FILE* out, const IngestResult& ing, const Graph& g, const ConnectResult& res,
+                         RedactCounts* redact,                  // §B0/W3-N1: REQUIRED — the Steiner-node sig= attrs are emitted text
+                         int maxTokens = 0,
+                         std::string_view rootArg = {},    // R-E (2026-08-17): same single-root-only root
+                                                           // argument serialize() takes — see its comment.
+                                                           // Shared by CLI --connect and the MCP connect verb.
+                         std::size_t unprovenDefs = 0 )    // H1: the terminals' decl→def residue, SUMMED by the caller
+{
+    std::vector<char> escBuf;
+    const auto ex = [ & ]( std::string_view s ) -> std::string { return std::string( escapeXml( s, escBuf ) ); };
+    const std::string rootPrefix = rootArg.empty() ? std::string() : sarif::rootPrefixOf( rootArg );
+    const auto         pathRel   = [ & ]( std::uint32_t fileId ) -> std::string_view
+    {
+        return rootArg.empty() ? std::string_view( ing.files[ fileId ] ) : sarif::rootRelativeUri( ing.files[ fileId ], rootPrefix );
+    };
+    // R-E fix (2026-08-19): the root= attribute and the shared root-relative legend are part of the document
+    // this verb budgets, so they are charged to BOTH the trim-loop fit check and the printed est_tokens. Built
+    // once here because connectEstTokens must be called with the same value in both places.
+    const std::string  connectRootAttr = rootArg.empty() ? std::string() : ( " root=\"" + ex( rootArg ) + "\"" );
+    // 0.6.1 M2 — the THIRD thing this verb emits ahead of its payload, and the one the estimator did not
+    // charge. PR #72 (issue #66, 382e66e6) added the graph_unindexed legend comment (185 B) beside the
+    // graph_unindexed= attribute and raised kConnectRootBytes 260 -> 285 for the ATTRIBUTE only. A corpus
+    // with one unindexed file therefore grew
+    // the delivered document by 205 B while est_tokens did not move a token: 2503 B / 1049 (conservative by
+    // 119 B) became 2708 B / 1049 — OPTIMISTIC by 86 B, the direction both constants above say this estimate
+    // may never take. Held in a NAMED string rather than charged from one call and emitted from another: the
+    // bytes counted here and the bytes written below are now the same object, so the two cannot drift again
+    // (same reason connectExtraBytes itself is built once). Gate: estchargecheck #17.
+    const std::string  connectUnindexedLegend = graphUnindexedLegendComment( g.unindexedFiles > 0 );
+    // H1: the residue attribute and its clause are two more things this document carries ahead of its payload, charged
+    // the way the unindexed clause above is — named once, counted from the same objects that are written. Both are empty
+    // at zero, so an answer that dropped nothing prices and emits byte-identically.
+    const std::string  connectUnprovenAttr   = unprovenDefsAttrXml( unprovenDefs );
+    const std::string  connectUnprovenLegend = unprovenDefsVerbComment( UnprovenDefsVerb::Connect, unprovenDefs > 0, "<!-- codecortex connect: " );
+    const std::size_t  connectExtraBytes = connectRootAttr.size() + std::strlen( rootRelPathsLegend( !rootArg.empty() ) )
+                                         + connectUnindexedLegend.size() + connectUnprovenAttr.size() + connectUnprovenLegend.size();
+
+    // §2.4a: the derived hub threshold every Steiner row's connects= is read against, computed ONCE (it is a
+    // property of the graph, not of a row) and named on the root so the label is never a bare assertion.
+    const std::uint32_t hubFloor = connectHubFloor( g );
+
+    // per-file content cache for the Steiner sig= attributes (each needed file read at most once).
+    HashMap<std::uint32_t, std::string> contents;
+    const auto contentOf = [ & ]( std::uint32_t fid ) -> const std::string&
+    {
+        const auto it = contents.find( fid );
+        if( it != contents.end() )
+        {
+            return it->second;
+        }
+        std::string s;
+        if( fid < ing.files.size() )
+        {
+            if( std::FILE* in = std::fopen( diskPath( ing, fid ).c_str(), "rb" ) )
+            {
+                char b[4096];
+                std::size_t n;
+                while( ( n = std::fread( b, 1, sizeof( b ), in ) ) > 0 )
+                {
+                    s.append( b, n );
+                }
+                std::fclose( in );
+            }
+        }
+        return contents.emplace( fid, std::move( s ) ).first->second;
+    };
+
+    // one <t>/<s>/<e> writer set appending to a payload string (built BEFORE the root so est_tokens is honest).
+    const auto symAttr = [ & ]( std::string& p, const char* tag, NodeId id )
+    {
+        const Symbol& s = ing.symbols[ id ];
+        p.append( "<" ).append( tag ).append( " n=\"" ).append( ex( s.name ) )
+         .append( "\" t=\"" ).append( symTag( s.kind ) )
+         .append( "\" p=\"" ).append( ex( pathRel( s.fileId ) ) ).append( ":" ).append( std::to_string( s.line ) ).append( "\"" );
+    };
+
+    // §4 trim order: pass 1 full sigs; pass 2 name-only Steiner nodes; then drop legs longest-first
+    // (ties: lower (termA,termB) first - the core's own cap ordering) until the estimate fits.
+    struct LegRef { std::size_t groupIdx, legIdx; std::uint32_t dist; NodeId a, b; };
+    std::vector<LegRef> legOrder;
+    for( std::size_t gi = 0; gi < res.groups.size(); ++gi )
+    {
+        for( std::size_t li = 0; li < res.groups[ gi ].paths.size(); ++li )
+        { const ConnectPath& cp = res.groups[ gi ].paths[ li ]; legOrder.push_back( { gi, li, cp.dist, cp.termA, cp.termB } ); }
+    }
+    std::sort( legOrder.begin(), legOrder.end(), []( const LegRef& x, const LegRef& y ) noexcept
+               { return x.dist != y.dist ? x.dist > y.dist : x.a != y.a ? x.a < y.a : x.b < y.b; } );
+
+    bool          withSigs    = true;
+    std::size_t   legsDropped = 0;
+    std::string   payload;
+    std::uint32_t nodeTotal = 0, edgeTotal = 0, connectedGroups = 0;
+    for( ;; )
+    {
+        payload.clear();
+        nodeTotal = 0;  edgeTotal = 0;  connectedGroups = 0;
+
+        // retained-leg mask per group for this pass. One byte per leg, so N=8 is free — rw::svector's inline
+        // array shares storage with the 8-byte heap pointer it unions with, and <char,8> is 16 B, the same
+        // as <char,1> and a third under a std::vector's 24. Rebuilt on every budget-trim pass, so the
+        // allocation it stops making is per-group-per-pass, not once.
+        std::vector<rw::SmallVec<char, 8>> retained( res.groups.size() );
+        for( std::size_t gi = 0; gi < res.groups.size(); ++gi )
+        {
+            retained[gi].assign( res.groups[gi].paths.size(), 1 );
+        }
+        for( std::size_t d = 0; d < legsDropped && d < legOrder.size(); ++d )
+        {
+            retained[legOrder[d].groupIdx][legOrder[d].legIdx] = 0;
+        }
+
+        // connected groups first (core order = lowest-terminal-id order), then the <unconnected> singletons.
+        for( const ConnectGroup& grp : res.groups )
+        {
+            if( grp.terminals.size() < 2 )
+            {
+                continue;
+            }
+            const std::size_t gi = std::size_t( &grp - res.groups.data() );
+
+            std::vector<NodeId>      steiner = grp.steiner;
+            std::vector<ConnectEdge> edges   = grp.edges;
+            if( legsDropped > 0 )                                   // a leg went: rebuild this group's union
+            {
+                const connectemit::GroupUnion u = connectemit::rebuildFromLegs( grp, retained[ gi ] );
+                steiner.clear();
+                for( NodeId v : u.nodes )
+                {
+                    if( !std::binary_search( grp.terminals.begin(), grp.terminals.end(), v ) )
+                    {
+                        steiner.push_back( v );
+                    }
+                }
+                edges = u.edges;
+            }
+            ++connectedGroups;
+            nodeTotal += std::uint32_t( grp.terminals.size() + steiner.size() );
+            edgeTotal += std::uint32_t( edges.size() );
+
+            payload.append( "<g terminals=\"" ).append( std::to_string( grp.terminals.size() ) ).append( "\">" );
+            for( NodeId t : grp.terminals )
+            {
+                symAttr( payload, "t", t );
+                // M20 (lens 6 F12): a TERMINAL is a caller-typed selector, resolved by resolveFocus's
+                // single pick (graph.h states the rule). --callers/--uses/--impact/--path/--verify all disclose defs= for the same
+                // name; the Steiner subgraph did not, so `--connect=size,…` was built from one of six `size`
+                // definitions with nothing on the row to say which question was answered. Steiner nodes (the
+                // "s" rows) carry no defs= because nobody selected them — the search found them.
+                const std::size_t terminalDefs = definitionCountOfName( ing, t );
+                if( terminalDefs > 1 ) { payload.append( " defs=\"" ).append( std::to_string( terminalDefs ) ).append( "\"" ); }
+                payload.append( "/>" );
+            }
+            for( NodeId sN : steiner )
+            {
+                symAttr( payload, "s", sN );
+                // §2.4a disclosure (non-negotiable #3). The Steiner row is the thing the agent did NOT name
+                // and is being asked to believe, so it says how much it explains: connects= is how many
+                // distinct symbols this intermediary joins, and hub="1" says that count is at or above the
+                // graph's own derived floor. An honest "the only join found connects 764 other things" is
+                // worth more than a confident bare `empty`. Both are FACTS off the CSR, so they are never
+                // dropped by the --max-tokens trim (which drops sig= bodies and then whole legs); they cost
+                // ~14 B a row and they are the reason the row can be trusted or discounted at all.
+                // Terminals never carry them — the caller named those; the search chose these.
+                const std::uint32_t sConnects = connectJoinBreadth( g, sN );
+                payload.append( " connects=\"" ).append( std::to_string( sConnects ) ).append( "\"" );
+                if( sConnects >= hubFloor )
+                {
+                    payload.append( " hub=\"1\"" );
+                }
+                if( withSigs )
+                {
+                    const Symbol&      sy  = ing.symbols[ sN ];
+                    const std::string& src = contentOf( sy.fileId );
+                    if( sy.sigStartByte < sy.sigEndByte && sy.sigEndByte <= src.size() )
+                    {
+                        payload.append( " sig=\"" ).append( ex( cleanSig( src.data(), sy.sigStartByte, sy.sigEndByte, redact ) ) ).append( "\"" );
+                    }
+                }
+                payload.append( "/>" );
+            }
+            for( const ConnectEdge& e : edges )
+            {
+                payload.append( "<e f=\"" ).append( ex( ing.symbols[ e.from ].name ) )
+                       .append( "\" t=\"" ).append( ex( ing.symbols[ e.to ].name ) ).append( "\"/>" );
+            }
+            payload.append( "</g>" );
+        }
+        for( const ConnectGroup& grp : res.groups )                 // §4: <unconnected> is NEVER trimmed
+        {
+            if( grp.terminals.size() != 1 )
+            {
+                continue;
+            }
+            nodeTotal += 1;
+            payload.append( "<unconnected radius=\"" ).append( std::to_string( res.radius ) ).append( "\">" );
+            symAttr( payload, "t", grp.terminals[ 0 ] );
+            // The SAME disclosure the <g> arm makes above, on the arm that makes the STRONGER claim. An
+            // unconnected terminal is still resolveFocus's single pick among N same-named definitions,
+            // and "no relationship within radius R" is exactly where answering about one of N silently
+            // changes the answer. Derived from definitionCountOfName — the same call the <g> arm uses —
+            // so the two can never drift into disagreeing about what the name resolved to.
+            const std::size_t loneDefs = definitionCountOfName( ing, grp.terminals[ 0 ] );
+            if( loneDefs > 1 ) { payload.append( " defs=\"" ).append( std::to_string( loneDefs ) ).append( "\"" ); }
+            payload.append( "/></unconnected>" );
+        }
+
+        // fit check against --max-tokens (0 = no budget) — over the WHOLE document (§P9.3, see kConnectHeader
+        // above): the same estimator that produces the printed est_tokens, so the budget the caller sets and
+        // the number the caller reads can never disagree.
+        const std::size_t est = connectEstTokens( payload.size(), connectExtraBytes );
+        if( maxTokens <= 0 || est <= std::size_t( maxTokens ) )
+        {
+            break;
+        }
+        if( withSigs )                    { withSigs = false;  continue; }   // trim 1: sigs -> name-only
+        if( legsDropped < legOrder.size() ) { ++legsDropped;   continue; }   // trim 2: drop whole legs
+        break;                                                               // trim 3 does not exist: terminals + <unconnected> stay
+    }
+
+    const bool truncated = res.truncated || legsDropped > 0;
+    // §P8 vocabulary: `est_tokens="~191"` was the tool's only NON-NUMERIC token estimate — the `~` made
+    // `int(...)` throw in the one field whose whole purpose is arithmetic against a budget, and no other
+    // verb apologises for an estimate being an estimate. Dropped.
+    std::size_t estTokens = connectEstTokens( payload.size(), connectExtraBytes );
+    // H9: the ceiling this bundle was SHAPED against, named on the root. The trim loop above really does
+    // drop sigs and then whole legs to fit `maxTokens`, and until this attribute existed the only evidence
+    // was `truncated="paths"` — which says something was cut but not what it was cut to. Absent when no
+    // --max-tokens was given (0), so the un-budgeted answer stays byte-identical; the MCP `connect` verb
+    // declares no budget argument, so its answer is the un-budgeted one and the two surfaces still agree.
+    char connectCeiling[ 32 ];  connectCeiling[ 0 ] = '\0';
+    if( maxTokens > 0 )
+    {
+        rw::formatTo( connectCeiling, sizeof( connectCeiling ), " max_tokens=\"{}\"", maxTokens );
+    }
+    // F5 sibling (capture-audit verify-wave2 2026-09-05, budgetpolicycheck (D)): the trim loop above has
+    // exactly two moves — sigs off, then legs dropped — and then it BREAKS whether or not the bundle fits.
+    // `--connect=… --max-tokens=200` therefore delivered 656 tokens beside max_tokens="200" wearing only
+    // truncated="paths", which says something was cut and not that the cut fell short. A ceiling named is a
+    // ceiling measured against: over_ceiling="1" when the delivered document still exceeds it. Its own 17
+    // bytes are charged back through the same estimator, so the number and the label describe one document.
+    const bool        connectOver     = maxTokens > 0 && estTokens > std::size_t( maxTokens );
+    const char* const connectOverAttr = connectOver ? " over_ceiling=\"1\"" : "";
+    if( connectOver )
+    {
+        estTokens = connectEstTokens( payload.size(), connectExtraBytes + std::strlen( connectOverAttr ) );
+    }
+    rw::emitTo( out, "{}{}{}{}", rw::cstr( kConnectHeader ), connectUnindexedLegend.c_str(), connectUnprovenLegend.c_str(),
+                rootRelPathsLegend( !rootArg.empty() ) );
+    rw::emitTo( out, "<connect terminals=\"{}\" nodes=\"{}\" edges=\"{}\" radius=\"{}\" groups=\"{}\"{} est_tokens=\"{}\" hub_floor=\"{}\"{}{}{}{}{}>",
+                  res.terminals.size(), nodeTotal, edgeTotal, res.radius, connectedGroups,
+                  connectUnprovenAttr.c_str(),   // H1: beside the counts it qualifies; absent at zero
+                  estTokens, hubFloor,
+                  rw::cstr( connectCeiling ), connectOverAttr,
+                  truncated ? " truncated=\"paths\"" : "", connectRootAttr.c_str(),
+                  graphCountFloorAttrXml( g ).c_str()  );   // H5/M15: nodes=/edges= are read off the name-based CSR — a floor, with the gauge
+    std::fwrite( payload.data(), 1, payload.size(), out );
+    rw::emitRaw( out, "</connect>" );
+}
+
+// `connect` verb: resolve the 2..16 symbol specs (resolveFocus - `file:name` disambiguation, exactly the CLI)
+// against the warm index, run connectSubgraph, and capture packConnect through a memstream (path_between
+// pattern). On failure returns "" with `err` set (unresolved symbol / bad terminal count).
+inline std::string connectText( const std::string& root, const std::vector<std::string>& symbolSpecs,
+                                std::uint32_t radius, std::string& err, RedactCounts* redact )
+{
+    const McpIndex&     ix  = getIndex( root );
+    const IngestResult& ing = ix.ing;
+    const Graph&        g   = ix.g;
+
+    if( symbolSpecs.size() < 2 || symbolSpecs.size() > connectcfg::kMaxTerminals )
+    { err = "connect needs 2..16 symbols (got " + std::to_string( symbolSpecs.size() ) + ")"; return {}; }
+
+    std::vector<NodeId> terminals;
+    std::size_t         unprovenDefs = 0;   // H1: summed over the terminals, exactly as the CLI --connect sums them
+    for( const std::string& spec : symbolSpecs )
+    {
+        std::size_t  termUnprovenDefs = 0;
+        const NodeId id               = resolveFocus( ing, spec, &termUnprovenDefs );
+        if( id == kNoNode ) { err = "symbol not found: " + spec + mcprefuse::atSeedClause( ing, spec ); return {}; }   // the @-clause is "" for a plain name
+        terminals.push_back( id );
+        unprovenDefs += termUnprovenDefs;
+    }
+
+    const ConnectResult res = connectSubgraph( g, terminals, radius );
+    rw::MemoryStream stream;
+    std::FILE* const mem = stream.open();
+    if( !mem ) { err = "internal error"; return {}; }
+    // R-E (2026-08-17 harvest): same single-root condition every other verb's root= uses (sarif.h).
+    packConnect( mem, ing, g, res, redact, /*maxTokens=*/0, ing.realPaths.empty() ? std::string_view( root ) : std::string_view(),
+                 unprovenDefs );
+    std::optional<std::string> answer = mcpAnswerText( stream );
+    if( !answer )
+    {
+        err = "internal error";   // the same refusal as the failed open above
+        return {};
+    }
+    return std::move( *answer );
+}
+
+// ─── quality_baseline / quality_delta verbs (the convergence-loop oracle over the warm index) ──────────────
+//
+// quality_baseline WRITES the `.codecortex_quality_baseline` sidecar (a side-effect verb, like the edit verbs),
+// stamping the current HEAD sha. quality_delta is READ-ONLY: it reports ONLY what the working tree made WORSE
+// vs the baseline (10 kinds), honoring the exact precedence the CLI --quality-delta uses:
+//   (1) an explicit sidecar (from quality_baseline) wins — UNLESS it is STALE (pinned at a different HEAD),
+//   (2) else auto-compare vs git HEAD (computeHeadSnapshot), (3) else degrade with a clear message.
+// Both reuse quality::computeSnapshot / writeBaseline / selectBaseline / computeHeadSnapshot / gitHeadSha /
+// computeDelta — the SAME functions main.cpp's handler calls (no duplicated computation). Step (1) in
+// particular is quality::selectBaseline, the single shared seam: R3 (2026-07-29) ended a period where the two
+// arms each owned a copy of the staleness test and disagreed about which sidecars were trustworthy.
+//
+// STATELESS-PER-CALL is fine here: the baseline lives on DISK (the sidecar / git HEAD), not in process memory,
+// so a fresh MCP call reconstructs the same comparison the CLI would. Determinism: computeSnapshot + the HEAD
+// archive are byte-stable for a fixed tree state, and computeDelta sorts (kind, sym) → the JSON is identical
+// run-to-run. NOTE: quality_delta rebuilds ing/graph from disk (NOT the warm McpIndex) so its `rootPath` keys
+// match the CLI's cfg.rootPath spelling exactly — the warm index's root may be an absolutized/remote path,
+// which would change the baselineCanonId keys and manufacture phantom regressions.
+//
+// SIDECAR LOCATION — D1 fix: this used to be the one deliberate CLI/MCP divergence (the MCP server's CWD is
+// wherever the agent launched it, not `root`, so it root-qualified while the CLI trusted CWD==root). D1
+// found that trust was unsound — the CLI is not always invoked from inside its own root either (a wrapper
+// script, an orchestrator batching several roots) — so the CLI now root-qualifies too, via the SAME helper
+// (quality::rootQualifiedSidecar / quality::baselinePath / quality::acksPath in quality.h; see that header's
+// comment for the full rationale). These two are now thin forwarders so every existing call site here keeps
+// working unchanged; the canonical implementation lives in quality.h.
+inline std::string qualityBaselinePath( const std::string& root ) { return rw::quality::baselinePath( root ); }
+inline std::string qualityAcksPath( const std::string& root )     { return rw::quality::acksPath( root ); }
+
+// the applied-vs-HEAD comparison, shared by the JSON emitter. `regs` = the regressions; `baseMarker` = the
+// baseline= marker (sidecar / git-HEAD / git-HEAD (stale sidecar ignored)); `ok`=false + `errMsg` when the
+// tree is non-git with no sidecar (caller → error, mirroring the CLI exit-1 guidance).
+struct QualityDeltaOutcome
+{
+    bool                              ok = false;
+    std::string                       errMsg;        // on degrade (non-git, no sidecar)
+    std::string                       baseMarker;    // "sidecar" | "git-HEAD" | "git-HEAD (stale sidecar …)" — see §B6 M10 below
+    std::vector<rw::quality::Regression> regs;
+    std::size_t                       ackedCount = 0;// findings suppressed by the .codecortex_quality_acks ratchet (honest suppression)
+    std::vector<rw::quality::StaleAck> staleAcks;     // L2 — acks whose target no longer applies to this working tree (see quality::computeStaleAcks)
+    // R1 IDENTITY — the same disclosure the CLI root carries, so an MCP-only agent is told what an ack's
+    // survival across a rename rested on. It has no CLI to re-ask from; a fact that exists on one surface and
+    // not the other is the §B6 M5 divergence this file has paid for once already.
+    // H14 (capture-audit 2026-09-04): ONE string, built by quality::identityDisclosure — the same call the
+    // CLI root makes, which returns the XML attrs and the JSON side by side precisely so the two cannot
+    // diverge. This used to be six extracted counts re-serialised by hand below, and the hand copy had
+    // forgotten `rename_window_commits` and `renames_window_truncated`. Losing the truncation flag is the
+    // expensive one: it says the 400-commit rename window was hit, so `renames` and every acked_by_rename
+    // verdict downstream is a FLOOR — and an MCP client had no way to learn that.
+    std::string                       identityJson;   // ",\"renames\":39,\"rename_window_commits\":400,…" (empty when git was unreadable)
+    std::size_t                       ackedByRename    = 0;
+    std::size_t                       ackedByContent   = 0;
+    std::size_t                       registerMacroExcluded = 0;   // P2.2: the CLI's disclosed dead-code exemption count — see quality.h
+    std::size_t                       apiNewSurface         = 0;   // Q-DIAL-4: the CLI's api-new-surface= count — see quality.h
+    // #228: the CLI root's head_basis= twin — see quality::HeadBasis for the value vocabulary. Present-only in
+    // the JSON, under the same absent-means-the-ordinary-archived-tree rule as the CLI, so mcpclidiffcheck's
+    // key-set lens stays satisfied.
+    const char*                       headBasis             = nullptr;
+};
+
+// §B6 M10 — a CORRUPT sidecar used to read as "no sidecar". readBaseline reports a file that yields no header,
+// no `head` stamp and no record line as ABSENT (correct — a broken pin is not a floor), and selectBaseline then
+// hands back the bare "git-HEAD" marker, which is the SAME answer a tree with NO sidecar at all gets. The only
+// disclosure was a server-side DISCLOSE on stderr, which no MCP client surfaces: the agent saw a
+// clean baseline:"git-HEAD" and could not know its pinned floor had silently stopped being read.
+//
+// Absent-vs-present is a fact this arm can establish on the path it already knows: a bare "git-HEAD" means the
+// sidecar was neither honored nor stale, so a file sitting at `sidecar` can only be one readBaseline rejected.
+// Reported in the MARKER, where the other "not the floor you think" state ("stale sidecar ignored") is already
+// reported, and read-only exactly like this arm's stale policy — the file is left on disk. Deliberately NOT a
+// quality.h change: the marker vocabulary there is shared with the CLI arm, and this states an MCP-arm fact
+// without moving the shared table.
+//
+// It is a named step rather than a block inside computeQualityDelta so that "which marker does this arm
+// report" has ONE answer with ONE reason, and adding a state later is an arm here instead of another `if`
+// buried in the middle of an ingest-and-compare function.
+inline const char* mcpBaselineMarker( const rw::quality::BaselineSelection& selection, const std::string& sidecarPath )
+{
+    if( selection.source != rw::quality::BaselineSource::Absent )
+    {
+        return selection.marker;
+    }
+    // Round 3 (pathguard.h): a refused link is decided by the refused open itself. The probe below FOLLOWS a link
+    // (std::filesystem::exists is a stat, not an lstat), so asking it would call a refusal "unreadable" whenever
+    // the link's target exists and "no sidecar" whenever it does not — an answer about some other file entirely.
+    if( selection.sidecarSymlinkRefused )
+    {
+        return selection.marker;
+    }
+
+    std::error_code sidecarEc;
+    if( std::filesystem::exists( std::filesystem::path( sidecarPath ), sidecarEc ) && !sidecarEc )
+    {
+        return "git-HEAD (sidecar unreadable)";   // present on disk, rejected by readBaseline — the SAME
+                                                   // spelling selectBaseline's own "present but unrecognizable"
+                                                   // state uses (quality.h), and the one verbs_quality.h's
+                                                   // legend documents; A2 (found-items 2026-09-17) found this
+                                                   // arm spelling the identical state differently.
+    }
+    return selection.marker;                              // genuinely absent — "git-HEAD"
+}
+
+// The error quality_delta returns when the git-HEAD fallback was attempted and ALSO came back empty — the CLI
+// twin is verbs_quality.h's noBaselineFatalMessage, and each state below mirrors its wording, per-arm verb aside.
+// A named step rather than a conditional chain inside computeQualityDelta, for the reason mcpBaselineMarker above
+// gives: each state is one arm with one reason, and "no <file>" is reached only when there is no file.
+//   * w1 sibling sweep: this arm passes removeStaleFile=false, so a stale sidecar ALWAYS survives here
+//     (baseSel.isStaleFileOnDisk() is true whenever isSidecarStale() is) — "delete it" is therefore always the true
+//     instruction and the wording needs no removed-vs-ignored split. The CLI twin, which unlinks, does branch on it.
+//   * Round 3 (pathguard.h): "no <file>" is false while a refused link is sitting at the name.
+//   * The producer rule (quality.h BaselineSource): a foreign pin is a real floor for another build, left on disk.
+inline std::string mcpNoBaselineMessage( const rw::quality::BaselineSelection& baseSel )
+{
+    const std::string sidecarName = rw::quality::kBaselineFile;
+    if( baseSel.sidecarSymlinkRefused )
+    {
+        return sidecarName + " is a symlink, which is refused on read exactly as on write (it was not opened), and there is no git HEAD to auto-compare against — replace the link with a regular copy of its target, or remove it and run the quality_baseline verb";
+    }
+    if( baseSel.sidecarUnreadable )
+    {
+        return sidecarName + " exists but is not a readable baseline (unrecognizable, an older sidecar format, or a pre-Q1 sidecar without per-symbol loc records) and there is no git HEAD to auto-compare against — re-pin it with the quality_baseline verb BEFORE the change you want to measure";
+    }
+    if( baseSel.isSidecarForeign() )
+    {
+        return sidecarName + " was pinned by another codecortex build (its producer stamp does not name this server's sources, and a dead set depends on how calls were resolved) and there is no git HEAD to auto-compare against — it was left on disk: run quality_delta with the build that pinned it, or re-pin on a clean tree (commit or stash first) with the quality_baseline verb BEFORE the change you want to measure";
+    }
+    if( baseSel.isSidecarStale() )
+    {
+        return sidecarName + " is STALE (pinned at a different HEAD) and there is no current HEAD tree to fall back to — delete it or re-run the quality_baseline verb";
+    }
+    return "no " + sidecarName + " and no git HEAD to auto-compare against — run the quality_baseline verb BEFORE the change you want to measure";
+}
+
+inline QualityDeltaOutcome computeQualityDelta( const std::string& root )
+{
+    QualityDeltaOutcome oc;
+
+    // rebuild ing/graph from disk with root exactly as invoked → baseline keys match the CLI key-for-key.
+    // Phase-M: serialize this working-tree ingest against a concurrent qsnap-prefetch worker (ingest() writes
+    // single-writer process-global caches). The computeHeadSnapshot call below locks
+    // the SAME mutex internally, so keep this guard SCOPED to the ingest only (no re-entrant lock → no deadlock).
+    IngestResult ing;
+    {
+        std::lock_guard<std::mutex> ingestLk( rw::quality::headSnapshotIngestMutex() );
+        ing = ingest( root.c_str(), {}, {} );
+    }
+    const Graph  g   = buildGraph( ing, nullptr );
+
+    const std::string sidecar = qualityBaselinePath( root );   // root-qualified (see SIDECAR LOCATION note)
+
+    // STALENESS lives in quality::selectBaseline — the ONE seam both arms share (R3 owner ruling, 2026-07-29).
+    // A sidecar pinned at a DIFFERENT HEAD than the current one is STALE (abandoned/parallel session, or
+    // written before a commit): trust it and quality_delta reports a wall of false regressions. This arm's own
+    // POLICY is `removeStaleFile=false` — quality_delta is READ-ONLY, so the stale file is left on disk and
+    // merely ignored ("git-HEAD (stale sidecar ignored)"), where the CLI passes true and self-heals it away.
+    // The strict-equality test itself used to be MCP-only; the CLI carried a reachable-ancestor carve-out that
+    // made it honor sidecars this arm dropped, which is the divergence R3 revoked.
+    rw::quality::BaselineSelection baseSel = rw::quality::selectBaseline( root, sidecar, /*removeStaleFile=*/false );
+    if( !baseSel.isSidecarHonored() )
+    {
+        // #228 part 1 — the IDENTITY BASIS, through the SAME seam the CLI takes (quality::computeHeadBasis).
+        // This verb and the CLI must answer one tree one way in the same second; a per-caller copy of the
+        // basis is precisely how they drifted apart before (the R3 divergence this arm's comment records).
+        rw::quality::HeadBasis basis = rw::quality::computeHeadBasis( root, ing, g, root );
+        if( !basis.ok )
+        {
+            oc.ok     = false;
+            oc.errMsg = mcpNoBaselineMessage( baseSel );
+            return oc;
+        }
+        baseSel.snapshot       = std::move( basis.snapshot );
+        oc.headBasis           = basis.basis;
+    }
+
+    // R1 IDENTITY: the SAME healing pre-pass the CLI runs, through the one entry point, and BEFORE
+    // computeDelta reads the baseline. §B6 M5 / R3 is the standing lesson — the moment this arm carries its
+    // own copy of a rule the two surfaces answer one question differently in the same second. This verb is
+    // read-only, so it never WRITES content ids (wantContentIds=false); it still uses the ones a row carries.
+    auto       acks = rw::quality::readAckRecords( qualityAcksPath( root ) );
+    const auto heal = rw::quality::healIdentity( baseSel.snapshot, acks, ing, g, root, root, /*wantContentIds=*/false );
+
+    oc.regs       = rw::quality::computeDelta( ing, g, baseSel.snapshot, root, {}, rw::kDefaultMaxFileBytes, &oc.registerMacroExcluded, &oc.apiNewSurface );
+
+    // signal-to-noise round: honor the per-finding ack ratchet exactly like the CLI — the acks sidecar is
+    // root-qualified (same SIDECAR LOCATION discipline as the baseline), suppression is reported via `acked`.
+    rw::quality::countAckRescues( oc.regs, acks, heal.ackRemap, oc.ackedByRename, oc.ackedByContent );
+    oc.identityJson     = rw::quality::identityDisclosure( heal ).second;   // H14: the CLI's own disclosure, verbatim
+    oc.ackedCount   = rw::quality::applyAckRatchet( oc.regs, acks );
+
+    // L2 — same stale-ack disclosure the CLI's --quality-delta reports (see quality.h's computeStaleAcks):
+    // checked against THIS working tree, never the baseline above, so it costs one more computeSnapshot pass
+    // over `ing`/`g` already built here; skipped when the ledger is empty (test/mcpclidiffcheck.sh's LENS2
+    // pins the two surfaces to the same JSON key set).
+    if( !acks.empty() )
+    {
+        oc.staleAcks = rw::quality::computeStaleAcks( acks, rw::quality::computeSnapshot( ing, g, root ) );
+        rw::quality::stampStaleAckIdentity( oc.staleAcks, ing, root );   // M21(a): the CLI twin's sym=/p=
+    }
+
+    // R3: the marker spelling table lives in selectBaseline, so CLI and MCP name the same state the same way;
+    // §B6 M10: plus this arm's own unreadable-sidecar state (mcpBaselineMarker, above).
+    oc.baseMarker = mcpBaselineMarker( baseSel, sidecar );
+    oc.ok         = true;
+    return oc;
+}
+
+// quality_delta → { JSON, error }. The JSON is "" ONLY on the non-git/no-sidecar degrade, and the error then says why.
+//
+// §B6 M5 [MISLEADING] — this payload and the CLI's `--quality-delta --json` were two JSON documents about
+// one computation that disagreed on the two things a consumer reads FIRST:
+//   • `regressions` was an ARRAY here and an INTEGER on the CLI (whose array is `r`), so a script written
+//     against one surface reads the other's count as a list and its list as a count.
+//   • `minor` and `at` were absent — `at` being the BASELINE SHA, dropped on the one verb whose entire
+//     meaning is "worse than a baseline", which left an MCP answer unattributable to the tree it judged.
+// The keys now mirror the CLI's exactly, header AND rows (p= locator, per-row gating, the churn/surface
+// facet names, displaySym's root-relative spelling, and the CLI's own was/now omission rule for the
+// zero-magnitude kinds). `regressions_count` is gone rather than kept as an alias: two names for one number
+// is how the next consumer picks the wrong one. Gate: test/mcpclidiffcheck.sh diffs the two key sets.
+inline std::pair<std::string, std::string> qualityDeltaJson( const std::string& root )
+{
+    const QualityDeltaOutcome oc = computeQualityDelta( root );
+    if( !oc.ok ) { return { std::string(), oc.errMsg }; }
+
+    // r26 ORIGIN SPLIT — the same three counts main.cpp derives, so both surfaces encode one contract.
+    std::size_t minorCount = 0, newSymbolCount = 0, gatingCount = 0;
+    for( const rw::quality::Regression& r : oc.regs )
+    {
+        if( r.isMinor )
+        {
+            ++minorCount;
+        }
+        if( r.isNewSymbol )
+        {
+            ++newSymbolCount;
+        }
+        else if( !r.isMinor )
+        {
+            ++gatingCount;
+        }
+    }
+
+    // the baseline anchor: "at":null on a non-git root (never a fake sha) — the CLI's own convention.
+    const std::string atVal  = gitstamp::stampAt( root );
+    const std::string atJson = atVal.empty() ? std::string( "null" ) : ( "\"" + mcpdetail::jsonEscape( atVal ) + "\"" );
+
+    std::string out = "{\"baseline\":\"" + mcpdetail::jsonEscape( oc.baseMarker )
+                    + "\",\"regressions\":" + std::to_string( oc.regs.size() )
+                    + ",\"minor\":" + std::to_string( minorCount )
+                    + ",\"acked\":" + std::to_string( oc.ackedCount )
+                    + ",\"stale\":" + std::to_string( oc.staleAcks.size() )
+                    + ",\"preexisting-worse\":" + std::to_string( oc.regs.size() - newSymbolCount )
+                    + ",\"new-symbol\":" + std::to_string( newSymbolCount )
+                    + ",\"gating\":" + std::to_string( gatingCount )
+                    // P2.2 — the CLI's disclosed dead-code exemption count, ALWAYS present (never omitted at
+                    // zero, unlike the identity fields just below): mcpclidiffcheck.sh's JSON-key-set lens
+                    // diffs this verb against `--quality-delta --json`, and the CLI never omits it either.
+                    + ",\"register-macro-excluded\":" + std::to_string( oc.registerMacroExcluded )
+                    // Q-DIAL-4 — same always-present rule, same mcpclidiffcheck key-set lens.
+                    + ",\"api-new-surface\":" + std::to_string( oc.apiNewSurface )
+                    // R1 IDENTITY — the CLI root's identity disclosure, spelled in JSON. Present only when
+                    // git could be read at all, exactly like the CLI arm (absent ≠ zero — see the legend).
+                    + oc.identityJson
+                    // #228 — the CLI root's head_basis= twin, present-only: absent means the archived HEAD tree.
+                    + ( oc.headBasis == nullptr ? std::string() : std::string( ",\"head_basis\":\"" ) + mcpdetail::jsonEscape( oc.headBasis ) + "\"" )
+                    + ",\"at\":" + atJson + ",\"r\":[";
+    bool first = true;
+    for( const rw::quality::Regression& r : oc.regs )
+    {
+        if( !first )
+        {
+            out += ",";
+        }
+        first = false;
+        // duplication carries a member LIST + token count; the zero-magnitude kinds (dead-code, and
+        // api-surface when was==now) are sym-only; every other kind carries was/now — the CLI's exact split.
+        out += "{\"kind\":\"" + mcpdetail::jsonEscape( r.kind ) + "\"";
+        if( r.kind == "duplication" )
+        {
+            out += ",\"members\":\"" + mcpdetail::jsonEscape( rw::quality::displaySym( r.sym, root ) )
+                 + "\",\"tokens\":" + std::to_string( r.now );
+        }
+        else
+        {
+            out += ",\"sym\":\"" + mcpdetail::jsonEscape( rw::quality::displaySym( r.sym, root ) ) + "\"";
+            if( !( r.kind == "dead-code" ) && !( r.kind == "api-surface" && r.was == r.now ) )
+            {
+                out += ",\"was\":" + std::to_string( r.was ) + ",\"now\":" + std::to_string( r.now );
+            }
+        }
+        if( !r.path.empty() )
+        {
+            out += ",\"p\":\"" + mcpdetail::jsonEscape( r.path ) + ":" + std::to_string( r.line ) + "\""; // P2.5 locator
+        }
+        if( !r.isNewSymbol && !r.isMinor )
+        {
+            out += ",\"gating\":true"; // the exit predicate, per row
+        }
+        if( r.isMinor )
+        {
+            out += ",\"sev\":\"minor\"";
+        }
+        if( !r.facet.empty() )
+        {
+            const char* facetName = rw::quality::facetAttrName( r.kind );   // ONE kind→name table (quality.h)
+            if( facetName )
+            {
+                out += ",\"" + std::string( facetName ) + "\":\"" + mcpdetail::jsonEscape( r.facet ) + "\"";
+            }
+        }
+        if( r.isNewSymbol )
+        {
+            out += ",\"origin\":\"new-symbol\""; // absent = preexisting-worse (mirrors the XML)
+        }
+        out += "}";
+    }
+    out += "],";     // L2 — "sa":[...], same taxonomy the CLI's <sa kind= key= why=/> rows carry (shared builder, quality::staleAcksJsonArray)
+    out += rw::quality::staleAcksJsonArray( oc.staleAcks );
+    out += "}";
+    return { std::move( out ), std::string() };
+}
+
+// quality_baseline → writes `.codecortex_quality_baseline` (side-effect verb) stamped with HEAD, returning a JSON
+// summary of what it wrote. Reuses quality::computeSnapshot + writeBaseline + gitHeadSha — the exact CLI path.
+// The sidecar is written in `root` (same as the CLI, which uses cfg.rootPath). Returns { JSON, "" }, or { "", error }
+// when the write fails (unwritable dir). Rebuilds ing/graph from disk so the snapshot keys match the CLI.
+inline std::pair<std::string, std::string> qualityBaselineJson( const std::string& root )
+{
+    IngestResult ing;                                          // Phase-M: serialize the ingest vs the prefetch worker (§2b)
+    {
+        std::lock_guard<std::mutex> ingestLk( rw::quality::headSnapshotIngestMutex() );
+        ing = ingest( root.c_str(), {}, {} );
+    }
+    const Graph  g   = buildGraph( ing, nullptr );
+
+    const std::string sidecar = qualityBaselinePath( root );   // root-qualified (see SIDECAR LOCATION note)
+    const std::string headSha = rw::quality::gitHeadSha( root );
+    const bool wrote = rw::quality::writeBaseline( rw::quality::computeSnapshot( ing, g, root ),
+                                                    sidecar, headSha );
+    if( !wrote )
+    {
+        // The parenthetical names BOTH causes since the CWE-59 guard landed. writeBaseline now also returns
+        // false when the destination is a symlink it refused to follow, and a JSON error that says only
+        // "unwritable directory?" would be a guess that is sometimes simply wrong — the honest reason is on
+        // stderr (rw::pathguard::openNoFollowTruncate), which the MCP protocol channel on stdout never carries.
+        return { std::string(), std::string( "could not write " ) + sidecar
+                                + " (unwritable directory, or the path is a symlink and was refused — see stderr)" };
+    }
+    std::string json = std::string( "{\"wrote\":\"" ) + mcpdetail::jsonEscape( sidecar )
+                     + "\",\"symbols\":" + std::to_string( ing.symbols.size() )
+                     + ",\"head_sha\":\"" + mcpdetail::jsonEscape( headSha.empty() ? std::string( "(none — not a git repo)" ) : headSha )
+                     + "\",\"note\":\"baseline pinned; re-run the quality_delta verb after each edit to see only what got worse\"}";
+    return { std::move( json ), std::string() };
+}
+
+// ─── L4: the B11-verb-parity MCP twins — `explore`/`pack_task`,
+// `from_trace`, `edit_check`. Each is a thin front door onto the SAME shared assembler its CLI sibling calls
+// (packtask.h / tracelocus.h / editcheck.h) — no forked logic, no drifting XML shape between the two
+// surfaces. `merge_scout` and `note-add`/`notes` stay CLI-only (write verbs / multi-ref UX; see
+// skills/codecortex-mcp).
+
+// `explore`/`pack_task` verb: the MCP twin of --pack-task — ONE call assembling the routed ranking + full
+// bodies + 1-hop callers + field notes + tests_to_run under ONE deterministic byte budget. Computes the lens
+// ranking with the SAME primitives forTaskText (the `for` verb, above) uses — chooseForRanker / lexicalScores
+// / applyMentionBoost / applyCoChangeBoost — then hands the populated LensRanking to packTaskBundleText()
+// (packtask.h), the SAME assembler --pack-task's CLI handler (main.cpp runPackTask) calls. `budgetTokens` 0
+// ⇒ the shared default (6000). No --anchor/--no-route equivalent over MCP (routing is always-on here, as it
+// is by default on the CLI; --anchor is a CLI-only CODECORTEX_DEV-gated experiment).
+//
+// `partitionCount` is the CLI's --partition=N over MCP — an ARGUMENT on this verb, not a
+// verb of its own, because it changes what `explore` returns (one bundle vs core + N slices) without changing
+// what it is FOR; a separate verb would duplicate the whole task/budget contract for one integer. 0 (or any
+// value outside 2..16, which is silently clamped OFF rather than erroring an otherwise valid explore call)
+// ⇒ the plain single-bundle form, byte-identical to before.
+inline std::string packTaskText( const std::string& root, const std::string& task, std::size_t budgetTokens,
+                                 RedactCounts* redact = nullptr, std::uint32_t partitionCount = 0, bool noRoute = false )
+{
+    const McpIndex&     ix  = getIndex( root );
+    const IngestResult& ing = ix.ing;
+    const Graph&        g   = ix.g;
+
+    LensRanking       lr;
+    // See forTaskText's own note: `noRoute` is the CLI --no-route over MCP, and it skips the shape demotion,
+    // the mention anchor and the co-change prior with the ranker, because all four are the routed reading.
+    const RouteChoice rc = noRoute ? RouteChoice{} : chooseForRanker( ing, task );
+    std::vector<char> ifaceExact( ing.symbols.size(), 0 );
+    for( std::size_t i = 0; i < ix.g.implementors.size() && i < ifaceExact.size(); ++i )
+    {
+        if( !ix.g.implementors[i].empty() )
+        {
+            ifaceExact[i] = 1;
+        }
+    }
+    // Query SHAPE + §P4 tier de-prioritization — same classifier, same multiplier, same order (before the
+    // mention anchor) as CLI --pack-task.
+    const queryshape::Verdict shape   = queryshape::classify( task );
+    const std::vector<float>  tierMul = rankTierSymbolMultipliersShaped( ing, !noRoute && shape.fires() );
+    lr.rank      = ( rc.which == LexMode::NameExact ) ? lexicalScoresNameExactRanked( ing, task, &tierMul )
+                                                       : lexicalScoresTiered( ing, g.outOff, g.outTargets, task, 0, &ifaceExact, &tierMul,
+                                                                              0, 0, {}, &lr.evidence );
+    // §L10b + verify-wave2 F6: same trim as the other route= construction sites — neither bracket.
+    lr.routeNote = routeNoteOf( rc, shape, noRoute );   // row 6: the route CODE, ONE producer (filter.h)
+
+    // input blow-up guard disclosure (lexical.h kMaxUniqueQueryTerms/dedupeQueryTerms) — same channel/
+    // attribute names as the other two --for/--pack-task surfaces.
+    {
+        CapDisclosure termsCap;
+        termsCap.note( "terms_capped", "terms_total", lr.evidence.termsCapped, lr.evidence.termsSeenTotal );
+        absorbCapDisclosure( termsCap, lr.capNote, lr.capAttrs, lr.capJson );
+    }
+
+    if( !noRoute && !std::getenv( "CODECORTEX_NO_MENTION" ) )
+    {
+        MentionBoostInfo mentionInfo;
+        if( applyMentionBoost( ing, task, lr.rank, &mentionInfo ) )
+        {
+            char nb[ 160 ];
+            rw::formatTo( nb, sizeof( nb ), " [mention anchor: {} file{} + {} symbols named in the task, score lifted to within 5% of the top score]",
+                           mentionInfo.fileCount, mentionInfo.fileCount == 1 ? "" : "s", mentionInfo.symbolCount );
+            lr.mentionNote = nb;
+        }
+        absorbCapDisclosure( mentionInfo.caps, lr.mentionNote, lr.capAttrs, lr.capJson );
+    }
+    if( !noRoute && std::getenv( "CODECORTEX_COCHANGE" ) && hasEnclosingGitRepo( root ) )
+    {
+        CommitWindowCensus coCensus;
+        const auto  coSets = gitRecentCommitFileSets( root, ing, kCoBoostCommitWindow, kCoBoostMaxFilesPerCommit, UINT32_MAX, &coCensus );
+        CoBoostInfo boostInfo;
+        // NOT guarded by coSets.empty(): applyCoChangeBoost records the commit-cap census BEFORE its own
+        // empty check and then returns false, so calling it unconditionally is what makes the cap honest.
+        // coSets is empty exactly when EVERY commit exceeded kCoBoostMaxFilesPerCommit -- the case where the
+        // cap bit hardest -- and a `!coSets.empty() &&` short-circuit meant coboost_commits_capped was the
+        // one disclosure never emitted at 100% drop. The return value still gates the boost NOTE alone.
+        if( applyCoChangeBoost( ing, coSets, lr.rank, &boostInfo, &coCensus ) )
+        {
+            char nb[ 200 ];
+            rw::formatTo( nb, sizeof( nb ), " [cochange boost: promoted {} symbols in {} files that historically change with the top seeds (last {} commits)]",
+                           boostInfo.boostedSymbolCount, boostInfo.boostedFileCount, kCoBoostCommitWindow );
+            lr.boostNote = nb;
+        }
+        absorbCapDisclosure( boostInfo.caps, lr.boostNote, lr.capAttrs, lr.capJson );
+    }
+    if( !std::getenv( "CODECORTEX_NO_DOC_MENTION" ) )
+    {
+        DocMentionBoostInfo docMentionInfo;
+        if( applyDocMentionBoost( g, lr.rank, &docMentionInfo ) )
+        {
+            char nb[ 160 ];
+            rw::formatTo( nb, sizeof( nb ), " [doc mentions: {} doc{} discussing {} top-ranked symbol{} surfaced]",
+                           docMentionInfo.docCount, docMentionInfo.docCount == 1 ? "" : "s",
+                           docMentionInfo.anchorCount, docMentionInfo.anchorCount == 1 ? "" : "s" );
+            lr.docMentionNote = nb;
+        }
+        absorbCapDisclosure( docMentionInfo.caps, lr.docMentionNote, lr.capAttrs, lr.capJson );
+    }
+
+    const std::vector<char>    impure = computeImpure( ing, g );
+    std::vector<std::uint32_t> fanIn( ing.symbols.size(), 0 );
+    {
+        const auto* ro = g.inEdges.rowOffsets();
+        for( std::size_t i = 0; i < ing.symbols.size(); ++i )
+        {
+            fanIn[i] = ro[i + 1] - ro[i];
+        }
+    }
+
+    const notes::NoteIndex        noteIndex = notes::loadNoteIndex( root );
+    const notes::NoteIndex* const notesPtr  = noteIndex.empty() ? nullptr : &noteIndex;
+
+    PackTaskInputs in;
+    in.budgetTokens = budgetTokens;
+    in.fanIn        = &fanIn;
+    in.impure       = &impure;
+    in.redact       = redact;
+    in.notes        = notesPtr;
+    in.notesDegraded = noteIndex.degraded;   // L3 follow-up (CodeRabbit 4053600616): read before notesPtr's nulling
+    // R-E (2026-08-17 harvest): same single-root condition every other verb's root= uses (sarif.h) — the
+    // CLI twin (main.cpp runPackTask) sets the identical field so the two dialects cannot diverge.
+    in.rootArg = ing.realPaths.empty() ? std::string_view( root ) : std::string_view();
+    if( partitionCount >= packpartition::kMinPartitions && partitionCount <= packpartition::kMaxPartitions )
+    {
+        return packpartition::packTaskPartitionText( ing, g, task, lr, in, partitionCount );
+    }
+    return packTaskBundleText( ing, g, task, lr, in );
+}
+
+// `from_trace` verb: the MCP twin of --from-trace — maps a pasted stack trace / sanitizer report / compiler
+// error onto indexed symbols, ranked INNERMOST-first, via fromTraceBundleText() (tracelocus.h) — the SAME
+// assembler the CLI --from-trace handler calls. `trace` is the raw trace TEXT (no stdin/file reading over
+// MCP — the caller pastes it as a request argument, unlike the CLI's FILE/'-' arg). Returns the assembler's own
+// result: !ok ⇒ zero parseable frames or a withheld bundle (isBufferLost), and the dispatcher words each refusal.
+inline FromTraceResult fromTraceText( const std::string& root, const std::string& trace, std::size_t budgetTokens, RedactCounts* redact = nullptr )
+{
+    const McpIndex&     ix  = getIndex( root );
+    const IngestResult& ing = ix.ing;
+    const Graph&        g   = ix.g;
+
+    const std::vector<char>    impure = computeImpure( ing, g );
+    std::vector<std::uint32_t> fanIn( ing.symbols.size(), 0 );
+    {
+        const auto* ro = g.inEdges.rowOffsets();
+        for( std::size_t i = 0; i < ing.symbols.size(); ++i )
+        {
+            fanIn[i] = ro[i + 1] - ro[i];
+        }
+    }
+    const notes::NoteIndex        noteIndex = notes::loadNoteIndex( root );
+    const notes::NoteIndex* const notesPtr  = noteIndex.empty() ? nullptr : &noteIndex;
+
+    FromTraceInputs in;
+    in.bundleBudgetBytes = budgetTokens > 0 ? rw::budgetBytesForTokens( budgetTokens )
+                                            : rw::kForPayloadBudgetBytes;
+    in.fanIn  = &fanIn;
+    in.impure = &impure;
+    in.redact = redact;
+    in.notes  = notesPtr;
+    in.notesDegraded = noteIndex.degraded;   // L3 follow-up (CodeRabbit 4053600616): read before notesPtr's nulling
+    in.rootArg = ing.realPaths.empty() ? std::string_view( root ) : std::string_view();   // R-R
+
+    const FromTraceResult res = fromTraceBundleText( ing, g, trace, "mcp trace input", in );
+    return res;
+}
+
+// `edit_check` verb: the MCP twin of --edit-check=SYM — "did MY edit change a contract someone depends on",
+// via editCheckBundleText() (editcheck.h), the SAME contract-comparison core the CLI --edit-check handler
+// calls. Rebuilds ing/graph FRESH from disk (NOT the warm McpIndex) so its root-relative baselineCanonId keys
+// match the CLI's exactly — same precedent as computeQualityDelta() above (a warm index's root may be
+// absolutized/remote-spelled, which would manufacture phantom contract-changes).
+//
+// TWO fields, and exactly one of them is ever populated: an empty payload ALWAYS carries the reason in
+// `refusal`, so the dispatcher stays a single "payload or refusal" branch and can never invent a message the
+// verb did not choose.
+//
+// §A6a parity: an AMBIGUOUS symbol is REFUSED here for the identical reason the CLI refuses it — a contract is
+// per definition site, so answering about one of N silently is exactly the failure this verb exists to
+// prevent. Both surfaces word it with editCheckAmbiguousMessage(), so they cannot drift apart.
+struct EditCheckReply { std::string payload; std::string refusal; };
+
+//
+// card A1 — `new_body` turns this into the PRE-APPLY preview: the same question about bytes that have not
+// been written. Nothing writes; the field is optional and the verb stays readOnlyHint:true. The CLI form is
+// --edit-check=SYM --edit-payload=FILE --dry-run, and both surfaces route through editpreview::run, so the
+// two cannot answer differently.
+// `pg` (2026-09-10) is the SAME limit/offset the CLI passes: the two surfaces must agree about the size of
+// one answer, which is exactly the M13 defect that named a cap living at its call site. Absent ⇒ {0,0} ⇒
+// the verb's own default window, identical to a bare `codecortex <dir> --edit-check=SYM`.
+inline EditCheckReply editCheckText( const std::string& root, const std::string& symbol, const std::string& newBody = {},
+                                     McpPageArgs pg = {} )
+{
+    IngestResult ing;   // Phase-M: serialize the ingest vs the qsnap-prefetch worker (§2b), same as computeQualityDelta
+    {
+        std::lock_guard<std::mutex> ingestLk( rw::quality::headSnapshotIngestMutex() );
+        ing = ingest( root.c_str(), {}, {} );
+    }
+    const Graph g = buildGraph( ing, nullptr );
+
+    // H1: the decl→def residue, the CLI --edit-check's unproven_defs= — same resolver, same assembler parameter, so the two
+    // surfaces cannot disagree about the number. The new_body preview re-resolves on its merged tree (editpreview.h).
+    std::size_t               unprovenDefs = 0;
+    const std::vector<NodeId> matches      = resolveAllByNameQualified( ing, symbol, &unprovenDefs );
+    // verifier N5: this was the last MCP not-found still speaking the pre-M8 dialect — four words, no echo of
+    // the spelling, no near-miss — on the one verb an agent reaches for right after a rename, where a typo
+    // and a genuinely absent symbol are the two likeliest causes and the message distinguished neither.
+    if( matches.empty() )
+    {
+        return EditCheckReply{ {}, mcprefuse::notFound( ing, "symbol", symbol,
+                                                        mcprefuse::notFoundHintFor( "edit_check", "symbol" ) ) };
+    }
+
+    const std::vector<EditCheckGroup> groups = editCheckGroups( ing, g, matches );
+    if( groups.size() > 1 )
+    {
+        return EditCheckReply { {}, editCheckAmbiguousMessage( symbol, groups, "symbol=", matches.size() ) };
+    }
+
+    if( !newBody.empty() )
+    {   // the two payload refusals a STRING argument can still trip — the file-side ones (unreadable, over the
+        // size ceiling) belong to the CLI's own reader. A payload with no definition in it lands on
+        // editpreview::run's "does not define SYM", which is the honest sentence for a blank one too.
+        if( looksBinary( newBody ) )
+        {
+            return EditCheckReply{ {}, "new_body " + std::string( mcpedit::kBinaryPayloadRefusal ) };
+        }
+        const rw::editpreview::Outcome preview =
+            rw::editpreview::run( ing, g, root, kDefaultMaxFileBytes, {}, true, symbol, groups[0].lowestNode, newBody, nullptr,
+                                   pg.limit, pg.offset );
+        return preview.ok ? EditCheckReply{ preview.xml, {} } : EditCheckReply{ {}, preview.message };
+    }
+
+    return EditCheckReply{ editCheckBundleText( ing, g, root, kDefaultMaxFileBytes, {}, groups[0].lowestNode,
+                                                 /*ni=*/nullptr, /*preview=*/false, pg.limit, pg.offset, unprovenDefs ), {} };
+}
+
+// ─── `slice` verb (lane/tc-sliceat): the ARISE def-use slice over MCP, mirroring the CLI --slice ────────
+//
+// One contract, two surfaces: SYM lists the sliceable locals; SYM+var (or the SYM:VAR spelling — the two
+// answer byte-identically) serves the per-line def-use rows; flow=back|fwd|both adds the rung-2 transitive
+// data-flow slice with depth bounding it (1..32, default 8); @FILE:LINE seeds by location, pre-picking the
+// variable when the seed line names exactly one sliceable local (disclosed — seed=/var_from=/seed_vars=,
+// the CLI's own vocabulary, because sliceBundleText is the ONE emitter both surfaces call). Refusals mirror
+// the CLI refusal-for-refusal: not-found (echo + near-miss + at-diagnosis), ambiguity (spellings listed,
+// never a silent pick), unserved language (the served list named), unknown var (locals listed), flow
+// misuse. Single-root by table (kMcpSingleRootVerbs): the slice re-parses the definition's on-disk file,
+// which a merged multi-root graph cannot address unambiguously.
+struct SliceReply { std::string payload; std::string refusal; };
+
+// §5a decision 3 (capture-audit 2026-09-04): `legend` is the compact posture, the MCP twin of the CLI's
+// --legend=compact. `compact` swaps the explanatory prose for a versioned schema id (codecortex.slice/v1) and
+// leaves every DATA and COMPLETENESS attribute — and, for slice, every row byte — untouched.
+//
+// M1 (terminality round A, 2026-09-05): the follow-up this comment registered is TAKEN — `compactLegend` is
+// now true by DEFAULT on this surface (mcp.h decides it once as legendCompactPosture and passes it here),
+// and `legend:"full"` is how a caller asks for the historic legend. The parity gates the old comment named
+// as the blocker were re-pinned in the same commit; the one thing that had to move with the default is this
+// verb's CALL SITE, because slice is the only verb that builds its compact form itself instead of taking
+// the textResult rewrite — two spellings of "compact" that differ in root attribute order.
+inline SliceReply sliceText( const std::string& root, const std::string& symbol, const std::string& var,
+                             const std::string& flow, int depth, RedactCounts* redact,
+                             bool compactLegend = false )
+{
+    // argument-shape refusals first — they need no index
+    if( !flow.empty() && flow != "back" && flow != "fwd" && flow != "both" )
+    {
+        return SliceReply{ {}, "flow '" + mcprefuse::cappedEcho( flow ) + "' is not a direction (supported: back|fwd|both)" };
+    }
+    if( depth > 0 && flow.empty() )
+    {
+        return SliceReply{ {}, "depth bounds the flow walk and there is none — pass flow=back|fwd|both with it, "
+                               "or omit depth" };
+    }
+
+    const McpIndex&     ix  = getIndex( root );
+    const IngestResult& ing = ix.ing;
+
+    // ── the two-phase spec split, exactly as the CLI: whole spelling first, then HEAD:VAR — skipped when
+    //    the var field already carries the variable (then `symbol` is a pure selector).
+    // H1: `unprovenDefs` is the residue of whichever reading produced `matches` — the second resolve overwrites the first.
+    std::string_view    selector     = symbol;
+    std::string_view    varName      = var;
+    std::size_t         unprovenDefs = 0;
+    std::vector<NodeId> matches      = resolveAllByNameQualified( ing, selector, &unprovenDefs );
+    if( matches.empty() && var.empty() )
+    {
+        const std::size_t lastColon = symbol.rfind( ':' );
+        if( lastColon != std::string::npos && lastColon > 0 && lastColon + 1 < symbol.size() )
+        {
+            selector = std::string_view( symbol ).substr( 0, lastColon );
+            varName  = std::string_view( symbol ).substr( lastColon + 1 );
+            matches  = resolveAllByNameQualified( ing, selector, &unprovenDefs );
+        }
+    }
+    if( matches.empty() )
+    {
+        return SliceReply{ {}, "symbol not found: " + mcprefuse::cappedEcho( symbol )
+                               + " (tried the whole spelling as a selector, then HEAD:VAR)"
+                               + mcprefuse::atSeedClause( ing, symbol ) };   // "" for a plain name
+    }
+
+    // ── §A6a ambiguity refusal, the CLI's own posture: a slice reads exactly ONE body ─────────────────
+    if( matches.size() > 1 )
+    {
+        const Graph& g = ix.g;
+        const std::vector<EditCheckGroup> groups = editCheckGroups( ing, g, matches );
+        std::string spellings;
+        const std::size_t shownCount = std::min<std::size_t>( groups.size(), kEditCheckSpellingsShown );
+        for( std::size_t groupIndex = 0; groupIndex < shownCount; ++groupIndex )
+        {
+            spellings += ( groupIndex ? ", " : "" ) + groups[ groupIndex ].spelling;
+        }
+        if( groups.size() > shownCount )
+        {
+            spellings += " (+" + std::to_string( groups.size() - shownCount ) + " more)";
+        }
+        return SliceReply{ {}, "'" + std::string( selector ) + "' matches " + std::to_string( matches.size() )
+                               + " definitions — a slice reads exactly ONE body, so an ambiguous selector is refused, "
+                                 "never silently narrowed. Qualify one: " + spellings
+                               + " — or seed by location with symbol=@FILE:LINE" };
+    }
+
+    const NodeId  focus = matches[0];
+    const Symbol& sym   = ing.symbols[ focus ];
+
+    // ── served-language gate — an honest refusal, never an empty success ──────────────────────────────
+    const slicev::SliceFam fam = slicev::sliceFamilyOf( sym.lang );
+    if( fam == slicev::SliceFam::None )
+    {
+        return SliceReply{ {}, std::string( "slice not served for " ) + langTag( sym.lang ) + " yet (served: "
+                               + slicev::kSliceServedList + ") — the def-use classification is a verified per-grammar "
+                                 "parent-kind read, and this language's has not been built" };
+    }
+
+    // ── read + re-parse the ONE file holding the definition ───────────────────────────────────────────
+    const std::string& path = diskPath( ing, sym.fileId );
+    std::string        src;
+    if( std::FILE* in = std::fopen( path.c_str(), "rb" ) )
+    {
+        char        buf[ 4096 ];
+        std::size_t n = 0;
+        while( ( n = std::fread( buf, 1, sizeof( buf ), in ) ) > 0 )
+        {
+            src.append( buf, n );
+        }
+        std::fclose( in );
+    }
+    else
+    {
+        DISCLOSE( Diagnostics::answerRefused, "the MCP slice answers an error naming the unreadable file; no slice is served",
+                  "mcp slice: definition file unreadable" );
+        return SliceReply{ {}, "cannot read " + path + " — the slice re-parses the definition's file and has nothing to walk" };
+    }
+
+    const ::TSLanguage* grammar = sliceGrammarForFile( path );
+    slicev::SliceScan   scan    = slicev::sliceScanDefinition( src, sym, fam, grammar, varName );
+    if( scan.tooDeep )
+    {
+        return SliceReply{ {}, "'" + sym.name + "' in " + path + " nests deeper than " + std::to_string( slicev::kMaxSliceDepth )
+                               + " syntax levels — refused: the slice walks recurse once per level, and a definition this deep would exhaust the stack" };
+    }
+    if( !scan.parseOk )
+    {
+        DISCLOSE( Diagnostics::answerRefused, "the MCP slice answers an error naming the file it could not re-parse; no slice is served",
+                  "mcp slice: definition re-parse failed" );
+        return SliceReply{ {}, "could not re-parse " + path + " (grammar missing, or the indexed span no longer fits "
+                               "the file — a stale index; call any read verb to refresh, or check the CLI --doctor)" };
+    }
+
+    // ── unknown-var refusal, offering the sliceable locals (the CLI's wording, field spellings) ───────
+    if( !varName.empty() && scan.occ.empty() )
+    {
+        std::string locals;
+        std::vector<slicev::SliceLocal> ordered = scan.locals;
+        std::sort( ordered.begin(), ordered.end(), []( const slicev::SliceLocal& a, const slicev::SliceLocal& b )
+                   { return a.line != b.line ? a.line < b.line : a.name < b.name; } );
+        for( std::size_t localIndex = 0; localIndex < ordered.size(); ++localIndex )
+        {
+            locals += ( localIndex ? ", " : "" ) + ordered[ localIndex ].name;
+        }
+        return SliceReply{ {}, "no occurrence of '" + std::string( varName ) + "' in " + sym.name
+                               + " — sliceable locals: " + ( locals.empty() ? "(none found)" : locals )
+                               + " (a bare symbol lists them with first-def lines)" };
+    }
+
+    // ── the @FILE:LINE seed's variable half: pre-pick, or mark the candidates (the CLI contract) ──────
+    slicev::SliceSeedInfo seedInfo;
+    bool                  seededRun = false;
+    std::string           pickedVar;                       // owns the pre-picked name (varName is a view)
+    if( !selector.empty() && selector.front() == '@' )
+    {
+        const AtSeed selSeed = resolveAtSeed( ing, selector.substr( 1 ) );   // the resolver already accepted this spelling
+        if( selSeed.fault == AtFault::None )
+        {
+            seedInfo.spec = std::string( selector.substr( 1 ) );
+            seededRun     = true;
+            if( varName.empty() )
+            {
+                seedInfo.seedVars     = slicev::sliceSeedLineLocals( scan, selSeed.line );
+                seedInfo.seedVarCount = seedInfo.seedVars.size();
+                if( seedInfo.seedVarCount == 1 )
+                {
+                    pickedVar            = seedInfo.seedVars.front();
+                    varName              = pickedVar;
+                    seedInfo.varFromSeed = true;
+                    scan                 = slicev::sliceScanDefinition( src, sym, fam, grammar, varName );
+                }
+            }
+        }
+    }
+
+    // ── the rung-2 flow, when asked for — a flow needs a seed variable ────────────────────────────────
+    const bool flowActive = !flow.empty();
+    if( flowActive && varName.empty() )
+    {
+        return SliceReply{ {}, "flow needs a seed variable — a bare symbol lists the sliceable locals; pick one and "
+                               "re-call with var (or a SYM:VAR / @FILE:LINE:VAR spelling)" };
+    }
+
+    slicev::SliceFlowOut  flowOut;
+    slicev::SliceFlowSpec flowSpec;
+    flowSpec.dir   = flow == "back" ? slicev::SliceFlowDir::Back
+                   : flow == "fwd"  ? slicev::SliceFlowDir::Fwd
+                                    : slicev::SliceFlowDir::Both;
+    flowSpec.bound = depth > 0 ? std::uint32_t( depth ) : slicev::kSliceFlowDefaultDepth;
+    if( flowActive )
+    {
+        flowOut      = slicev::sliceFlowCompute( scan, varName, flowSpec.dir, flowSpec.bound );
+        flowSpec.out = &flowOut;
+    }
+
+    slicev::SliceEmitOpts emit;   // legend posture from the argument below — the MCP payload stays byte-identical to the CLI at the same posture
+    emit.flow          = flowActive ? &flowSpec : nullptr;
+    emit.seed          = seededRun ? &seedInfo : nullptr;
+    emit.compactLegend = compactLegend;   // decision 3: the same posture flag the CLI --legend=compact sets
+    emit.unprovenDefs  = unprovenDefs;    // H1: the CLI --slice's unproven_defs=, through the one emitter both surfaces call
+    return SliceReply{ slicev::sliceBundleText( ing, root, focus, varName, scan, src, redact, emit ), {} };
+}
+
+// ─── T4: fetch_body — the LAZY-BODY verb. The read verbs return signatures + a stable `handle`; this verb
+// returns the FULL def source ONLY when the agent asks for it by handle. The MCP posture is
+// "names/signatures by default, bodies by handle on request" (the kit default-lean posture, ~90% cut).
+//
+// fetchBody(root, handle) → outcome: either the body JSON payload, or a JSON-RPC-shaped refusal message. The
+// refusals mirror the edit-verbs' staleness discipline — a body is NEVER served against bytes the handle
+// wasn't minted from:
+//   • malformed handle (not sym#<16hex>@<16hex>) → refuse (agent re-reads to get a fresh handle)
+//   • no symbol with that stable id → refuse (the symbol was renamed/removed — refresh via a read verb)
+//   • the file can't be re-read → refuse
+//   • the file's CURRENT bytes hash ≠ the handle's pinned contentHash → STALE: refuse, "refresh via a read
+//     verb", body withheld. This is the free staleness the pinned contentHash buys.
+// ─── Feature 2: partial-range fetch_body (octocode) ───────────────────────────────────────────────
+//
+// RANGE SEMANTICS (documented here and in the fetch_body tools/list description):
+//   • start_line / end_line are 1-BASED and INCLUSIVE, and are relative to the BODY — line 1 is the def's
+//     FIRST line (the signature line), so lines L..M of a 500-line function is exactly {start_line:L,
+//     end_line:M}. (Body-relative, not file-relative: the agent thinks in "the function's line 12", and the
+//     numbering is stable regardless of where in the file the def sits.)
+//   • CLAMPED to the def's own line span, never OOB: start_line clamps up to 1, end_line clamps down to the
+//     body's last line; if start_line > end_line after clamping (or start_line exceeds the body) → a CLEAR
+//     out-of-range error, never a slice past the buffer.
+//   • Omitting BOTH returns the whole body (backward-compatible with the pre-range fetch_body).
+//   • UTF-8-SAFE by construction: the slice boundaries are '\n' bytes (or the body's own [a,b) ends), and a
+//     '\n' can never fall inside a multibyte UTF-8 sequence, so a line slice never splits a codepoint. (The
+//     final jsonEscape pass is ALSO codepoint-validating, so even a torn byte would degrade to U+FFFD, but
+//     line-boundary slicing means we never hand it one.)
+//   • DETERMINISTic: a pure function of (body bytes, start_line, end_line) — byte-identical run-to-run and
+//     across two processes. The handle staleness contract (contentHash pin) is unchanged and still applies:
+//     a stale/malformed/unresolved handle refuses BEFORE any range is considered.
+
+// slice body-relative INCLUSIVE 1-based [startLine, endLine] out of `body` (the full def bytes). Returns the
+// byte substring and, via out-params, the CLAMPED line window actually returned + the body's total line
+// count. `oob` is set true (and the return is empty) when the requested start is past the last line — the
+// caller turns that into a clear error. Line 1 begins at byte 0; line N begins just after the (N-1)th '\n'.
+// The last line has no trailing '\n' unless the body itself ends in one (then there is a final empty line,
+// which we do NOT count — total lines = (#\n in body) + (body nonempty && !endsWithNewline ? 1 : 0), i.e. the
+// human "how many lines of code" count). A single-line def is 1 line.
+// NAME: distinct from serialize.h::sliceBodyLines by CONTRACT, not just namespace — that one CLAMPS a start
+// past the end DOWN into range; this one REFUSES it (sets `oob`, returns empty) so fetch_body can emit a clear
+// out-of-range error. The names diverged on purpose; keep them different so neither is mistaken for the other.
+inline std::string sliceBodyLinesOrError( const std::string& body, long long startLine, long long endLine,
+                                          long long& clampedStart, long long& clampedEnd, long long& totalLines, bool& oob )
+{
+    oob = false;
+    // total lines: count '\n', plus one for a final non-newline-terminated line.
+    long long nl = 0;
+    for( char c : body )
+    {
+        if( c == '\n' )
+        {
+            ++nl;
+        }
+    }
+    const bool endsNl = !body.empty() && body.back() == '\n';
+    totalLines = nl + ( ( !body.empty() && !endsNl ) ? 1 : 0 );
+    if( totalLines < 1 )
+    {
+        totalLines = ( body.empty() ? 0 : 1 );
+    }
+
+    // clamp the window to [1, totalLines]; a start past the end is genuinely out of range.
+    long long s = startLine < 1 ? 1 : startLine;
+    long long e = endLine   < 1 ? 1 : endLine;
+    if( totalLines == 0 ) { clampedStart = 1; clampedEnd = 0; oob = ( startLine > 0 ); return {}; }
+    if( s > totalLines )  { clampedStart = s; clampedEnd = e; oob = true; return {}; }   // start beyond body → error
+    if( e > totalLines )
+    {
+        e = totalLines; // clamp end down (not an error)
+    }
+    if( e < s )
+    {
+        e = s; // degenerate end<start → single line
+    }
+    clampedStart = s; clampedEnd = e;
+
+    // walk to the byte offset where line `s` begins and where line `e+1` begins (or end of body).
+    const auto lineStartByte = [ & ]( long long lineNo ) -> std::size_t
+    {
+        if( lineNo <= 1 )
+        {
+            return 0;
+        }
+        long long seen = 1;                                     // we are at the start of line 1
+        for( std::size_t i = 0; i < body.size(); ++i )
+        {
+            if( body[i] == '\n' )
+            {
+                ++seen;                                         // the byte AFTER this '\n' starts line `seen`
+                if( seen == lineNo )
+                {
+                    return i + 1;
+                }
+            }
+        }
+        return body.size();                                     // past the last line → end of body
+    };
+    const std::size_t aByte = lineStartByte( s );
+    const std::size_t bByte = ( e >= totalLines ) ? body.size() : lineStartByte( e + 1 );
+    if( aByte > bByte || bByte > body.size() )
+    {
+        return {}; // paranoia: never slice out of bounds
+    }
+    return body.substr( aByte, bByte - aByte );
+}
+
+struct FetchOutcome
+{
+    bool        ok = false;
+    int         errCode = -32602;
+    std::string message;      // on refusal
+    std::string resultJson;   // on success: {handle, name, kind, file, line, bytes, body [, start_line, end_line, total_lines, partial]}
+    // V3/RN1: true for exactly ONE refusal — a well-formed handle that resolved against no symbol in this
+    // tree. It is the only fault whose cause can be an omitted `path` rather than a rename, so the dispatch
+    // arm (which is the only place that knows where the root came from) needs to recognize it. Reported as
+    // a discriminator rather than by matching the message text, because a refusal identified by substring
+    // is one that silently stops being identified the next time someone improves the wording.
+    bool        unresolvedHandle = false;
+};
+
+// fetchBody with optional body-relative line range. `hasRange` selects partial mode; when false the whole
+// body is returned (the original T4 behavior, byte-identical). See sliceBodyLinesOrError for the range semantics.
+// `redact` masks credential shapes in the emitted body text (A3-F3 — the raw-JSON body seam, the highest-
+// exposure emission path of all: served straight into a cloud LLM context); null under --no-redact.
+// Declared first (defaults live HERE, per the one-declaration rule) so fetchBodyByName below and the
+// definition after it can call each other — the name path serves by re-entering the handle path.
+inline FetchOutcome fetchBody( const std::string& root, const std::string& handle,
+                               long long startLine = 1, long long endLine = 0, bool hasRange = false,
+                               RedactCounts* redact = nullptr );
+
+// R2c (the 2026-08-12 usage mine): serve fetch_body for a bare symbol NAME through the SAME lookup path
+// find_symbol uses (resolveAllByNameQualified → the lowest-id pick; resolveFocus's C/C++ body preference is NOT applied), then
+// RECURSE into fetchBody with the freshly-minted real handle — every staleness/overload guarantee applies
+// unchanged, and the result teaches the handle for next time. Disclosed: resolved_from_name always;
+// name_defs/other_defs (file:line + handle, capped) when the name has several DISTINCT defs — the honest
+// sibling of fetchBody's same-handle overload note. An unknown name refuses with a did-you-mean (the ONE
+// shared suggester) plus the find_symbol pointer: a one-shot recovery, never a format lecture.
+inline FetchOutcome fetchBodyByName( const std::string& root, const std::string& name,
+                                     long long startLine, long long endLine, bool hasRange,
+                                     RedactCounts* redact )
+{
+    // the guard lives HERE so the caller's parse-failure branch is one call: a "sym#"-prefixed string is
+    // NEVER treated as a name (a corrupt REAL handle must keep the malformed refusal rather than
+    // mis-resolve through a name that happens to match), and an empty string has nothing to look up.
+    if( name.rfind( "sym#", 0 ) == 0 || name.empty() )
+    {
+        FetchOutcome oc;
+        oc.ok = false; oc.errCode = -32602;
+        oc.message = "malformed handle '" + name + "' (expected sym#<16hex>@<16hex>); call a read verb to obtain a valid handle";
+        return oc;
+    }
+
+    const McpIndex&           nameIx       = getIndex( root );          // same index a read verb would build
+    // H1: a file:name spelling whose definitions were dropped serves the declaration's body; the out-param says how many
+    // definitions that left out, and rides the JSON beside resolved_from_name (absent at zero).
+    std::size_t               unprovenDefs = 0;
+    const std::vector<NodeId> nameMatches  = resolveAllByNameQualified( nameIx.ing, name, &unprovenDefs );
+    if( nameMatches.empty() )
+    {
+        FetchOutcome oc;
+        oc.ok = false; oc.errCode = -32602;
+        oc.message = withDidYouMean( nameIx.ing, name,
+                                     "'" + name + "' is neither a handle (sym#<16hex>@<16hex>) nor a known symbol name" )
+                   + " — call find_symbol for the handle, or pass the exact definition name (file:name disambiguates)"
+                   + mcprefuse::atSeedClause( nameIx.ing, name );   // an @FILE:LINE spelling that faulted carries the at-diagnosis
+        return oc;
+    }
+
+    // distinct HANDLES across the matches (a decl + def in different files mint different ids);
+    // matches ascend by NodeId, so front() is the resolveFocus pick and order is deterministic.
+    std::vector<std::string> distinctHandles;
+    std::vector<NodeId>      distinctIds;
+    for( const NodeId id : nameMatches )
+    {
+        std::string h2 = handleFor( nameIx, id );
+        if( std::find( distinctHandles.begin(), distinctHandles.end(), h2 ) == distinctHandles.end() )
+        {
+            distinctHandles.push_back( std::move( h2 ) );
+            distinctIds.push_back( id );
+        }
+    }
+
+    FetchOutcome byName = fetchBody( root, distinctHandles.front(), startLine, endLine, hasRange, redact );
+    if( byName.ok && !byName.resultJson.empty() && byName.resultJson.front() == '{' )
+    {
+        std::string disclosure = "\"resolved_from_name\":\"" + mcpdetail::jsonEscape( name ) + "\",";
+        if( unprovenDefs > 0 )
+        {
+            disclosure += "\"unproven_defs\":" + std::to_string( unprovenDefs ) + ",";
+        }
+        if( distinctHandles.size() > 1 )
+        {
+            disclosure += "\"name_defs\":" + std::to_string( distinctHandles.size() ) + ",\"other_defs\":[";
+            constexpr std::size_t kOtherDefCap = 4;   // disclosure, not a listing — cap the tail
+            bool first = true;
+            for( std::size_t i = 1; i < distinctIds.size() && i <= kOtherDefCap; ++i )
+            {
+                const Symbol& si = nameIx.ing.symbols[ distinctIds[i] ];
+                if( !first )
+                {
+                    disclosure += ",";
+                }
+                first = false;
+                disclosure += "{\"file\":\"" + mcpdetail::jsonEscape( nameIx.ing.files[ si.fileId ] )
+                            + "\",\"line\":" + std::to_string( si.line )
+                            + ",\"handle\":\"" + mcpdetail::jsonEscape( distinctHandles[i] ) + "\"}";
+            }
+            disclosure += "],";
+        }
+        byName.resultJson.insert( 1, disclosure );
+    }
+    return byName;
+}
+
+inline FetchOutcome fetchBody( const std::string& root, const std::string& handle,
+                               long long startLine, long long endLine, bool hasRange,
+                               RedactCounts* redact )
+{
+    FetchOutcome oc;
+
+    // 1. parse the handle strictly — a hand-mutated / garbage handle refuses, never mis-resolves.
+    //    R2c (the 2026-08-12 usage mine): a string that fails the parse routes to fetchBodyByName above,
+    //    which either serves it as a bare symbol NAME (disclosed) or speaks the malformed-handle /
+    //    unknown-name refusal itself — including the "sym#"-prefix guard.
+    std::uint64_t idHash = 0, wantContent = 0;
+    if( !mcpdetail::parseHandle( handle, idHash, wantContent ) )
+    {
+        return fetchBodyByName( root, handle, startLine, endLine, hasRange, redact );
+    }
+
+    const McpIndex&     ix  = getIndex( root );          // refreshes the index if the tree changed (warm==cold)
+    const IngestResult& ing = ix.ing;
+
+    // 2. resolve the STABLE id back to a symbol. A rename/removal makes the id unresolvable → refuse.
+    std::vector< NodeId > handleMatches;
+    const NodeId f = resolveHandleAll( ix, idHash, handleMatches );
+    if( f == kNoNode || f >= ing.symbols.size() )
+    {
+        oc.ok = false; oc.errCode = -32602;
+        oc.unresolvedHandle = true;   // V3/RN1: the dispatch arm may add the omitted-`path` cause to this one
+        oc.message = "handle '" + handle + "' does not resolve to any current symbol (it may have been renamed or removed); call a read verb to refresh";
+        return oc;
+    }
+
+    // 2b. F4 HONESTY: same-scope OVERLOADS share one handle (same path::scope::name, same file → identical
+    //     canonId hash). We serve the lowest-id overload's body, but with distinct bodies that is only ONE of
+    //     several — never serve it silently. Build an ambiguity note listing the OTHER overloads' file:line so
+    //     the agent can disambiguate by reading the specific line (the edit verbs REFUSE the same ambiguity;
+    //     a read-only verb can be honest without refusing). Only a genuine body divergence is worth noting, so
+    //     collisions whose bodies are byte-identical (a decl + its def) stay silent.
+    std::string ambiguityNote;
+    if( handleMatches.size() > 1 )
+    {
+        // do the bodies actually differ? read each colliding symbol's span from its (freshly re-read) file.
+        // any read failure or any distinct body → treat as ambiguous (be conservative: prefer a note).
+        bool bodiesDiffer = false;
+        {
+            const Symbol&     s0    = ing.symbols[ handleMatches[0] ];
+            bool              rok0  = false;
+            const std::string src0  = mcpdetail::readFileBytes( diskPath( ing, s0.fileId ), rok0 );
+            const std::string body0 = ( rok0 && s0.sigStartByte < s0.endByte && s0.endByte <= src0.size() )
+                                    ? src0.substr( s0.sigStartByte, s0.endByte - s0.sigStartByte ) : std::string{};
+
+            for( std::size_t i = 1; i < handleMatches.size() && !bodiesDiffer; ++i )
+            {
+                const Symbol&     si    = ing.symbols[ handleMatches[i] ];
+                bool              roki  = false;
+                const std::string srci  = mcpdetail::readFileBytes( diskPath( ing, si.fileId ), roki );
+                const std::string bodyi = ( roki && si.sigStartByte < si.endByte && si.endByte <= srci.size() )
+                                        ? srci.substr( si.sigStartByte, si.endByte - si.sigStartByte ) : std::string{};
+                if( !rok0 || !roki || bodyi != body0 )
+                {
+                    bodiesDiffer = true;
+                }
+            }
+        }
+
+        if( bodiesDiffer )
+        {
+            const Symbol& chosen = ing.symbols[f];
+            ambiguityNote = std::to_string( handleMatches.size() ) + " overloads share this handle; showing "
+                          + ing.files[ chosen.fileId ] + ":" + std::to_string( chosen.line )
+                          + " — disambiguate with path/line. others: ";
+            bool anyOther = false;
+            for( std::size_t i = 0; i < handleMatches.size(); ++i )
+            {
+                if( handleMatches[i] == f )
+                {
+                    continue;
+                }
+                const Symbol& si = ing.symbols[ handleMatches[i] ];
+                if( anyOther )
+                {
+                    ambiguityNote += ", ";
+                }
+                ambiguityNote += ing.files[ si.fileId ] + ":" + std::to_string( si.line );
+                anyOther = true;
+            }
+        }
+    }
+
+    const Symbol&       s      = ing.symbols[f];
+    const std::uint32_t fileId = s.fileId;
+    const std::string&  path   = ing.files[ fileId ];
+
+    // 3. re-read the file NOW and verify its bytes still hash to the handle's PINNED contentHash. A mismatch
+    //    means the body changed since the handle was minted → STALE: refuse (never serve a stale body).
+    bool readOk = false;
+    const std::string src = mcpdetail::readFileBytes( path, readOk );
+    if( !readOk )
+    {
+        oc.ok = false; oc.errCode = -32603;
+        oc.message = "cannot read file '" + path + "' to fetch body for handle '" + handle + "'";
+        return oc;
+    }
+    const std::uint64_t freshContent = mcpdetail::byteHash( src.data(), src.size() );
+    if( freshContent != wantContent )
+    {
+        oc.ok = false; oc.errCode = -32602;
+        oc.message = "stale handle '" + handle + "'; the file '" + path
+                   + "' changed since this handle was issued — refresh via any read verb (find_symbol/for/grep), then fetch the new handle";
+        return oc;
+    }
+
+    // 4. the def span is [sigStartByte, endByte) — the exact span --expand/replace_symbol_body use. Degrade,
+    //    never assert: an insane span refuses rather than slicing out of bounds.
+    const std::size_t a = s.sigStartByte, b = s.endByte;
+    if( !( a < b && b <= src.size() ) )
+    {
+        oc.ok = false; oc.errCode = -32603;
+        oc.message = "definition span for handle '" + handle + "' is invalid (a=" + std::to_string( a )
+                   + " b=" + std::to_string( b ) + " size=" + std::to_string( src.size() ) + ")";
+        return oc;
+    }
+
+    const std::string fullBody( src.data() + a, b - a );
+
+    // 5. optional partial-range slice (Feature 2). No range → the whole body (backward-compatible). A range
+    //    with a start past the last line is a CLEAR out-of-range refusal, never an out-of-bounds slice.
+    std::string body = fullBody;
+    long long   clampedStart = 1, clampedEnd = 0, totalLines = 0;
+    bool        isPartial = false;
+    if( hasRange )
+    {
+        bool oob = false;
+        body = sliceBodyLinesOrError( fullBody, startLine, endLine, clampedStart, clampedEnd, totalLines, oob );
+        if( oob )
+        {
+            oc.ok = false; oc.errCode = -32602;
+            oc.message = "line range start " + std::to_string( startLine ) + " is out of bounds for handle '"
+                       + handle + "' (the body has " + std::to_string( totalLines )
+                       + " line" + ( totalLines == 1 ? "" : "s" ) + "); request a start_line within [1, "
+                       + std::to_string( totalLines ) + "]";
+            return oc;
+        }
+        // a range that (after clamping) covers the whole body is reported partial=false so callers can tell.
+        isPartial = !( clampedStart == 1 && clampedEnd == totalLines );
+    }
+    else
+    {
+        // still report total_lines for a full fetch so an agent can decide whether to re-fetch a range next time.
+        long long nl = 0;
+        for( char c : fullBody )
+        {
+            if( c == '\n' )
+            {
+                ++nl;
+            }
+        }
+        const bool endsNl = !fullBody.empty() && fullBody.back() == '\n';
+        totalLines   = nl + ( ( !fullBody.empty() && !endsNl ) ? 1 : 0 );
+        if( totalLines < 1 )
+        {
+            totalLines = ( fullBody.empty() ? 0 : 1 );
+        }
+        clampedStart = 1; clampedEnd = totalLines;
+    }
+
+    // A3-F3: redact credential shapes from the emitted body text. AFTER the range slice (a secret
+    // is single-line and the slice is line-bounded, so no secret straddles the cut) and BEFORE the byte
+    // count below, so `bytes` reports exactly what is served; no-op when redact is null (--no-redact).
+    redactInPlace( body, redact );
+
+    // L3: field-notes parity for the "body" verb. fetch_body serves JSON (not the for/exemplar XML), so a
+    // matching symbol's notes ride a JSON `notes` array of {d,text} — the same (date,text) the <note> children
+    // carry. Keyed by THIS symbol's canonical id; jsonEscape neutralizes hostile text. An empty/absent notes
+    // file leaves `notesJson` empty → the key is omitted → the payload is byte-identical (the inertness contract).
+    std::string notesJson;
+    {
+        const notes::NoteIndex ni    = notes::loadNoteIndex( root );
+        const std::string      canon = canonicalId( relForHash( ing.files[ fileId ], ni.root ), s.scope, s.name );   // D5: root-relative note key
+        if( const auto* hits = ni.find( canon ) )
+        {
+            notesJson = ",\"notes\":[";
+            bool first = true;
+            for( std::uint32_t i : *hits )
+            {
+                const notes::Note& n = ni.notes[i];
+                if( !first )
+                {
+                    notesJson += ",";
+                }
+                // provenance parity with the <note sha= branch=> XML attrs (serialize.h::appendOneNote) —
+                // OMITTED keys on a legacy/unstamped note, never emitted empty, and abbreviated (shortSha)
+                // to match the terse XML surfacing.
+                notesJson += "{\"d\":\"" + mcpdetail::jsonEscape( n.date ) + "\",\"text\":\"" + mcpdetail::jsonEscape( n.text ) + "\"";
+                if( !n.sha.empty() )
+                {
+                    notesJson += ",\"sha\":\"" + mcpdetail::jsonEscape( notes::shortSha( n.sha ) ) + "\"";
+                    if( !n.branch.empty() )
+                    {
+                        notesJson += ",\"branch\":\"" + mcpdetail::jsonEscape( n.branch ) + "\"";
+                    }
+                }
+                notesJson += "}";
+                first = false;
+            }
+            notesJson += "]";
+        }
+        // L3 follow-up (CodeRabbit 4053600616): notes.h's ONE marker — absent on a clean read. `ni` is a local
+        // value here (never nulled for emptiness), so degraded() reaches this JSON body even when the sidecar
+        // matched nothing (every line unparsed, or the whole file refused).
+        if( ni.degraded )
+        {
+            notesJson += std::string( notes::kNotesDegradedJsonKey );
+        }
+    }
+
+    // M12 (capture-audit-2026-09-04, lane L9): the "file" key is DISPLAY, distinct from `path` above (which
+    // stays untouched — it feeds readFileBytes and the error messages above, i.e. real disk I/O). Before
+    // this fix it printed "./src/graph.h" on a relative root; every other MCP verb's "file" key is already
+    // root-relative (see e.g. the situJPathRel/ccRel/pathForJ lambdas earlier in this file).
+    const bool         fbSingleRoot = ing.realPaths.empty();
+    const std::string  fbDisplayPath = fbSingleRoot ? std::string( sarif::rootRelativeUri( path, sarif::rootPrefixOf( root ) ) ) : path;
+
+    oc.ok = true;
+    oc.resultJson = std::string( "{\"handle\":\"" ) + mcpdetail::jsonEscape( handle )
+                  + "\",\"name\":\"" + mcpdetail::jsonEscape( s.name )
+                  + "\",\"kind\":\"" + symTag( s.kind )
+                  + "\",\"file\":\"" + mcpdetail::jsonEscape( fbDisplayPath )
+                  + "\",\"line\":" + std::to_string( s.line )
+                  + ",\"start_line\":" + std::to_string( clampedStart )
+                  + ",\"end_line\":" + std::to_string( clampedEnd )
+                  + ",\"total_lines\":" + std::to_string( totalLines )
+                  + ",\"partial\":" + ( isPartial ? "true" : "false" )
+                  + ",\"bytes\":" + std::to_string( body.size() )
+                  + ",\"body\":\"" + mcpdetail::jsonEscape( body ) + "\""
+                  + ( ambiguityNote.empty() ? std::string{}
+                        : ( ",\"ambiguous_handle\":" + std::to_string( handleMatches.size() )
+                          + ",\"ambiguity_note\":\"" + mcpdetail::jsonEscape( ambiguityNote ) + "\"" ) )
+                  + notesJson   // L3: field notes on this symbol (omitted when none)
+                  + "}";
+    return oc;
+}
+
+// ─── A4-R3: batch retrieval verb — one-turn context sweep ────────────────────────────────────────
+//
+// N heterogeneous READ sub-queries answered in ONE call, so an MCP agent pays a single round-trip for
+// a whole sweep instead of one per question (the deterministic $0 counterpart of Windsurf Fast Context /
+// Cognition SWE-grep). Each sub-query REUSES the exact text-builder its
+// standalone verb uses (forTaskText/grepHitsJson/symbolQueryJson/impactText/usesText/mentionsJson/…) —
+// no verb logic is reimplemented, so a batched answer is byte-identical to the same standalone verb call.
+//
+// Scope: the READ set only — NOT the edit verbs (side effects) and NOT quality_baseline (writes a
+// sidecar). quality_delta is also excluded (a heavy both-trees clone pass, out of place in a fast sweep).
+inline constexpr std::size_t kBatchCap = 16;   // max sub-queries processed per batch; excess is REPORTED, never silently dropped
+
+// ─── §B6 M14: the batch-served verb registry ─────────────────────────────────────────────────────────────
+//
+// The set batch serves, as a TABLE rather than as a sentence inside tools/list and a second sentence inside
+// runBatchSub's unknown-sub-verb message. The tools/list stanza used to hand-count its own exclusion
+// parenthetical ("NOT the edit or quality_baseline verbs" — 4 verbs, where the true excluded set is 15), and
+// the two ALIASES `callers`/`callees` were served but documented nowhere. Both facts now come from here:
+// mcp.h derives the excluded COUNT from kMcpVerbCount minus this table (a static_assert holds the tools/list
+// literal to it), and the unknown-sub-verb refusal lists these names instead of restating them.
+inline constexpr std::string_view kBatchServedVerbs[] = {
+    "for", "grep", "find_symbol", "find_referencing_symbols", "impact", "uses", "mentions",
+    "analyze", "lego", "owners", "cochange", "path_between", "exemplar", "fetch_body",
+    // P17 (capture-audit 2026-09-04, lens 8 #17): slice and edit_check. Both are READ-ONLY, and they are
+    // the two an agent most wants in the SAME turn as callers/uses — "what did I just change, who calls it,
+    // where does the value flow, did the contract move". slice was excluded as "a per-definition on-disk
+    // re-parse"; that is one file read, cheaper than the grep sub-query already in the set. edit_check is a
+    // qheadsnap cache read on a warm tree. The PREVIEW half of edit_check stays out: new_body is not in
+    // kBatchSubQueryFields, so a batched preview refuses as an undeclared field rather than quietly
+    // building a spliced tree inside a fast sweep.
+    "slice", "edit_check",
+};
+
+// Dispatch-only synonyms: `callers` == find_referencing_symbols, `callees` == find_symbol. They are NOT
+// separate verbs (no separate answer, no separate advertisement) — they exist because those two are the
+// names an agent reaches for, and they are named here so "what does batch accept" has one answer.
+inline constexpr std::string_view kBatchVerbAliases[] = { "callers", "callees" };
+
+inline constexpr std::size_t kBatchServedCount = std::size( kBatchServedVerbs );
+
+// The batch arm's paging verdict: the sub-query's window refusal, but only for the two sub-verbs that
+// actually CONSUME a window (grep and impact) — "" for every other verb and for a valid window. A named
+// helper rather than three more conditions inside runBatchSub's dispatch chain, which is already this
+// file's most complex function: "which sub-verbs page, and is this one's window valid" is one question,
+// and it belongs beside the served-verb registry above, not in the middle of a 14-arm if/else.
+//
+// A bad window is this SUB-QUERY's own inline error (ok="0" err="…"), never the whole batch's — the batch
+// contract for every other refusal, so a paging typo in query 3 never costs the caller queries 1, 2 and 4.
+inline std::string batchPageRefusal( std::string_view verb, const McpPageParse& page )
+{
+    if( page.refusal.empty() )
+    {
+        return {};
+    }
+    return ( verb == "grep" || verb == "impact" || verb == "uses" ) ? page.refusal : std::string{};   // LB-G: uses pages too
+}
+
+// The served set as ONE list (registry + the two aliases), for the membership test, the near-miss pool and
+// the refusal's own listing — three uses that must never disagree about what batch answers.
+inline std::vector<std::string_view> batchKnownVerbs()
+{
+    std::vector<std::string_view> known( std::begin( kBatchServedVerbs ), std::end( kBatchServedVerbs ) );
+    known.insert( known.end(), std::begin( kBatchVerbAliases ), std::end( kBatchVerbAliases ) );
+    return known;
+}
+
+// M5 (capture-audit 2026-09-04): ONE `verb:arg` sub-query grammar, spoken by BOTH batch front doors.
+//
+// THE FINDING. `--batch=FILE` took `verb:arg` LINES with CLI verb names (`callers:fnv1a64`); MCP `batch`
+// took `{verb, …args}` OBJECTS with MCP verb names and refused the string form outright. One verb, one
+// name, two grammars — so an agent that had learned the CLI spelling paid a failed call to learn the MCP
+// one, and the capture's own `["for:…","callers:…"]` example was a refusal captioned as a success.
+//
+// The conversion below was a lambda inside main.cpp's --batch arm; it is here now, beside the registry it
+// resolves against, so the MCP arm can accept the same line and produce the byte-identical sub-query object
+// runBatchSub already consumed. The CLI VERB NAMES were already aliased (kBatchVerbAliases: callers,
+// callees), which is why the fix is one grammar rather than two vocabularies.
+//
+// Returns "" for a blank line or a `#` comment (the CLI's own skip rule). A `verb` with no colon is a
+// no-argument sub-query (`analyze`), which is legal; whether the verb EXISTS is runBatchSub's judgment, not
+// this function's — it composes, it does not validate.
+inline std::string batchObjectFromCliSpec( std::string_view spec )
+{
+    const std::size_t b = spec.find_first_not_of( " \t\r" );
+    if( b == std::string_view::npos )
+    {
+        return {};   // blank
+    }
+    const std::size_t e    = spec.find_last_not_of( " \t\r" );
+    const std::string line( spec.substr( b, e - b + 1 ) );
+    if( line.empty() || line[ 0 ] == '#' )
+    {
+        return {};   // comment
+    }
+    // F11 (capture-audit verify-wave2 2026-09-05, recorded by wave 1 and unowned until M5 took this grammar):
+    // the colon is a SEPARATOR, and `callers: rankGraphTeleport` is how a human writes one. Untrimmed, the
+    // leading space rode into the symbol and came back as
+    //   symbol not found: ' rankGraphTeleport' (did you mean 'rankGraphTeleport'?)
+    // — a did-you-mean whose suggestion is the string the caller typed, which is the shape of a tool blaming
+    // a user for its own parse. Trimmed on both sides of the colon, the same trim this function already runs
+    // on the whole line. isBatchCliSpec already trimmed the VERB half, so the two halves now agree.
+    const auto trimEnds = []( std::string_view t )
+    {
+        const std::size_t f = t.find_first_not_of( " \t\r" );
+        if( f == std::string_view::npos ) { return std::string{}; }
+        return std::string( t.substr( f, t.find_last_not_of( " \t\r" ) - f + 1 ) );
+    };
+    const std::size_t colon = line.find( ':' );
+    const std::string verb  = ( colon == std::string::npos ) ? line : trimEnds( std::string_view( line ).substr( 0, colon ) );
+    const std::string arg   = ( colon == std::string::npos ) ? std::string{} : trimEnds( std::string_view( line ).substr( colon + 1 ) );
+
+    const auto  j   = []( const std::string& v ) { return mcpdetail::jsonEscape( v ); };
+    std::string obj = "{\"verb\":\"" + j( verb ) + "\"";
+    if( verb == "path_between" )
+    {
+        const std::size_t comma = arg.find( ',' );
+        const std::string from  = ( comma == std::string::npos ) ? arg : arg.substr( 0, comma );
+        const std::string to    = ( comma == std::string::npos ) ? std::string{} : arg.substr( comma + 1 );
+        obj += ",\"from\":\"" + j( from ) + "\",\"to\":\"" + j( to ) + "\"";
+    }
+    else if( !arg.empty() )
+    {
+        const char* key = "symbol";                          // callers/callees/impact/uses/mentions/owners/find_*
+        if( verb == "for" || verb == "exemplar" ) { key = "task"; }
+        else if( verb == "grep" )                 { key = "pattern"; }
+        else if( verb == "lego" )                 { key = "type"; }
+        else if( verb == "cochange" )             { key = "file"; }
+        else if( verb == "fetch_body" )           { key = "handle"; }
+        obj += ",\"" + std::string( key ) + "\":\"" + j( arg ) + "\"";
+    }
+    obj += "}";
+    return obj;
+}
+
+// M5: is `spec` a `verb:arg` line naming a verb this batch actually serves? The MCP arm needs this BEFORE
+// it commits to reading a `queries` array as strings: an array of arbitrary strings (the hostile
+// `queries:[1,"x",null]` the M8 refusal covers) must keep getting the bad-value sentence, not be silently
+// reinterpreted as a sub-query named "x". So the string grammar is accepted only when EVERY element names
+// a served verb — a precise test, not a shape guess.
+inline bool isBatchCliSpec( std::string_view spec )
+{
+    const std::size_t b = spec.find_first_not_of( " \t\r" );
+    if( b == std::string_view::npos )
+    {
+        return false;
+    }
+    const std::string_view trimmed = spec.substr( b );
+    const std::size_t      colon   = trimmed.find( ':' );
+    std::string_view       verb    = colon == std::string_view::npos ? trimmed : trimmed.substr( 0, colon );
+    while( !verb.empty() && ( verb.back() == ' ' || verb.back() == '\t' || verb.back() == '\r' ) )
+    {
+        verb.remove_suffix( 1 );
+    }
+    const std::vector<std::string_view> known = batchKnownVerbs();
+    return std::find( known.begin(), known.end(), verb ) != known.end();
+}
+
+// §B6 M9 (batch half): "" when `verb` IS served, else name it, offer the near-miss, and list the served set
+// FROM THE REGISTRY rather than from a hand-copied slash-list that can drift from what the chain dispatches.
+//
+// W3FIX M4 made it a named function rather than the dispatch chain's fall-through `else`, because the ORDER
+// now matters: an unknown sub-verb must be reported BEFORE its arguments are judged, since it has no schema
+// to judge them against — and "unknown sub-verb" is the actionable half of that request's problem anyway.
+inline std::string unknownSubVerbRefusal( std::string_view verb )
+{
+    const std::vector<std::string_view> known = batchKnownVerbs();
+    if( std::find( known.begin(), known.end(), verb ) != known.end() )
+    {
+        return {};
+    }
+
+    std::string msg = "unknown sub-verb '" + mcprefuse::cappedEcho( verb ) + "'";
+    if( const std::string near = mcprefuse::nearestName( known, verb ); !near.empty() )
+    {
+        msg += " (did you mean '" + near + "'?)";
+    }
+    msg += " — batch serves read verbs only: " + mcprefuse::joinClauses( known, "/" );
+    return msg;
+}
+
+struct BatchSub
+{
+    std::string verb;      // the requested sub-verb, echoed back (escaped) even when unknown
+    std::string payload;   // the sub-answer body (XML or JSON, verbatim from the reused builder); "" on error
+    bool        ok = false;
+    std::string err;       // human-readable reason when !ok (missing arg / not found / unknown sub-verb)
+};
+
+// Answer ONE sub-query object (its raw JSON substring) against `root`, reusing the standalone verb's
+// builder. `topK`/`stable` mirror the server's run params; `redactPtr` threads the per-request redaction
+// tally into the body/doc-emitting verbs exactly as the standalone dispatch does. Never throws for a
+// resolvable-but-empty result — that becomes ok=false with an explanatory err, never a whole-batch failure.
+inline BatchSub runBatchSub( const std::string& root, const std::string& obj, int topK, bool stable, RedactCounts* redactPtr,
+                            bool compactLegend = false )
+{
+    using mcpdetail::findString;
+
+    BatchSub r;
+
+    // W3FIX H5, the SECOND arm: the identical guarded string reader the live arm uses, so a wrong-shaped
+    // sub-query argument (`{"verb":"grep","pattern":["a"]}`) refuses here too instead of reading as absent
+    // and reporting the field missing. `strArg` remembers the first refusal; declaration order is the
+    // reporting order, and it is the same order as the live arm's.
+    std::string shapeRefusal;
+    const auto  strArg = [ & ]( const char* field ) -> std::string
+    {
+        const McpStringArg a = mcpStringArg( obj, field );
+        if( shapeRefusal.empty() && !a.refusal.empty() )
+        {
+            shapeRefusal = a.refusal;
+        }
+        return a.value;
+    };
+
+    r.verb = strArg( "verb" );
+
+    const std::string symbol  = strArg( "symbol" );
+    const std::string pattern = strArg( "pattern" );
+    const std::string task    = strArg( "task" );
+    const std::string type    = strArg( "type" );
+    const std::string handle  = strArg( "handle" );
+    const std::string kind    = strArg( "kind" );
+    const std::string grepInTyped = strArg( "in" );   // P3-4: the grep sub-query's span-tier hatch
+    const std::string var     = strArg( "var" );      // P17: the slice sub-query's variable half
+    const std::string flow    = strArg( "flow" );     // P17: back|fwd|both — validated inside sliceText
+    const std::string from    = strArg( "from" );
+    const std::string to      = strArg( "to" );
+    const std::string file    = strArg( "file" );
+
+    // W3FIX M5, the SECOND arm: the sub-query's range bounds through the same guarded numeric reader, so
+    // `start_line:3.9` refuses here exactly as it does live instead of truncating to 3 and answering about a
+    // different line span.
+    const auto intArg = [ & ]( const char* field, long long least, long long most ) -> McpIntArg
+    {
+        const McpIntArg a = mcpIntArg( obj, field, least, most );
+        if( shapeRefusal.empty() && !a.refusal.empty() )
+        {
+            shapeRefusal = a.refusal;
+        }
+        return a;
+    };
+    const McpIntArg depthArg  = intArg( "depth", 1, 32 );   // P17: the slice flow walk's bound (sliceText pairs it with flow)
+    const McpIntArg startArg  = intArg( "start_line", 1, kMcpPageValueMax );
+    const McpIntArg endArg    = intArg( "end_line",   1, kMcpPageValueMax );
+    const long long startLine = startArg.value;
+    const long long endLine   = endArg.value;
+    const bool      hasStart  = startArg.isPresent;
+    const bool      hasEnd    = endArg.isPresent;
+
+    const auto bad = [ & ]( std::string m ) -> BatchSub { r.ok = false; r.err = std::move( m ); r.payload.clear(); return r; };
+
+    // §B6 M7: the missing-required-field refusal comes from the SHARED table (mcprefusal.h), the same one
+    // the live server arm renders — this arm used to say "missing pattern" where the live arm said "missing
+    // required field: pattern" and the CLI named the flag, the problem AND an example. `isPresent` is the
+    // only per-arm part: here it reads this sub-query object.
+    const auto argPresent = [ & ]( std::string_view field ) -> bool
+    { return !findString( obj, std::string( field ).c_str() ).empty(); };
+    const auto missingField = [ & ]( std::string_view verb ) -> std::string
+    { return mcprefuse::missingFieldRefusal( verb, argPresent ); };
+
+    // §B6 M8 + verifier N7: the not-found refusals echo the spelling, carry a near-miss AND carry the verb's
+    // trailing guidance clause — this arm dropped that clause on three verbs while the live arm kept it (one
+    // condition, two lengths). All three halves now come from mcprefusal.h, keyed by the verb.
+    const auto symbolMissing = [ & ]( std::string_view verb, std::string_view spelling ) -> std::string
+    { return mcprefuse::notFound( getIndex( root ).ing, "symbol", spelling, mcprefuse::notFoundHintFor( verb, "symbol" ) ); };
+
+    // Verifier N2/N8: the paging window, validated ONCE for the two sub-verbs that consume it.
+    const McpPageParse pageParse = mcpPageArgs( obj );
+    if( const std::string pageErr = batchPageRefusal( r.verb, pageParse ); !pageErr.empty() )
+    {
+        return bad( pageErr );
+    }
+
+    if( r.verb.empty() )
+    {
+        return bad( shapeRefusal.empty()
+                  ? "missing required field: verb — every batch sub-query names one read verb, e.g. "
+                    "verb=\"grep\" (batch serves: " + mcprefuse::joinClauses(
+                        std::vector<std::string_view>( std::begin( kBatchServedVerbs ), std::end( kBatchServedVerbs ) ), "/" ) + ")"
+                  : shapeRefusal );   // `verb:5` is PRESENT-but-wrong-shaped, not missing (W3FIX H5/M8)
+    }
+
+    // W3FIX H5: a wrong-SHAPED sub-query argument refuses before the verb serves a default — checked at the
+    // same point in the chain as the live arm's shapeRefusal gate (before verb dispatch), so a given request
+    // gets the same refusal through either arm.
+    if( !shapeRefusal.empty() )
+    {
+        return bad( shapeRefusal );
+    }
+
+    // §B6 M9 / W3FIX M4 — in this order, deliberately: an unknown sub-verb first (it has no schema for the
+    // next check to use), then an argument the batch ITEM schema does not declare, with the same near-miss
+    // treatment the live arm gives an undeclared tools/call field.
+    if( const std::string verbErr = unknownSubVerbRefusal( r.verb ); !verbErr.empty() )
+    {
+        return bad( verbErr );
+    }
+    // F7 (verify-wave2): the sub-query IS refused here — verified inline on 2d40209 — but the sentence used
+    // to read "slice accepts: verb, symbol, pattern, task, …", naming the batch ITEM schema under the
+    // SUB-VERB's name. slice accepts no `pattern` and no `from`, so the recovery list was false for the verb
+    // it named. The schema is still the right one to judge against (mcprefusal.h kBatchSubQueryFields says
+    // why); it is the ATTRIBUTION that was wrong, so the sentence names the schema it actually applied.
+    if( const std::string fieldErr = mcpUnknownFieldRefusal( obj, "batch sub-queries", mcprefuse::kBatchSubQueryFields );
+        !fieldErr.empty() )
+    {
+        return bad( fieldErr );
+    }
+
+    if( r.verb == "for" )
+    {
+        if( task.empty() )
+        {
+            return bad( missingField( "for" ) );
+        }
+        std::optional<std::string> forAnswer = forTaskText( root, task, redactPtr, 0, false, pageParse.page );   // L-W: the batch arm pages the file page too
+        if( !forAnswer )
+        {
+            return bad( "internal error: the for answer buffer lost bytes — no answer served" );
+        }
+        r.payload = std::move( *forAnswer );
+        if( r.payload.empty() )
+        {
+            return bad( "no symbols found" );
+        }
+    }
+    else if( r.verb == "grep" )
+    {
+        if( pattern.empty() )
+        {
+            return bad( missingField( "grep" ) );
+        }
+        // P3-4/P6-1: the span-tier hatch, through the SAME closed-value reader the live arm uses — so a
+        // typo refuses here as it does there, and the ack's "both callers updated" is finally true.
+        GrepIn batchGrepIn = GrepIn::Code;
+        if( const std::string inRefusal = grepInModeFromArg( grepInTyped, batchGrepIn ); !inRefusal.empty() )
+        {
+            return bad( inRefusal );
+        }
+        r.payload = grepHitsJson( root, pattern, pageParse.page, batchGrepIn );   // N8: the batch arm pages grep too
+    }
+    else if( r.verb == "find_symbol" || r.verb == "callees" )
+    {
+        if( symbol.empty() )
+        {
+            return bad( missingField( "find_symbol" ) );
+        }
+        r.payload = symbolQueryJson( root, symbol, false, pageParse.page );   // M13: the batch arm pages these too
+        if( r.payload.empty() )
+        {
+            return bad( symbolMissing( "find_symbol", symbol ) );
+        }
+    }
+    else if( r.verb == "find_referencing_symbols" || r.verb == "callers" )
+    {
+        if( symbol.empty() )
+        {
+            return bad( missingField( "find_referencing_symbols" ) );
+        }
+        r.payload = symbolQueryJson( root, symbol, true, pageParse.page );    // M13: same window as the live verb
+        if( r.payload.empty() )
+        {
+            return bad( symbolMissing( "find_referencing_symbols", symbol ) );
+        }
+    }
+    else if( r.verb == "impact" )
+    {
+        if( symbol.empty() )
+        {
+            return bad( missingField( "impact" ) );
+        }
+        std::optional<std::string> impactAnswer = impactText( root, symbol, pageParse.page );   // §B6 M4: the batch arm honors the SAME window
+        if( !impactAnswer )
+        {
+            return bad( "internal error: the impact answer buffer lost bytes — no answer served" );
+        }
+        r.payload = std::move( *impactAnswer );
+        if( r.payload.empty() )
+        {
+            return bad( symbolMissing( "impact", symbol ) );
+        }
+    }
+    else if( r.verb == "uses" )
+    {
+        if( symbol.empty() )
+        {
+            return bad( missingField( "uses" ) );
+        }
+        // V2-1: refuse a qualified spelling whose bare name IS defined (shared guard, see usesSelectorRefusal).
+        if( const std::string refusal = usesSelectorRefusal( getIndex( root ).ing, symbol ); !refusal.empty() )
+        {
+            return bad( refusal );
+        }
+        std::optional<std::string> usesAnswer = usesText( root, symbol, pageParse.page );   // LB-G: the batch arm honors the SAME window (the impact precedent)
+        if( !usesAnswer )
+        {
+            return bad( "internal error: the uses answer buffer lost bytes — no answer served" );
+        }
+        r.payload = std::move( *usesAnswer );
+    }
+    else if( r.verb == "mentions" )
+    {
+        if( symbol.empty() )
+        {
+            return bad( missingField( "mentions" ) );
+        }
+        // §B11.1: the batch arm refuses a qualified spelling identically — the same clone-seam drift V2-1's
+        // own header warns about (its first landing guarded one dispatch site of two).
+        if( const std::string refusal = qualifiedSelectorRefusal( getIndex( root ).ing, symbol, "--mentions=" ); !refusal.empty() )
+        {
+            return bad( refusal );
+        }
+        r.payload = mentionsJson( root, symbol, pageParse.page );   // M13
+        if( r.payload.empty() )
+        {
+            return bad( symbolMissing( "mentions", symbol ) );
+        }
+    }
+    else if( r.verb == "analyze" )
+    {
+        r.payload = analyzeToString( root, topK, stable );
+        if( r.payload.empty() )
+        {
+            return bad( "no indexed symbols at path (empty corpus or unreadable directory)" );
+        }
+    }
+    else if( r.verb == "lego" )
+    {
+        if( type.empty() )
+        {
+            return bad( missingField( "lego" ) );
+        }
+        r.payload = legoText( root, type, redactPtr );           // D8 fix: "" now means genuine not-found only (zero implementors is real content)
+        if( r.payload.empty() )
+        {
+            return bad( mcprefuse::notFound( getIndex( root ).ing, "type", type ) );
+        }
+    }
+    else if( r.verb == "owners" )
+    {
+        // §B11.1: same guard, same sentence — `symbol` is optional here, and an empty one has no colon.
+        if( const std::string refusal = qualifiedSelectorRefusal( getIndex( root ).ing, symbol, "--owners=" ); !refusal.empty() )
+        {
+            return bad( refusal );
+        }
+        std::optional<std::string> ownersAnswer = ownersText( root, symbol, pageParse.page );      // symbol optional (empty = all files); M13: paged
+        if( !ownersAnswer )
+        {
+            return bad( "internal error: the owners answer buffer lost bytes — no answer served" );
+        }
+        r.payload = std::move( *ownersAnswer );
+        if( r.payload.empty() )
+        {
+            return bad( symbol.empty() ? std::string( "no git history for this tree (owners is mined from git; not a repo, or no commits)" )
+                                       : symbolMissing( "owners", symbol ) );   // N7: the hint comes from the table row
+        }
+    }
+    else if( r.verb == "cochange" )
+    {
+        if( file.empty() )
+        {
+            return bad( missingField( "cochange" ) );
+        }
+        r.payload = cochangePartnersJson( root, file, pageParse.page );   // M13: the batch arm pages it too
+        if( r.payload.empty() )
+        {
+            return bad( mcprefuse::fileNotFound( getIndex( root ).ing, file ) );
+        }
+    }
+    else if( r.verb == "path_between" )
+    {
+        if( from.empty() || to.empty() )
+        {
+            return bad( missingField( "path_between" ) );
+        }
+        std::optional<std::string> pathAnswer = pathText( root, from, to );
+        if( !pathAnswer )
+        {
+            return bad( "internal error: the path_between answer buffer lost bytes — no answer served" );
+        }
+        r.payload = std::move( *pathAnswer );
+        if( r.payload.empty() )
+        {
+            return bad( pathEndpointRefusal( getIndex( root ).ing, from, to ) );
+        }
+    }
+    else if( r.verb == "exemplar" )
+    {
+        const std::string arg = !kind.empty() ? kind : task;
+        if( arg.empty() )
+        {
+            return bad( missingField( "exemplar" ) );
+        }
+        std::optional<std::string> exemplarAnswer = exemplarText( root, arg, redactPtr );
+        if( !exemplarAnswer )
+        {
+            return bad( "internal error: the exemplar answer buffer lost bytes — no answer served" );
+        }
+        r.payload = std::move( *exemplarAnswer );
+        if( r.payload.empty() )
+        {
+            return bad( "no matching exemplar (no symbol of that kind, or the task matched nothing)" );
+        }
+    }
+    else if( r.verb == "slice" )
+    {
+        if( symbol.empty() )
+        {
+            return bad( missingField( "slice" ) );
+        }
+        // sliceText owns the WHOLE contract (resolution, the @FILE:LINE seed, flow/depth pairing, every
+        // refusal) — the same call the live arm makes, so a batched slice cannot become a second slice.
+        // M1: the POSTURE reaches the sub-answer. slice builds its compact form in its own emitter (it is the
+        // one verb that does), so a batched slice has to be told — compacting it afterwards with the
+        // compactlegend.h layer would produce the layer's spelling of the root (schema= first) against the
+        // standalone verb's native spelling (schema= after lang=), and batchcheck (h)'s contract is that a
+        // sub-answer reproduces its standalone output byte-for-byte.
+        const SliceReply sr = sliceText( root, symbol, var, flow, depthArg.isPresent ? int( depthArg.value ) : 0, redactPtr,
+                                         compactLegend );
+        if( sr.payload.empty() )
+        {
+            return bad( sr.refusal );
+        }
+        r.payload = sr.payload;
+    }
+    else if( r.verb == "edit_check" )
+    {
+        if( symbol.empty() )
+        {
+            return bad( missingField( "edit_check" ) );
+        }
+        // No new_body: the batched form is the post-hoc question only (see kBatchServedVerbs).
+        // 2026-09-10: paged like every other windowing verb in this arm, so "does the batch arm honor limit?"
+        // keeps ONE answer. Absent limit/offset is {0,0}, which is the standalone verb's own default window —
+        // the byte-identity test/batchcheck.sh (h) asserts against the standalone call is unaffected.
+        const EditCheckReply er = editCheckText( root, symbol, {}, pageParse.page );
+        if( er.payload.empty() )
+        {
+            return bad( er.refusal );
+        }
+        r.payload = er.payload;
+    }
+    else if( r.verb == "fetch_body" )
+    {
+        if( handle.empty() )
+        {
+            return bad( missingField( "fetch_body" ) );
+        }
+        const bool         hasRange = hasStart || hasEnd;
+        const long long    s        = hasStart ? startLine : 1;
+        const long long    e        = hasEnd   ? endLine   : ( hasStart ? (long long)0x7fffffff : 0 );
+        const FetchOutcome fo       = fetchBody( root, handle, s, e, hasRange, redactPtr );
+        if( !fo.ok )
+        {
+            return bad( fo.message );
+        }
+        r.payload = fo.resultJson;
+    }
+    else
+    {
+        // Unreachable by construction: unknownSubVerbRefusal above already refused anything outside
+        // kBatchServedVerbs + kBatchVerbAliases, and every member of those has an arm. If a verb joins the
+        // registry without one, THIS is the honest failure — never a silent ok="1" with an empty payload.
+        DISCLOSE( Diagnostics::answerRefused, "the batch sub-query is refused with an explicit bug message, never an empty ok",
+                  "batch: a verb in the served registry has no dispatch arm" );
+        return bad( "batch cannot answer '" + r.verb + "' — it is in the served registry but has no dispatch "
+                    "arm (a codecortex bug: kBatchServedVerbs and runBatchSub have drifted)" );
+    }
+
+    r.ok = true;
+    return r;
+}
+
+// A4-R3: wrap arbitrary text in a CDATA section, splitting any interior "]]>" across the boundary
+// ("]]>" → "]]]]><![CDATA[>") so a sub-answer that itself contains "]]>" can never terminate the section
+// early. This is what keeps the whole batch payload one WELL-FORMED XML document regardless of whether a
+// sub-answer is XML (for/impact/uses/…) or JSON (grep/find_symbol/…) — every payload rides verbatim inside
+// CDATA, so extracting a <q>'s CDATA reproduces its standalone-verb output byte-for-byte.
+inline std::string batchCdata( const std::string& s )
+{
+    std::string out = "<![CDATA[";
+    std::size_t pos = 0;
+    for( ;; )
+    {
+        const std::size_t hit = s.find( "]]>", pos );
+        if( hit == std::string::npos ) { out.append( s, pos, std::string::npos ); break; }
+        out.append( s, pos, hit - pos );
+        out += "]]]]><![CDATA[>";
+        pos = hit + 3;
+    }
+    out += "]]>";
+    return out;
+}
+
+// A4-R3: serialize the completed sub-answers into ONE batch payload. DEDUP (the "natural seam for
+// within-reply dedup" the audit named): if sub-answer j's payload is byte-identical to an earlier OK
+// sub-answer i's, j emits `<dup-of q="i"/>` instead of repeating the block — conservative (exact same
+// payload only), deterministic (first earlier match wins), and it never mis-references (only an exact
+// byte match dedups). `requested` is the sub-query count BEFORE the cap (so an over-cap batch is honest:
+// n < requested with capped="1"); `cap` is kBatchCap.
+// M1 (terminality round A, 2026-09-05): is VERB in the compact-legend family — i.e. does it DECLARE the
+// `legend` argument? Read from kMcpVerbFields, the same table the unknown-field refusal dispatches from, so
+// a verb joining the family needs one edit and gets the default, the argument, the refusal and the batch
+// behaviour together. Used by the live dispatch (mcp.h, legendCompactPosture) and by the batch assembler.
+//
+// It is what keeps the DEFAULT from leaking onto verbs the argument was never offered for: `for` carries a
+// header that is already its own short legend whose comments are DATA (A10), grep/cochange/find_* answer
+// JSON, the edit verbs answer receipts. Inside a batch that distinction is load-bearing rather than
+// cosmetic — batchcheck (a) asserts every sub-answer is byte-identical to its STANDALONE verb, and
+// compacting a sub-answer whose standalone twin is full breaks exactly that.
+inline bool mcpVerbDeclaresLegend( std::string_view verb ) noexcept
+{
+    for( const std::string_view f : mcprefuse::declaredFieldsFor( verb ) )
+    {
+        if( f == "legend" )
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// P1 (L7): the compact-legend KEY for an MCP verb whose XML root is shared (`ctx`, `r`) — the twin of
+// main.cpp's compactLegendHint, keyed by verb name instead of by flag. Verbs with a unique root need none.
+inline std::string_view mcpCompactLegendHint( std::string_view verb ) noexcept
+{
+    if( verb == "analyze" || verb == "rank_by" )        { return "map"; }   // lane/t10-mcp-coverage: rank_by's XML root is the SAME <r> shape analyze serves
+    if( verb == "explore" || verb == "pack_task" )     { return "pack-task"; }
+    if( verb == "from_trace" )                         { return "from-trace"; }
+    if( verb == "lego" )                               { return "lego"; }
+    if( verb == "exemplar" )                           { return "exemplar"; }
+    return {};
+}
+
+// M1 (terminality round A, 2026-09-05): the compact posture, applied to a batch's SUB-ANSWERS.
+//
+// WHY IT CANNOT RIDE THE ORDINARY REWRITE. Both surfaces apply the compact dialect to the finished document
+// — main.cpp's runWithCompactLegend for the CLI, mcp.h's textResult for the server — and both deliberately
+// leave CDATA sections alone, because a CDATA section is DATA and a sub-answer inside one may be JSON or
+// plain text that a legend rewrite would corrupt. So a batch compacted only at the top level shipped its own
+// legend short and sixteen sub-answers' legends long, on the one verb where legend duplication costs the
+// most. Measured on this repo's fixture, a two-query batch (uses + slice): 8,840 B full, 8,645 B with the
+// outer legend compacted alone (−195 B), 4,478 B with the sub-answers compacted too (−49%).
+//
+// slice takes BOTH steps, in the same order the standalone dispatch takes them, and that is the whole
+// subtlety of this helper. It is the one verb with a native compact emitter, so runBatchSub asks it for the
+// compact form (compactLegend) — which decides where schema= sits on the root — and then the layer runs over
+// the result and replaces its legend TEXT with the shared spec, exactly as textResult does for a standalone
+// slice. Doing only the first step (an earlier cut of this change) gave a batched slice the native legend,
+// 1,542 B against the standalone verb's 606 B: byte-identical rows and a different legend, which is precisely
+// the divergence batchcheck (h) exists to catch, and it caught it.
+//
+// The batchText contract is UNCHANGED by this and is the reason it is done at all: a <q>'s CDATA still
+// reproduces its standalone-verb output byte-for-byte — under the same posture, which is now the default on
+// both sides. Gate: batchcheck (a) and (h), re-pinned to the compact standalone.
+inline void applyCompactToBatchSubs( std::vector<BatchSub>& subs )
+{
+    for( BatchSub& s : subs )
+    {
+        if( !mcpVerbDeclaresLegend( s.verb ) )
+        {
+            continue;   // not in the family — its standalone twin is not compacted either. See above.
+        }
+        rw::applyCompactDialect( s.payload, mcpCompactLegendHint( s.verb ) );
+    }
+}
+
+inline std::string batchText( const std::vector<BatchSub>& subs, std::size_t requested, std::size_t cap )
+{
+    std::vector<char> esc;
+    const auto ex = [ & ]( std::string_view sv ) -> std::string { return std::string( escapeXml( sv, esc ) ); };
+
+    std::string out;
+    out += "<batch n=\"" + std::to_string( subs.size() )
+         + "\" requested=\"" + std::to_string( requested )
+         + "\" cap=\"" + std::to_string( cap ) + "\"";
+    if( requested > cap )
+    {
+        out += " capped=\"1\"";
+    }
+    out += "><!-- codecortex batch: N read sub-queries answered in one sweep. Each <q> carries i=index, "
+           "verb=sub-verb, ok=1|0; the sub-answer rides verbatim in CDATA (a mix of XML and JSON payloads); "
+           "<dup-of q=\"i\"/> means this payload is byte-identical to the one already emitted at index i; "
+           "ok=0 carries err= and no payload. Over-cap batches set capped=\"1\" with n<requested. -->";
+
+    for( std::size_t i = 0; i < subs.size(); ++i )
+    {
+        const BatchSub& sub = subs[i];
+        out += "<q i=\"" + std::to_string( i ) + "\" verb=\"" + ex( sub.verb ) + "\" ok=\"" + ( sub.ok ? "1" : "0" ) + "\"";
+        if( !sub.ok )
+        {
+            out += " err=\"" + ex( sub.err ) + "\"/>";
+            continue;
+        }
+        // dedup: first earlier OK sub-answer with an identical payload (exact byte match only).
+        std::size_t dupOf = i;
+        for( std::size_t j = 0; j < i; ++j )
+        {
+            if( subs[j].ok && subs[j].payload == sub.payload ) { dupOf = j; break; }
+        }
+        if( dupOf != i )
+        {
+            out += "><dup-of q=\"" + std::to_string( dupOf ) + "\"/></q>";
+        }
+        else
+        {
+            out += ">" + batchCdata( sub.payload ) + "</q>";
+        }
+    }
+    out += "</batch>";
+    return out;
+}
+
+}   // namespace rw

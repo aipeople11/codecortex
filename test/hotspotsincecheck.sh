@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# hotspotsincecheck.sh — §P0.5c gate: --hotspots must not report an all-history scan under a window label
+# nobody asked for, and its header comment must agree with its window= attribute.
+#
+#   --hotspots --since=nonsense    -> window="12mo", exit 0; degrade only on stderr   (before)
+#   --hotspots --since=notaref9z   -> window="notaref9z", exit 0, stderr EMPTY        (before — the digit
+#                                     slipped past the coarse looksLikeDate gate and git approxidate turned
+#                                     it into an arbitrary timestamp)
+#   --hotspots --since="2 weeks ago" -> window="2 weeks ago" but the header comment still said (window=12mo)
+#
+# A false NON-zero: the churn numbers are real, the window they are labelled with is not, and the only
+# honest signal was a DISCLOSE on stderr — invisible to every MCP client.
+#
+#   CODECORTEX_BIN=build/codecortex      bash test/hotspotsincecheck.sh
+#   CODECORTEX_BIN=build_base/codecortex bash test/hotspotsincecheck.sh   # must FAIL (pre-fix binary)
+
+set -u
+ROOT="$( cd "$( dirname "$0" )/.." && pwd )"
+# BOTH seams — `bash test/<gate>.sh asan/codecortex` is how a differential run passes a binary, and this gate
+# accepted the positional argument and silently ignored it, so a red-first run measured build/codecortex.
+BIN="${1:-${CODECORTEX_BIN:-$ROOT/build/codecortex}}"
+[ "${BIN#/}" = "$BIN" ] && BIN="$ROOT/$BIN"
+TMP="$( mktemp -d )"; trap 'rm -rf "$TMP"' EXIT
+fail=0
+ok(){ printf '  PASS  %s\n' "$*" || { fail=1; printf '  FAIL  could not write the PASS line for: %s\n' "$*"; }; return 0; }
+no(){ printf '  FAIL  %s\n' "$*"; fail=1; }
+
+[ -x "$BIN" ] || { echo "no codecortex binary at $BIN — build first"; exit 2; }
+git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 || { echo "SKIP: not a git repo"; exit 0; }
+echo "hotspotsincecheck: BIN=$BIN  ROOT=$ROOT"
+
+# ── 1. an unresolvable --since refuses, naming the value, with no <hotspots> element
+refuseCase(){
+    local value="$1"
+    "$BIN" "$ROOT" --hotspots --since="$value" >"$TMP/out" 2>"$TMP/err"; local rc=$?
+    if [ "$rc" -eq 1 ]; then ok "--since='$value': exit 1"; else no "--since='$value': exit $rc (expected 1)"; fi
+    grep -q -- "$value" "$TMP/err" && ok "--since='$value': refusal names the value" \
+        || no "--since='$value': refusal does not name the value: $( head -c 200 "$TMP/err" )"
+    grep -q '<hotspots' "$TMP/out" && no "--since='$value': still emitted a <hotspots> element" \
+        || ok "--since='$value': no <hotspots> element on the refusal path"
+}
+refuseCase nonsense
+refuseCase notaref9z          # the digit used to slip past looksLikeDate and become an arbitrary window
+
+# ── 2. a VALID window is reported honestly in BOTH places — attribute and header comment (§P9 N7)
+# L1 (2026-09-19): the CLI default legend is compact (root leads with schema=, no (window=...) header clause); these
+# arms read the full-default root start-tag and the FULL legend's prose, so they ask for --legend=full.
+"$BIN" "$ROOT" --hotspots --since="2 weeks ago" --legend=full >"$TMP/ok" 2>/dev/null; rc=$?
+if [ "$rc" -eq 0 ]; then ok '--since="2 weeks ago": exit 0'; else no "--since=\"2 weeks ago\": exit $rc (expected 0)"; fi
+grep -q '<hotspots window="2 weeks ago"' "$TMP/ok" && ok 'window= says "2 weeks ago"' \
+    || no "window= is not \"2 weeks ago\": $( grep -oE '<hotspots [^>]*' "$TMP/ok" | head -c 120 )"
+grep -q '(window=2 weeks ago)' "$TMP/ok" && ok 'header comment says (window=2 weeks ago) — agrees with the attribute' \
+    || no "header comment disagrees with window=: $( grep -oE '\(window=[^)]*\)' "$TMP/ok" | head -1 )"
+grep -q '(window=12mo)' "$TMP/ok" && no 'header comment still hardcodes (window=12mo) under a --since' \
+    || ok 'header comment no longer hardcodes 12mo'
+
+# a revision boundary is the deterministic form and must keep working
+"$BIN" "$ROOT" --hotspots --since=HEAD~5 --legend=full >"$TMP/rev" 2>/dev/null; rcr=$?
+[ "$rcr" -eq 0 ] && grep -q '<hotspots window="HEAD~5"' "$TMP/rev" \
+    && ok "--since=HEAD~5 (revision) still scopes and exits 0" \
+    || no "--since=HEAD~5: exit $rcr without window=\"HEAD~5\""
+
+# ── 3. no --since at all: the default window, in both places, unchanged
+"$BIN" "$ROOT" --hotspots --legend=full >"$TMP/def" 2>/dev/null; rcd=$?
+# F1 (round C): the default window is HEAD-anchored and its label says so, in BOTH places — the attribute
+# and the header comment must still agree, which is the property this arm exists for.
+[ "$rcd" -eq 0 ] && grep -q '<hotspots window="12mo@HEAD"' "$TMP/def" && grep -q '(window=12mo@HEAD)' "$TMP/def" \
+    && ok 'default --hotspots: window="12mo" in both attribute and comment' \
+    || no "default --hotspots: exit $rcd, window/comment not both 12mo"
+
+# ── RE-PINNED 2026-09-04 (capture-audit M8, lens 7 F-SINCE-1) ────────────────────────────────────────
+# These two arms used to assert that --cochange / --rank-by=churn DEGRADE to all-history on a garbage
+# --since (output byte-equal to the bare invocation). That was the surviving half of the very policy
+# §P0.5c removed from --hotspots: an unresolvable value is not a request for the default window, and the
+# only signal the caller got was a stderr note under an exit 0 root stamped window="18mo". --since is one
+# GLOBAL flag; it now refuses ONCE, before any verb runs, for all four of its consumers. What survives
+# from the old arms is the fact they were really protecting — that a digit-bearing garbage value
+# (notaref9z) is never handed to git approxidate as a "date" — which a refusal states more plainly than a
+# byte-comparison did.
+# (--top-k rides only on the ranked-map arm; --cochange refuses it, which would mask the subject.)
+for host in "--cochange" "--rank-by=churn --top-k=5"; do
+    "$BIN" "$ROOT" $host --since=notaref9z > "$TMP/since_garbage.out" 2>"$TMP/since_garbage.err"; rcg=$?
+    [ "$rcg" -ne 0 ] && [ ! -s "$TMP/since_garbage.out" ] && grep -q 'notaref9z' "$TMP/since_garbage.err" \
+        && ok "$host --since=<garbage>: refuses (exit $rcg, empty stdout, names the value) — never a fabricated window" \
+        || no "$host --since=<garbage>: exit $rcg with $( wc -c <"$TMP/since_garbage.out" | tr -d ' ' ) B on stdout — a garbage value still shapes the window"
+done
+
+# ── ranked= RECONCILES AGAINST A DENOMINATOR ─────────────────────────────────────────────────────────
+# ranked="209" was emitted with nothing to divide it by, and the two ways a file misses the ranking — no
+# churn in the window, no function or method to score — were dropped by one `if` into one silent absence.
+# On this repo that hid 669 of 878 files, and the split is not what a reader would guess: 667 have no
+# complexity to score at all and only 2 are churn-free.
+#
+# Asserted as an IDENTITY, not as four numbers: the four attributes must reconcile on whatever corpus this
+# runs against, today and after the repo grows (a pinned count is a gate with an expiry date). Plus the
+# denominator must be the SAME files= the default map reports — a second, differently-drawn total under the
+# same attribute name would be worse than no denominator.
+HS="$( "$BIN" "$ROOT" --hotspots 2>/dev/null | grep -oE '<hotspots [^>]*' )"
+hsattr(){ printf '%s' "$HS" | grep -oE " $1=\"[0-9]+\"" | grep -oE '[0-9]+'; }
+HS_FILES="$( hsattr files )"; HS_RANKED="$( hsattr ranked )"
+HS_NOCHURN="$( hsattr unranked_no_churn )"; HS_NOCX="$( hsattr unranked_no_complexity )"
+# extent honesty (test/extentcheck.sh arm G): a FOURTH bucket, absent when 0 — files whose every scorable function
+# failed a containment check. This repo holds two such fixtures (test/extentfix), so the identity needs the term.
+HS_SUSPECT="$( hsattr unranked_extent_suspect )"; HS_SUSPECT="${HS_SUSPECT:-0}"
+if [ -z "$HS_FILES" ] || [ -z "$HS_RANKED" ] || [ -z "$HS_NOCHURN" ] || [ -z "$HS_NOCX" ]; then
+    no "--hotspots does not carry the ranked= denominator + both exclusion counts: $HS"
+else
+    SUM=$(( HS_RANKED + HS_NOCHURN + HS_NOCX + HS_SUSPECT ))
+    [ "$SUM" = "$HS_FILES" ] \
+        && ok "--hotspots: ranked($HS_RANKED) + no_churn($HS_NOCHURN) + no_complexity($HS_NOCX) + extent_suspect($HS_SUSPECT) = files($HS_FILES) — the partition is exact" \
+        || no "--hotspots partition does not reconcile: $HS_RANKED + $HS_NOCHURN + $HS_NOCX + $HS_SUSPECT = $SUM, files=$HS_FILES"
+    MAP_FILES="$( "$BIN" "$ROOT" --top-k=1 2>/dev/null | grep -oE 'files=[0-9]+' | head -1 | grep -oE '[0-9]+' )"
+    [ -n "$MAP_FILES" ] && [ "$MAP_FILES" = "$HS_FILES" ] \
+        && ok "--hotspots files=\"$HS_FILES\" is the same denominator the default map reports" \
+        || no "--hotspots files=$HS_FILES disagrees with the map's files=${MAP_FILES:-<unread>}"
+    # the legend must SAY that no_churn conflates a quiet file with one the git-path join never bound —
+    # otherwise the number reads as a measure of quietness, which it is not.
+    "$BIN" "$ROOT" --hotspots --legend=full 2>/dev/null | grep -oE '<!--[^>]*-->' | head -1 | grep -q 'join never bound' \
+        && ok "--hotspots legend states that unranked_no_churn conflates quiet files with unbound ones" \
+        || no "--hotspots legend does not disclose what unranked_no_churn conflates"
+fi
+
+[ "$fail" = 0 ] && echo "ALL PASS" || echo "FAILURES ABOVE"
+exit $fail

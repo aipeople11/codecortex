@@ -1,0 +1,5418 @@
+#include "infra/emit.h" // rw::emitTo / emitRaw / formatTo — THE emitter and its siblings
+#include "gitcmd.h"         // rw::gitCmd — every git child starts with --no-optional-locks -c core.fsmonitor=false
+#include <string_view>       // %.*s (precision, pointer) collapses to one view
+
+// main.cpp — codecortex entry point: parse args → ingest → graph → PageRank → minified XML,
+// plus --map-diff (teleport toward git-changed files) and --pack-top-n (append source).
+// ingest() comes from ingest.cpp (real, tree-sitter) or stub_ingest.cpp (test).
+
+#include "model.h"
+#include "nextverb.h"              // P3 (L7): next= on every enumerated root (the verbs_*.h fragments read it from here)
+#include "infra/stdinline.h"       // R4: readByteSafeLine — the ONE byte-safe stdin line reader (--from-trace=- / --batch=-)
+#include "ingest.h"
+#include "workspace.h"             // multi-root workspaces: root hygiene + labels + the id-offset merge
+#include "graph.h"
+#include "scip.h"                  // SCIP precision overlay (--scip=index.scip)
+#include "serialize.h"
+#include "pageview.h"              // §P8: the ONE --limit/--offset window + root-element shown=/capped= disclosure
+#include "graphlegend.h"           // §H4 §3.4: the ONE counts_floor= marker + the shared graph-count legend wording
+#include "columnar.h"              // RESEARCH lever 1: opt-in columnar re-serialization for the flat list verbs (--format=columnar)
+#include "redact.h"                // RedactCounts + reportRedactions for the emitted-body secret redaction
+#include "filter.h"
+#include "eval.h"
+#include "skilleval.h"
+#include "lexical.h"
+#include "recall.h"
+#include "situ.h"
+#include "handoff.h"               // --handoff: the continuation packet (verified + heuristic sections)
+#include "dmm.h"                   // --dmm: the Delta Maintainability Model scalar — the trendable complement to --quality-delta
+#include "readability.h"           // --readability: the Posnett (MSR 2011) per-function readability lens
+#include "commentcoherence.h"      // --comment-coherence: Steidl c_coeff + Scalabrino CIC, per documented function/method
+#include "contextratio.h"          // --context-ratio: the LOCAL-REASONING lens (outside-the-file share of a unit's context)
+#include "nonlocalstate.h"         // --nonlocal-state: per function, the non-local MUTABLE state it reaches (reads vs writes)
+#include "renamemine.h"            // --naming-calibration: the naming-* rules scored against the repo's own rename history (§9.5)
+#include "namingconsistency.h"     // --naming-consistency: §9.2 TIER A convention normalization (corpus-derived case-style vote)
+#include "ensemble.h"              // --ensemble: the family join over structural / lexical / confusion / historical evidence
+#include "qualitypanel.h"          // --quality-panel: THE SINGLE COMMAND — the ensemble's four families plus colocation and state, under a preset
+#include "testmap.h"               // §P11.2/§P11.4: the test<->code map both ways (--affected=SYM seeding)
+#include "packtask.h"              // L4: the shared --pack-task / MCP explore/pack_task bundle assembler (packTaskBundleText)
+#include "partition.h"             // --pack-task --partition=N — the fan-out form (core + N slices), same assembler.
+                                   //   BEFORE mcp.h so mcpverbs.h's explore verb can reach packTaskPartitionText (same rule packtask.h follows).
+#include "tracelocus.h"            // L4: the shared --from-trace / MCP from_trace bundle assembler (fromTraceBundleText)
+#include "callhierarchy.h"        // H14/M13: the shared --callers/--callees / MCP find_* 1-hop computation (CLI == MCP rows)
+#include "editcheck.h"             // L4: the shared --edit-check / MCP edit_check contract-comparison core (editCheckBundleText)
+#include "slice.h"                 // lane/paper-slice: --slice=SYM[:VAR] — the ARISE-motivated def-use slice core (sliceBundleText)
+#include "editpreview.h"           // card A1: the PRE-APPLY contract preview (editpreview::run) — BEFORE mcp.h, which
+                                   //   is what lets the MCP edit_check verb mirror it from mcpverbs.h
+#include "slicediff.h"            // card A4: --slice=SYM:VAR --since=REV — the def-use slice as a DEPENDENCE diff
+#include "mcp.h"
+#include "codecortex_mcp_bridge.h"
+#include "compactlegend.h"         // P1 (L7): the --legend=compact dialect layer for every XML verb (runWithCompactLegend)
+#include "mcpserver.h"             // the optional remote MCP transport (--listen), picked below
+#include "telemetry/collector.h"      // CodeCortex invocation/tool telemetry
+#include "ui/server.h"                // CodeCortex Developer Console
+#include "editplan.h"              // CLI-first versioned multi-edit transactions
+#include "wrap.h"
+#include "install_command.h"
+#include "host_observer.h"
+
+// P8 (L7): the test-gate root's ccx_bar= (situ.h kTestGateCcxBarMirror) is quality.h's kCcxBar — one bar, two spellings,
+// pinned equal in the one TU that sees both (quality.h is also compiled standalone by the bench/probe targets).
+static_assert( rw::kTestGateCcxBarMirror == rw::quality::kCcxBar, "situ.h kTestGateCcxBarMirror must equal quality.h kCcxBar" );
+#include "infra/profileScope.h"    // PROFILE_SCOPE self-profiling — gated by PROFILE_ENABLED (off unless -DCODECORTEX_PROFILE=ON)
+#include "arch.h"
+#include "search.h"
+#include "query.h"
+#include "pattern.h"               // R2: the pattern surface's compiler + disclosures (the matcher runs inside the ingest walk)
+#include "verify.h"                // G4 verify-a-claim: the --verify closed claim grammar + verdict/limit vocabularies (runVerify below)
+#include "forpage.h"               // forWidenNext — the ONE spelling of the --for widening page, with its byte ceiling
+#include "taskroute.h"             // --help-task: deterministic task -> one safe CLI recommendation or abstention
+#include "quality.h"
+#include "cloneidiom.h"          // idiom-class demotion for clone findings — the closed 3-idiom shape classifier both --clones and the quality-delta duplication kind annotate rows with
+#include "gitstamp.h"
+#include "githarden.h"      // harvest 2026-09-09: the git-config trust boundary — one call in main(), before any thread              // r26-stamp Task A: gitstamp::atAttr — the at="<sha>[+dirty]" root anchor, shared by
+                                   // --hotspots / --quality-delta / --doctor below (each verb's own file pulls it too)
+#include "binstale.h"              // --doctor's tracked-binary-staleness check (git-order, not mtime)
+#include "codexdoctor.h"           // --doctor --agent=codex: live binary/skills/hooks/MCP surface parity
+#include "crossref.h"              // --stray-content / --whereis — the cross-branch content index
+#include "darkflags.h"             // --flags — the dark-content (compile/cmake/env gate) dashboard
+#include "flipimpact.h"            // --flags --flip=NAME: the blast radius of turning ONE of those gates ON
+#include "layout.h"                // --layout=STRUCT — computed field offsets + tcodecortexs + mirror drift
+#include "fieldaffinity.h"         // --field-affinity — the cache-locality lens (co-access graph vs declared order)
+#include "abicheck.h"              // --stray-content --abi — the cross-branch ABI-BREAK gate (layout x stray-content)
+#include "docdrift.h"              // --doc-drift — the markdown doc-anchor verifier
+#include "planlint.h"              // P3.2: --plan-lint=FILE — the house PLAN format's STRUCTURE check (cards vs the
+                                    // status ledger, terminal glyphs, stale hourglass lines, undischarged owed mentions)
+#include "gitoracle.h"             // --with-history: the shared "was this name ever here" git-history oracle
+#include "mergescout.h"            // L1: --merge-scout=REF[,REF...] — read-only cross-branch overlap + landing order
+#include "landingplan.h"           // --stray-content --plan — composes crossref's sweep with mergescout's overlap oracle
+#include "lanes.h"                 // --plan-lanes=N --task / --plan-lanes --brief — the PRE-HOC lane plan (JSON on stdout)
+#include "exemplar.h"              // A3-F5: shared --exemplar selection (ccx ceiling + fixture penalty + task→kind confidence)
+#include "didyoumean.h"            // §P12.1 / §B6 M8: the ONE near-miss suggester, now shared with the MCP refusal table
+#include "selectorrefuse.h"        // §B4.2: the ONE file:name selector not-found refusal — all six SYM-taking verbs
+#include "gitmine.h"
+#include "ownersview.h"            // §P6.4: countUniformOwnership/ownershipRowsToPrint — shared with mcpverbs.h's `owners` verb
+#include "mention.h"               // B8: query-mention anchoring — files/modules/symbols NAMED in the --for text
+#include "siblift.h"               // r4 EXPERIMENT: env-gated same-directory sibling lift (inert by default)
+#include "filepool.h"              // r5 EXPERIMENT: env-gated file-level evidence pooling (inert by default)
+#include "expand.h"                // r6 EXPERIMENT: env-gated structural expansion from top-ranked files (inert by default)
+#include "tracein.h"               // L2: --from-trace=FILE — table-driven stack-trace/sanitizer/compiler frame extraction
+#include "clones.h"
+#include "skillscan.h"
+#include "htmlexport.h"
+#include "lintrules.h"
+#include "lintcatalog.h"           // L7: --lint-catalog + --lint-select=/--lint-ignore= — the built-in rule registry
+#include "atoms.h"                 // --lint: the atoms-of-confusion pack (Gopstein FSE 2017), C-family only
+#include "cachelint.h"             // --lint: the cache-friendliness pack (access-pattern half; layout half is --field-affinity)
+#include "naminglens.h"            // identifier-naming lens v1: the naming-* built-in --lint rules (deterministic, dictionary-free)
+#include "verbtable.h"             // V6: known-verb dictionary for the community/zoom label verb-histogram suffix
+#include "sarif.h"                 // --sarif: SARIF 2.1.0 re-serialization of --lint's findings (github code-scanning UI)
+#include "prcontext.h"
+#include "ccjson.h"
+#include "cli.h"
+#include "embedded_queries.h"      // configure-generated tags.scm table shared with ingest and --doctor
+#include "infra/hashutil.h"        // sanitizer-clean modulo-2^64 FNV multiplication
+#include "infra/charconvcompat.h"  // rw::parseFloating — FP from_chars is `= delete` on older libc++, unavailable below macOS 26
+
+#include <algorithm>
+#include <array>
+#include <charconv>
+#include <cctype>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <filesystem>
+#include <functional>
+#include <numeric>
+#include <optional>
+#include <span>
+#include <string>
+#include <tuple>
+#include <utility>
+#include <vector>
+#include <cstdint>
+#include <climits>
+#include <chrono>             // VT-1 --run-trace: the wall clock behind duration_ms/timeout (steady_clock)
+#include <csignal>            // VT-1 --run-trace: SIGKILL for the timeout's process-group kill
+#include <tree_sitter/api.h>  // --doctor's grammar-probe check (ts_query_new against each grammar's tags.scm)
+#include "infra/os.h"         // rw::os — getpid, the --run-trace child (spawn_sh/poll/waitpid/kill), --doctor's exepath
+
+namespace
+{
+
+using rw::shSingleQuote;   // defined in gitmine.h, shared with the MCP server
+
+// The per-user cache-dir ladder + the git-baseline helpers now live in quality.h (the baseline home) so BOTH
+// the CLI --quality-* paths and the MCP quality_delta/quality_baseline verbs call ONE copy — no duplicated
+// git-archive / stale-vs-HEAD logic. Re-exported here so every existing call site below is byte-unchanged.
+using rw::quality::cacheDirLadder;
+using rw::quality::gitHeadSha;
+using rw::quality::gitRepoHasHistory;
+using rw::quality::computeHeadSnapshot;
+using rw::quality::resolveCacheBlobPath;   // Y4: shard-aware blob path — see quality.h
+
+// 2026-08-29 main.cpp split: the cross-family helpers promoted to their domain headers, re-exported so
+// every existing call site below (and in the verb-family sections this file includes) is byte-unchanged.
+using rw::gitChangedFiles;                 // situ.h — the working-tree changed-file mask, one mask builder for CLI + MCP
+using rw::gitChurnCounts;                  // gitmine.h — per-file commit counts over a window
+using rw::mineChurnPerFile;                // gitmine.h — THE shared per-file churn miner (single- and multi-root)
+using rw::quality::isHeaderPath;           // quality.h — the --dead-code eligibility trio, shared with --safe-delete
+using rw::quality::sourceHasStaticToken;
+using rw::quality::deadCodeEligibleKind;
+
+// Warm-by-default cache location: a per-root file keyed by the root's ABSOLUTE path, under the hardened
+// cacheDirLadder(), so repeated invocations on the same tree re-parse only changed files.
+//
+// The 16-hex root field comes from quality.h's `cacheRootKeyHex` — the ONE canonical spelling every cache
+// family now shares (lean/rich here, `codecortex-mcp-<key>.cache`, and shaKeyedCachePath's qheadsnap/qsnap/
+// qbody/qhist/qms/qchurn/stier). This function used to open-code the hash with a TRUNCATED FNV-1a offset
+// basis while quality.h used the real one, so one root minted two key families and the byte-budget pin
+// (evictBySizeBudget) could only ever see half of them. The seed that survived is this function's, because
+// it is the one that keeps the 1.76 GB llvm parse cache warm; the full argument lives beside
+// `kCacheRootKeySeed`.
+// Absolute path so two different dirs both invoked as "." don't collide (a collision would only ever
+// cost a cold re-parse — the cache is keyed per-file-path internally — but absolute keeps each tree's
+// cache distinct and warm). Cache content is content-hashed + parserVer-gated, so a stale/foreign cache
+// self-heals to a correct cold parse. STABLE per (user, root): same root + same env → same path, so
+// warm-cache reuse still works across runs.
+//
+// A4-P4: the cache file is SPLIT by verb class (lean vs rich). --for/--metrics/--uses/--exemplar
+// ingest "rich" (captureValueUses=true); everything else "lean". Both classes are parserVer-gated to
+// DIFFERENT versions (parserVerFor), so a single shared file forced a full re-parse + full rewrite on
+// every class switch (measured: plain-map-after --for 0.81 s vs 0.16 s warm). Suffixing the filename
+// with the class gives each class its OWN warm cache, so alternating verb classes never thrashes.
+// (MCP has its own separate file, mcpCachePath in mcp.h — unaffected.)
+//
+// Y4: resolved through resolveCacheBlobPath (quality.h) — the shard-aware, backward-compatible
+// choke point every codecortex-*.bin blob path now routes through. See its comment for the full rationale.
+//
+// THE EXCLUDE SET AND --max-file-size ARE DELIBERATELY NOT IN THIS KEY, and that is a measured decision,
+// not an oversight. Folding them in (one blob per exclude configuration per root) was built and it met
+// every band it was registered against — and it was REVERTED, because the un-excluded root of a real
+// development tree is 158,202 files, twelve gate configurations then want twelve 686 MB blobs, and the
+// cache directory's 2 GiB cap (kMaxCacheDirBytes) evicts the blob a running gate is about to reuse: the
+// full battery went from 7 minutes to 62. docs/EVALS.md, "The auto-cache key ignores --exclude", RUN
+// 2026-09-03, is the registered NEGATIVE; do not bring the key change back.
+//
+// The two costs that key change was written against are paid off by the BLOB'S SHAPE instead
+// (kCacheVersion 15, src/ingest_cache.h): one superset blob per (root, class) carries a record OFFSET
+// TABLE, so a run deserialises only the records for the files it actually crawled, and a save carries
+// over verbatim the records for files it did not crawl — so a narrower configuration is cheap to load
+// and can no longer truncate the shared blob. Gate: test/cacheoffsetcheck.sh.
+std::string defaultCachePath( const std::string& root, bool captureValueUses )
+{
+    return rw::quality::rootKeyedCachePath( root, "codecortex-", captureValueUses ? "-rich.bin" : "-lean.bin" );
+}
+
+// computeHeadSnapshot / gitHeadSha / gitRepoHasHistory / cacheDirLadder now live in quality.h (the
+// baseline home) and are re-exported via the `using` aliases above — one shared copy for CLI + MCP.
+
+
+// gitRepoHasHistory / gitHeadSha moved to quality.h (re-exported via the `using` aliases above) so the CLI
+// --quality-* paths and the MCP quality_delta/quality_baseline verbs share ONE copy of the HEAD probes.
+
+// Wave-4 remote ergonomics: `codecortex <git-url>` — if the positional arg is a git URL (https:// or
+// git@), shallow-clone it (git clone --depth=1, core.quotepath=false) into a stable per-URL cache dir
+// under $TMPDIR (reused if it already exists) and return the local path to map. On success, prints one
+// stderr line telling the user where it cloned. On failure, prints a clear error and returns "" (the
+// caller degrades: error + exit 1). A non-URL arg is returned unchanged (no clone attempted).
+//
+// A3-F15: a leading '-' is rejected here even if it otherwise matches a scheme prefix (it can't, since
+// none of the four prefixes start with '-', but this also blocks a bare "-..." that some future scheme
+// addition might otherwise accept) — the load-bearing option-injection defense lives at the clone
+// call site (`--` before the URL + the protocol.ext/protocol.file allow-list below); this check is a
+// second, cheap gate on the "is this even a URL" recognizer itself.
+bool isGitUrl( std::string_view s ) noexcept
+{
+    if( s.empty() || s.front() == '-' )
+    {
+        return false; // never treat a dash-leading arg as a URL (option-injection guard)
+    }
+    return s.rfind( "https://", 0 ) == 0 || s.rfind( "http://", 0 ) == 0 || s.rfind( "git@", 0 ) == 0 || s.rfind( "ssh://", 0 ) == 0;
+}
+
+// T2 pagination window + the §P8 root-element disclosure both live in pageview.h now — three serializers
+// need them (main.cpp's verbs, crossref.h's --whereis, docdrift.h's --doc-drift) and the vocabulary must not
+// drift between them. `using` rather than a re-declaration so there is exactly one definition.
+using rw::PageWindow;
+using rw::pageWindow;
+using rw::pageDisclosure;
+using rw::pagingDisclosure;
+using rw::effectiveRowCap;
+
+// §P8 G1: the local pageAttr() that used to live here — a bare ` offset="M" limit="N"` for --callers/
+// --callees/--tree — is DELETED, not deprecated. It cut rows correctly but disclosed neither the total nor
+// has_more/next_offset, so those three verbs looked paginated while a loop over them could never terminate:
+// a second, strictly weaker paging vocabulary sitting next to the real one. Every caller now uses
+// pageDisclosure() (or pagingDisclosure() where a noun-prefixed shown_<noun>= already serves), so there is
+// exactly ONE spelling of "this response is a page" in the tool. See src/pageview.h.
+
+
+// octocode partial-fetch + the §P8 seam-1 selector: split one --expand/--outline token into the SELECTOR
+// it resolves through and an optional 1-based [start,end] line range. The grammar (documented in --help):
+//
+//     NAME                 whole body                                        (original)
+//     NAME:START-END       body slice                                        (original)
+//     FILE:NAME            file-qualified selector                           (§P8 seam 1)
+//     FILE:LINE:NAME       a pasted `p="path:line"` locator + the row's n=    (§P8 seam 1)
+//     FILE:NAME:START-END  selector AND slice                                (§P8 seam 1)
+//
+// The text after the LAST ':' decides, by ONE rule: **it is a range attempt iff it starts with a digit**
+// — no identifier in any grammar we parse starts with a digit, so the two readings can never collide.
+// Everything else leaves the WHOLE token as the selector, which then resolves through the same
+// resolveAllByNameQualified() --callers/--callees/--impact use (one resolver, not a second implementation):
+// bare name → every def of that name; canonical id → exact; file:name → that file's def. This is what makes
+// `--callers=X` → pick a row → fetch its body a real chain — before it, the `:` in the row's own `p=` was
+// read as a range, warned "malformed range", and the leftover path was refused as a typo'd symbol name.
+//
+// A range attempt that does not parse (non-numeric, empty half, START==0) still DEGRADES to whole-body —
+// never a hard error, never a crash — with a one-line stderr note naming `verb` (house style: recoverable
+// input ⇒ degrade + note, not ASSUME/throw). `verb` exists because --outline routes through here too and
+// used to emit a note blaming --expand (§P10 X7). A reversed range (START>END) is NOT rejected here —
+// sliceBodyLines() swaps it defensively — so only truly unparseable text degrades.
+struct ExpandToken { std::string selector; rw::LineRange range; };
+inline ExpandToken parseExpandToken( const std::string& token, const char* verb = "--expand" ) noexcept
+{
+    ExpandToken out;
+    out.selector = token;                                               // the default for every non-range shape
+
+    // Split at the LAST ':' — a canonical id (path::scope::name, exactly what --for/--pack-task emit in id=)
+    // is full of ':' and every one of them is scope syntax, never a range seam. Splitting at the FIRST ':'
+    // turned "./src/serialize.h::XmlWriter::write" into the name "./src/serialize.h" and then refused it.
+    const std::size_t colon = token.rfind( ':' );
+    if( colon == std::string::npos )
+    {
+        return out; // no range → whole-body, unchanged
+    }
+
+    const std::string_view rangeStr = std::string_view( token ).substr( colon + 1 );
+
+    // The disambiguator. A tail that does not open with a digit is a NAME, so the whole token is a
+    // file-qualified selector — return it untouched and silently (this is a CORRECT input, not a botch).
+    if( rangeStr.empty() || rangeStr.front() < '0' || rangeStr.front() > '9' )
+    {
+        return out;
+    }
+
+    // An @FILE:LINE line seed (lane/at-seed) carries its own trailing digits: on an @-led token a
+    // digit-led tail with NO dash is the seed's line, not a range attempt — the whole token is the
+    // selector and resolveAtSeed reads the line half itself. "@src/f.cpp:120:5-10" still slices: its
+    // tail has the dash, so the range strips here and "@src/f.cpp:120" resolves as the seed.
+    if( token.front() == '@' && rangeStr.find( '-' ) == std::string_view::npos )
+    {
+        return out;
+    }
+
+    out.selector = token.substr( 0, colon );
+    const std::size_t dash = rangeStr.find( '-' );
+
+    const auto parseU32 = []( std::string_view s, std::uint32_t& v ) noexcept
+    {
+        if( s.empty() )
+        {
+            return false;
+        }
+        for( char c : s )
+        {
+            if( c < '0' || c > '9' )
+            {
+                return false; // digits only — no sign, no whitespace
+            }
+        }
+        char*      end = nullptr;
+        const long n   = std::strtol( std::string( s ).c_str(), &end, 10 );
+        if( n <= 0 || n > 0x7FFFFFFFL )
+        {
+            return false; // START/END are 1-based; 0 or overflow is malformed
+        }
+        v = std::uint32_t( n );
+        return true;
+    };
+
+    std::uint32_t startLine = 0, endLine = 0;
+    const bool    parsed = dash != std::string_view::npos
+                         && parseU32( rangeStr.substr( 0, dash ), startLine )
+                         && parseU32( rangeStr.substr( dash + 1 ), endLine );
+    if( !parsed )
+    {
+        // A "::" anywhere means the tail is a scope segment, not a botched range: the whole token is the
+        // name. Silent by design — "path::scope::name" is a CORRECT input, so warning about it would train
+        // the reader to ignore a warning that fires on the happy path.
+        if( token.find( "::" ) != std::string::npos ) { out.selector = token;  return out; }
+
+        rw::emitTo( stderr, "codecortex: {}={}: malformed range '{}' (want START-END, e.g. 5-10) — emitting the whole body\n",
+                      verb, token.c_str(), std::string_view( rangeStr.data(), rangeStr.size() ) );
+        return out;   // degrade: selector only, hasRange stays false
+    }
+    out.range.startLine = startLine;
+    out.range.endLine   = endLine;
+    out.range.hasRange  = true;
+    return out;
+}
+
+// S3: how old is a cached clone, in whole days, from the cache DIR's mtime (no network call — the dir's
+// mtime is bumped by the clone itself and untouched by a read-only map, so it approximates "when we last
+// fetched"). Clamped to >= 0 so a clock skew (mtime in the future) never prints a negative age.
+long cloneAgeDays( const std::string& cacheDir )
+{
+    rw::os::stat_t st{};
+    if( rw::os::stat( cacheDir.c_str(), &st ) != 0 )
+    {
+        return 0;
+    }
+    const long long ageSec = static_cast<long long>( std::time( nullptr ) ) - static_cast<long long>( st.st_mtime );
+    return ageSec > 0 ? static_cast<long>( ageSec / 86400 ) : 0;
+}
+
+// returns { localPath, ok }. ok=false ⇒ clone failed (caller exits 1). Non-URL ⇒ { url-as-is, true }.
+// refetch=true forces a fresh clone even if a cached one already exists (S3: the cache otherwise never
+// refetches — a months-old clone would be silently mapped forever).
+std::pair<std::string, bool> resolveRemoteRoot( const std::string& urlOrPath, bool refetch = false )
+{
+    if( !isGitUrl( urlOrPath ) )
+    {
+        return { urlOrPath, true };
+    }
+
+    // cache key = FNV-1a-64 of the URL → <hardened cache dir>/codecortex-remote-<hex>. Reuse if the dir
+    // already exists (idempotent: a second run on the same URL is instant, no re-clone) — S4: same
+    // $TMPDIR → $XDG_CACHE_HOME/codecortex (0700) → /tmp ladder as defaultCachePath/mcpCachePath.
+    std::uint64_t h = 1469598103934665603ull;
+    for( const char c : urlOrPath )
+    {
+        h = rw::hashutil::fnv1aAbsorb( h, c );
+    }
+    char tail[ 48 ];
+    rw::formatTo( tail, sizeof( tail ), "/codecortex-remote-{:016x}", static_cast<unsigned long long>( h ) );
+    const std::string cacheDir = cacheDirLadder() + tail;
+
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if( !refetch && fs::exists( fs::path( cacheDir ) / ".git", ec ) && !ec )
+    {
+        const long ageDays = cloneAgeDays( cacheDir );
+        rw::emitTo( stderr, "codecortex: reusing cached clone of {} ({} day{} old); pass --refetch to update\n",
+                      urlOrPath.c_str(), ageDays, ageDays == 1 ? "" : "s" );
+        return { cacheDir, true };
+    }
+
+    // fresh clone (either no cache yet, or --refetch forced one). Remove any existing/partial dir first
+    // so a half-clone (or a stale one, under --refetch) can't poison the cache.
+    //
+    // A3-F15 hardening: `-c protocol.ext.allow=never` blocks the `ext::` transport (arbitrary command
+    // execution via a crafted "URL") and `-c protocol.file.allow=user` keeps `file://` limited to the
+    // invoking user's own privilege (no cross-user local-clone tricks); `--` before the URL stops a
+    // URL string that starts with `-` from ever being parsed as a `git clone` OPTION even if isGitUrl's
+    // own leading-dash guard were ever bypassed or loosened — belt-and-suspenders, not the only gate.
+    fs::remove_all( fs::path( cacheDir ), ec );
+    const std::string cmd = rw::gitCmd( " -c protocol.ext.allow=never -c protocol.file.allow=user -c core.quotepath=false "
+                                         "clone --depth=1 -q -- " ) + rw::shSingleQuote( urlOrPath )
+                          + " " + rw::shSingleQuote( cacheDir ) + " 2>&1";
+    rw::emitTo( stderr, "codecortex: cloning {} → {}\n", urlOrPath.c_str(), cacheDir.c_str() );
+    std::FILE* pipe = rw::os::popen( cmd.c_str(), "r" );
+    if( !pipe )
+    {
+        rw::emitRaw( stderr, "codecortex: could not launch git clone (is git on PATH?)\n" );
+        return { std::string(), false };
+    }
+    char line[ 4096 ];
+    while( std::fgets( line, sizeof( line ), pipe ) )
+    {
+        rw::emitTo( stderr, "  {}", rw::cstr( line ) ); // surface git's own diagnostics
+    }
+    const int rc = rw::os::pclose( pipe );
+    if( rc != 0 || !( fs::exists( fs::path( cacheDir ) / ".git", ec ) && !ec ) )
+    {
+        rw::emitTo( stderr, "codecortex: git clone failed for {}\n", urlOrPath.c_str() );
+        fs::remove_all( fs::path( cacheDir ), ec );
+        return { std::string(), false };
+    }
+    return { cacheDir, true };
+}
+
+// §P12.1 / A3-F16a: the bounded-edit-distance near-miss suggester moved to src/didyoumean.h (§B6 M8) so
+// the MCP arms can reach the SAME one — their not-found refusals used to carry no suggestion at all
+// because this code was unreachable from a header. Pulled back in under its original three names, so
+// every call site below (17 of them) is unchanged.
+using rw::boundedEditDistance;
+using rw::didYouMean;
+using rw::withDidYouMean;
+using rw::selectorNotFoundMessage;   // §B4.2: the shared file:name selector refusal (selectorrefuse.h)
+
+// ── verb-dispatch context (Phase B7.2) ───────────────────────────────────────────────────────────────
+// The shared, post-graph state every verb handler reads. Bundling it into one views-at-the-seam struct
+// keeps each handler to a single parameter; each handler rebinds only the fields it uses, so the moved
+// bodies below are byte-identical to the pre-B7.2 inline dispatch blocks in main().
+// §P4.1 — the --grep scan phases, computed AHEAD of this struct (see verbs_grep.h). Forward-declared so
+// MainDispatch can carry a pointer to them without the grep section having to precede it; nullptr is the
+// ordinary case (any run whose answering verb is not grep) and the verb then computes them inline.
+struct GrepScanPhases;
+
+// ── card A1: --edit-check=SYM --edit-payload=FILE --dry-run — WHO OWNS THE COMBINATION ────────────────
+// --edit-payload and --dry-run were each spoken for: the first by the three CLI write verbs, the second by
+// --edit-plan. Both of those handlers dispatch BEFORE the ingest pipeline, so without this predicate the
+// preview never reaches --edit-check at all — it lands on "--edit-payload requires one of
+// --replace-symbol-body…", a refusal that is true of yesterday's flag table and useless about what was typed.
+// One predicate, read by all three handlers, so the ownership is stated once.
+bool editPreviewRequested( const rw::Config& c ) noexcept
+{
+    return !c.editCheckSym.empty() && !c.editPayload.empty() && c.editPlanDryRun && !c.editPlanApply;
+}
+
+// the half-typed forms, refused where the caller can still see which flag is missing. Returns nullopt for
+// every combination that is somebody else's business (including the complete preview, which the ordinary
+// --edit-check handler answers after the tree is parsed).
+std::optional<int> runEditPreviewGuard( const rw::Config& c )
+{
+    if( c.editCheckSym.empty() || !c.editPlan.empty() )
+    {
+        return std::nullopt;
+    }
+    if( !c.editPayload.empty() && c.editPlanApply )
+    {
+        rw::emitTo( stderr, "codecortex: --edit-check --edit-payload is a PREVIEW and never writes — pass --dry-run, or apply the "
+                              "payload with --replace-symbol-body={} --edit-payload={}\n", std::string_view( c.editCheckSym.data(), c.editCheckSym.size() ), std::string_view( c.editPayload.data(), c.editPayload.size() ) );
+        return 1;
+    }
+    if( !c.editPayload.empty() && !c.editPlanDryRun )
+    {
+        rw::emitRaw( stderr, "codecortex: --edit-check --edit-payload previews an unwritten payload and requires --dry-run "
+                              "(add --dry-run to preview; use --replace-symbol-body to actually write it)\n" );
+        return 1;
+    }
+    if( c.editPayload.empty() && c.editPlanDryRun )
+    {
+        rw::emitRaw( stderr, "codecortex: --edit-check --dry-run needs the bytes to preview — pass --edit-payload=FILE "
+                              "(or --edit-payload=- for stdin)\n" );
+        return 1;
+    }
+    return std::nullopt;
+}
+
+struct MainDispatch
+{
+    const rw::Config&                     cfg;
+    const rw::IngestResult&               ing;
+    const rw::Graph&                      g;
+    const std::string&                     root;
+    bool                                   multiRoot;
+    const std::vector<rw::WorkspaceRoot>& ws;
+    const std::vector<std::uint32_t>&      fanIn;
+    const std::vector<std::uint32_t>*      fanInPtr;
+    const rw::QMetrics&                   qmetrics;
+    const std::vector<std::uint32_t>*      ampPtr;
+    const std::vector<std::uint32_t>*      cboPtr;
+    const std::vector<std::uint8_t>*       testedPtr;
+    const std::vector<std::uint32_t>*      lcom4Ptr;
+    const std::vector<char>*               impurePtr;
+    std::vector<std::uint32_t>&            forChurn;
+    rw::RedactCounts&                     redactCounts;
+    rw::RedactCounts*                     redactPtr;
+    const rw::notes::NoteIndex*           notesPtr;   // L3: field-notes surfacing index (nullptr ⇒ inert: no/empty file, or multi-root)
+    bool                                   notesDegraded = false;   // L3 follow-up (CodeRabbit 4053600616): the sidecar
+                                                                     //   read left something out this run — set once,
+                                                                     //   beside notesPtr, before notesPtr is nulled for
+                                                                     //   emptiness (so a fully-degraded, zero-note read
+                                                                     //   still reaches the map/--expand <ctx>/<r> roots)
+    const GrepScanPhases*                 grepPhases = nullptr;   // §P4.1: prefetched grep scan (nullptr ⇒ compute inline)
+    bool                                   valueUses  = false;     // card A1: the captureValueUses this run's ingest actually used, so the
+                                                                    //   pre-apply preview re-parses its one spliced file the SAME way
+};
+
+}   // namespace — part 1: the shared preamble helpers + the verb-dispatch context
+
+// ── the verb-family sections (2026-08-29 split) ──────────────────────────────────────────────────────
+// Each verbs_*.h below is a SECTION of this translation unit, not a library header: it reopens the
+// unnamed namespace above (one TU, one unnamed namespace), sees every #include and preamble helper
+// defined so far, and is included exactly once, right here. CODECORTEX_MAIN_TU is the enforcement: any
+// other includer is a compile error. Order matters — a later section may call an earlier one (the
+// change family calls the for family's computeLensRanking; everything may call the promoted domain
+// helpers re-exported at the top of this file).
+#define CODECORTEX_MAIN_TU 1
+#include "verbs_doctor.h"
+#include "verbs_lint.h"
+#include "verbs_for.h"
+#include "verbs_navigate.h"
+#include "verbs_quality.h"
+#include "verbs_change.h"
+#include "verbs_report.h"
+#include "verbs_grep.h"
+#include "lsp.h"                 // the --lsp navigation-server section (Phase 1 PoC — docs/LSP.md); after the verb families so it can reuse the shared use-site scan
+
+// ── LANGUAGE-REGISTRATION COMPLETENESS, at compile time ──────────────────────────────────────────────────────────
+// Appending a Lang is not one table. 02f798e3 left Dart out of kUnanalyzedLangs, kCatalogLangs and langFromToken's map;
+// 9418e35e found five languages the unanalyzed disclosure never named; PR #233 nearly shipped without its `.gd`
+// langOfPath row. Each stayed one language short because nothing but a gate run on the right fixture could notice.
+// This is the one translation unit that includes every one of those tables, so the checks live here. Each returns the
+// FIRST Lang index that is wrong and kLangCount when clean, so the compiler's note names the language
+// ("'21 == 23'" is Dart). A value a zero-filled row can also produce, such as an empty string, would pass the defect.
+// model.h's isCodeLang is the one declared exemption: a data or document format joins none of these tables.
+// ingest_crawl.h holds the sibling check for langOfPath's extension table, which needs kLangTable.
+namespace rw::langreg
+{
+// every code language is either analysed by --nonlocal-state or named by it as unanalysed, never both and never neither
+constexpr std::size_t firstLangNonlocalMisclassifies() noexcept
+{
+    for( std::size_t index = 0; index < kLangCount; ++index )
+    {
+        const Lang lang         = Lang( index );
+        const bool isAnalyzed   = std::ranges::find( nonlocal::kAnalyzedLangs, lang ) != nonlocal::kAnalyzedLangs.end();
+        const bool isUnanalyzed = std::ranges::find( nonlocal::kUnanalyzedLangs, lang, &nonlocal::UnanalyzedLang::lang ) != nonlocal::kUnanalyzedLangs.end();
+        if( isCodeLang( lang ) ? isAnalyzed == isUnanalyzed : ( isAnalyzed || isUnanalyzed ) )
+        {
+            return index;
+        }
+    }
+    return kLangCount;
+}
+
+// every code language is spellable in a rule's `language:`, carried by the lint catalog and reachable by langOfPath;
+// a data or document format is in none of the three
+constexpr std::size_t firstLangLintCannotName() noexcept
+{
+    for( std::size_t index = 0; index < kLangCount; ++index )
+    {
+        const Lang lang      = Lang( index );
+        const bool hasToken  = std::ranges::find( kLangTokenRows, lang, &LangTokenRow::lang ) != std::end( kLangTokenRows );
+        const bool isCatalog = std::ranges::find( lintcatalog::kCatalogLangs, lang ) != lintcatalog::kCatalogLangs.end();
+        const bool hasExt    = std::ranges::find( kLintExtRows, lang, &LintExtRow::lang ) != std::end( kLintExtRows );
+        if( isCodeLang( lang ) ? !( hasToken && isCatalog && hasExt ) : ( hasToken || isCatalog || hasExt ) )
+        {
+            return index;
+        }
+    }
+    return kLangCount;
+}
+} // namespace rw::langreg
+
+static_assert( rw::langreg::firstLangNonlocalMisclassifies() == rw::kLangCount,
+               "a code Lang is in neither (or both) of nonlocal::kAnalyzedLangs / kUnanalyzedLangs, or a data Lang is in one — "
+               "--nonlocal-state's unanalyzed_langs= disclosure would be silent about it" );
+static_assert( rw::langreg::firstLangLintCannotName() == rw::kLangCount,
+               "a code Lang is missing from lintrules.h kLangTokenRows, lintcatalog::kCatalogLangs or lintrules.h kLintExtRows "
+               "(or a data Lang is in one)" );
+static_assert( std::string_view( rw::langTag( rw::Lang( rw::kLangCount ) ) ) == "?",
+               "an enumerator was appended after the one kLangCount names — move kLangCount to the new last enumerator" );
+
+// L1: defined with the compact-legend layer below; the --token-budget gate prices a compact-posture map with it.
+static std::string_view compactLegendHint( const rw::Config& c, std::string_view doc );
+
+namespace
+{
+
+
+std::optional<int> runEvalViews( const MainDispatch& d )
+{
+    using namespace rw;
+    const Config&                     cfg          = d.cfg;
+    const IngestResult&               ing          = d.ing;
+    const Graph&                      g            = d.g;
+    const std::string&                root         = d.root;
+
+    // --eval: deterministic self-eval (co-change recovery vs a BM25 baseline) — does the structural
+    // ranking surface the rest of a change's files better than lexical? Needs a git repo with changes.
+    if( cfg.eval )
+    {
+        std::vector<char> changed( ing.files.size(), 0 );
+        gitChangedFiles( root, ing, changed );          // current diff = the n=1 fallback; history is primary
+        return runEval( root, ing, g, changed );
+    }
+
+    // --eval-retrieval: KNOWN-ITEM retrieval eval — validates query-TIME ranker choice (name-exact / routing /
+    // anchoring) that the seed-based --eval structurally cannot measure. No git history needed (the gold item
+    // is in the corpus by construction), so it runs on any parsed tree. Deterministic.
+    if( cfg.evalRetrieval )
+    {
+        return runEvalRetrieval( ing, g );
+    }
+
+    // --eval-mined=FILE: session-trace-mined retrieval eval — consumes a
+    // bench/mine_traces.py minedpair.jsonl artifact, file-level gold, reuses recallAtK/rankFiles.
+    if( !cfg.evalMined.empty() )
+    {
+        return runEvalMined( root, ing, g, std::string( cfg.evalMined ) );
+    }
+
+    // --eval-skills=FILE: labelled skill-ROUTING eval — ROOT is the skills
+    // directory; FILE is the prompt→permitted-skill(s) corpus. Runs the shipping --for computation over
+    // the skills ingest as one arm, so it dispatches here where ing+g are already built. Deterministic.
+    if( !cfg.evalSkills.empty() )
+    {
+        return runEvalSkills( root, ing, g, std::string( cfg.evalSkills ) );
+    }
+    return std::nullopt;
+}
+
+
+// ── H1 (capture-audit 2026-09-04) — A NOTE TARGET IS A SELECTOR ───────────────────────────────────────
+//
+// THE DEFECT. `--note-add="lessByScoreDescId: …"` — the bare-name spelling the documented agent protocol
+// teaches, and 4 of 4 real --note-add calls in the routing log — stored the target VERBATIM, while the
+// surfacing index keys on the canonical id (serialize.h::symbolNoteTarget = canonicalIdRelTo). So the row
+// landed `dangling="1"` and rode on nothing: --for and --expand of that very symbol emitted no <note>
+// child. The write returned 0 and said nothing. A write-side memory that silently stores dead entries is
+// worse than no memory, because the agent believes it recorded the gotcha.
+//
+// THE FIX. The write side resolves through resolveAllByNameQualified — the SAME resolver --expand /
+// --callers / --uses / --impact / --edit-check resolve with, so every spelling those verbs accept (bare
+// name, file:name, Scope::name, canonical id, @FILE:LINE) keys the identical note. Unique ⇒ store the
+// canonical id and SAY SO (a silent rewrite of a caller's input is the other half of the same dishonesty);
+// N>1 ⇒ refuse naming every candidate, the posture --slice/--edit-check/the edit verbs already take over
+// this resolver ("an ambiguous selector is refused, never silently narrowed"); zero ⇒ a PATH-shaped target
+// still writes (a note on a file that does not exist yet is legal) with a loud dangling warning when it
+// matches no indexed file, and a NAME-shaped one is refused with the read verbs' own did-you-mean.
+//
+// Lifted out of runNotes rather than inlined into it: the handler was already at the verbosity bar, and
+// this is one decision with one output, which is what a function is. Gated by test/notecanoncheck.sh.
+struct NoteTargetResolution
+{
+    std::string target;             // what to STORE — the canonical id when the selector resolved
+    bool        refused = false;    // the refusal is already on stderr; the caller exits 1
+};
+
+// The UNIQUE-definition arm of resolveNoteAddTarget: store the canonical id and SAY SO when it differs from what was
+// typed. Lifted out when H1's residue line joined it, because the handler already sat at the verbosity bar.
+//
+// H1 — the decl→def residue, on the one surface this verb has: its stderr. `unprovenDefs` is what the resolver dropped
+// for a file:name target — same-named definitions it could not tie to the file it named — and `consequence` says what
+// that means for THIS outcome: a note stored on the declaration, or a refusal that stored nothing. One line for both, so
+// the count and the remedy cannot drift apart between them; nothing is printed at zero.
+void emitNoteAddUnprovenDefs( std::size_t unprovenDefs, const char* consequence )
+{
+    if( unprovenDefs == 0 )
+    {
+        return;
+    }
+    rw::emitTo( stderr, "codecortex: --note-add: unproven_defs={} — the target also matched {} same-named definition(s) it could not tie to "
+                          "the file it named; {}. Widen the target to the bare NAME, or to Scope::name, to see them\n",
+                unprovenDefs, unprovenDefs, consequence );
+}
+
+// The one definition left is the declaration: the note keys it, and it will not surface on the dropped definitions.
+NoteTargetResolution noteTargetForDefinition( const MainDispatch& d, rw::NodeId def, const std::string& rawTarget,
+                                              const std::string& normalized, std::size_t unprovenDefs )
+{
+    using namespace rw;
+    const IngestResult& ing = d.ing;
+    const Symbol&       s   = ing.symbols[ def ];
+    // EXACTLY the key --notes' liveness set and serialize.h's surfacing lookup build (canonicalIdRelTo),
+    // spelled from the same three fields, so "stored" and "found" can never be two different strings.
+    const std::string canon = canonicalId( relForHash( ing.files[ s.fileId ], d.root ), s.scope, s.name );
+    if( canon != normalized )
+    {
+        rw::emitTo( stderr, "codecortex: --note-add: target '{}' canonicalised to '{}' — that is the id --for/--expand key notes by\n",
+                      rawTarget.c_str(), canon.c_str() );
+    }
+    emitNoteAddUnprovenDefs( unprovenDefs, "the note keys the declaration above and will not surface on them" );
+    return { canon, false };
+}
+
+NoteTargetResolution resolveNoteAddTarget( const MainDispatch& d, const std::string& rawTarget, std::string normalized )
+{
+    using namespace rw;
+    const IngestResult& ing = d.ing;
+
+    std::size_t               naUnprovenDefs = 0;   // H1: the residue both outcomes below disclose
+    const std::vector<NodeId> defs           = resolveAllByNameQualified( ing, rawTarget, &naUnprovenDefs );
+
+    if( defs.size() == 1 )
+    {
+        return noteTargetForDefinition( d, defs[0], rawTarget, normalized, naUnprovenDefs );
+    }
+
+    if( defs.size() > 1 )
+    {
+        // H1 on the REFUSAL: the candidates it lists are the definitions the resolver could PROVE, so a caller who retypes
+        // one of them never learns the dropped ones exist. Said first, and worded for a path that stores nothing
+        // (decltodefcheck E2y2).
+        emitNoteAddUnprovenDefs( naUnprovenDefs, "they are not among the definitions listed below, and no note was stored" );
+        const std::vector<EditCheckGroup> groups = editCheckGroups( ing, d.g, defs );
+        std::string msg = "codecortex: --note-add: target '" + rawTarget + "' is ambiguous — it matches "
+                        + std::to_string( defs.size() ) + " definitions in " + std::to_string( groups.size() )
+                        + " distinct contracts, and a note keys ONE canonical id (it would surface on one of them and "
+                          "look absent on the rest). Qualify one: ";
+        const std::size_t shownCount = std::min( groups.size(), rw::kEditCheckSpellingsShown );
+        for( std::size_t groupIndex = 0; groupIndex < shownCount; ++groupIndex )
+        {
+            msg += ( groupIndex ? ", " : "" ) + groups[ groupIndex ].spelling;
+        }
+        if( groups.size() > shownCount )
+        {
+            msg += " (+" + std::to_string( groups.size() - shownCount ) + " more contracts)";
+        }
+        msg += " — e.g. --note-add=\"" + groups[0].spelling + ": <your note>\"";
+        rw::emitTo( stderr, "{}\n", msg.c_str() );
+        return { std::string{}, true };
+    }
+
+    // ── resolved NOTHING ────────────────────────────────────────────────────────────────────────────────
+    const bool onDisk = [ & ]
+    {
+        rw::os::stat_t st{};
+        const std::string abs = normalized.empty() || normalized.front() == '/' ? normalized : d.root + "/" + normalized;
+        return rw::os::stat( abs.c_str(), &st ) == 0;
+    }();
+    if( !notes::noteTargetIsPathShaped( normalized ) && !onDisk )
+    {
+        rw::emitTo( stderr, "{}\n",
+                      ( selectorNotFoundMessage( ing, "codecortex: --note-add: target not found: ", rawTarget, "--note-add=" )
+                        + " — a note keys the canonical id a read verb resolves; to note a FILE instead, pass a path "
+                          "(one with a '/' or an extension), which may name a file that does not exist yet" ).c_str() );
+        return { std::string{}, true };
+    }
+
+    const bool indexedFile = std::any_of( ing.files.begin(), ing.files.end(),
+                                          [ & ]( const std::string& p ) { return relForHash( p, d.root ) == normalized; } );
+    if( !indexedFile )
+    {
+        // LOUD, but not a refusal: a forward-looking note on a file about to be created is the case this
+        // path exists for. The honesty is in saying, at write time, exactly what --notes will report later.
+        rw::emitTo( stderr, "codecortex: --note-add: WARNING: target '{}' matches no indexed file or symbol — the note is stored DANGLING\n"
+                              "  (--notes lists it, nothing surfaces it) until that path is indexed; run --notes to prune it if it was a typo\n",
+                      normalized.c_str() );
+    }
+    return { std::move( normalized ), false };
+}
+
+
+// L3 — repo field notes: the WRITE side (surfacing at retrieval is wired into
+// packSignatures/packBodies above). Two verbs share this handler:
+//   --note-add="TARGET: text" — append a note to the committed, sorted root/.codecortex_notes and print the exact
+//        written line. The date is git's committer clock (HEAD, %cs), NOT wall time, so the line is a pure
+//        function of (commit state, target, text) — deterministic and stable across machines; a non-git root
+//        degrades to the fixed epoch 1970-01-01 + a DISCLOSE (nothing to date against). MUTATES one
+//        file and touches nothing else; the multi-root refusal lives with its siblings earlier in main().
+//   --notes — list every note grouped by target; a target matching no indexed symbol canonical-id / file path
+//        is flagged dangling="1" (legal — surfaced nowhere, listed here so the human can prune it). Read-only.
+std::optional<int> runNotes( const MainDispatch& d )
+{
+    using namespace rw;
+    const Config&       cfg = d.cfg;
+    const IngestResult& ing = d.ing;
+
+    // ── --note-add: split "TARGET: text" on the FIRST ": " (a canonical id's "::" pairs carry no space, so
+    //    they never false-match), sanitize both fields to the single-line/tab-free format invariant, then
+    //    append+re-sort+write and print the written line verbatim. ────────────────────────────────────────
+    if( cfg.noteAddFlag )
+    {
+        const std::string spec( cfg.noteAdd );
+        const std::size_t sep = spec.find( ": " );
+        if( sep == std::string::npos )
+        {
+            rw::emitTo( stderr, "codecortex: --note-add: want \"TARGET: text\" (a canonical id path::scope::name or a file path, then ': ', then the note) — got '{}'\n", spec.c_str() );
+            return 1;
+        }
+        // §S3 — sanitizeNoteField sanitizes AND decides (notes.h's header has the full finding): the old
+        // `sanitizeField(...).empty()` pair refused an ASCII-blank note and accepted six other blank classes,
+        // committing an invisible line into `.codecortex_notes`. `hasContent` is rw::hasVisibleContent, the same
+        // derived predicate the MCP edit verbs' payload check reads.
+        const notes::NoteField targetField = notes::sanitizeNoteField( std::string_view( spec ).substr( 0, sep ) );
+        const notes::NoteField textField   = notes::sanitizeNoteField( std::string_view( spec ).substr( sep + 2 ) );
+        const std::string&     rawTarget   = targetField.text;
+        const std::string&     text        = textField.text;
+        if( !targetField.hasContent || !textField.hasContent )
+        {
+            // §S3 — the refusal SPELLS an invisible value instead of echoing it, for blankPayloadSpelling's
+            // own reason: echoing the bytes pastes a C1 control or a bidi override into the caller's terminal,
+            // and `U+200E` is something they can grep for while the character itself is not. An EMPTY field
+            // has nothing to spell, so it keeps the original sentence byte-for-byte — a caller who typed
+            // `--note-add="alpha: "` sees exactly what they saw before.
+            // blankPayloadSpelling's contract is "call me on a payload you have ALREADY ruled all-blank" —
+            // on any other value it spells every code point in it, which would render a perfectly good
+            // target as `U+0061 U+006C …`. So the three cases are separated here rather than inferred from
+            // an empty spelling: a field that HAS content and the field that is genuinely absent both keep
+            // the original quoted echo, and only the present-but-invisible one is spelled.
+            const auto describeField = []( const notes::NoteField& field ) -> std::string
+            {
+                if( field.hasContent || field.text.empty() )
+                {
+                    return "'" + field.text + "'";
+                }
+
+                const auto [ blankCodePointCount, blankSpelling ] = rw::blankPayloadSpelling( field.text );
+                return std::to_string( blankCodePointCount )
+                     + ( blankCodePointCount == 1 ? " invisible code point: " : " invisible code points: " )
+                     + blankSpelling;
+            };
+            rw::emitTo( stderr, "codecortex: --note-add: both a target and a note text are required (got target={} text={})\n",
+                          describeField( targetField ).c_str(), describeField( textField ).c_str() );
+            return 1;
+        }
+        // R6: a gentle stderr NUDGE (never a refusal — the add proceeds either way) when the text carries
+        // no causal/decision marker. Decision-shaped notes retrieve better than plain prose; this is advice
+        // on the text itself, so it prints regardless of what the target-normalization step below decides.
+        // stderr only — never stdout, so it can never contaminate --note-add's printed line or a later
+        // --for/--expand/default-map XML emission (notescheck.sh's det-gate covers this).
+        if( !notes::isDecisionShaped( text ) )
+        {
+            rw::emitRaw( stderr, "codecortex: --note-add: tip: notes that say \"chose X over Y because Z\" surface better — consider adding the why\n" );
+        }
+        // D5: canonicalize the target's path component to ROOT-RELATIVE before it ever touches disk — the
+        // portable-notes contract (.codecortex_notes is committed and must resolve on any other checkout). An
+        // absolute target outside this root can never be reached from another checkout's crawl, so refuse
+        // loudly instead of silently writing a note that surfaces nowhere, ever.
+        bool outsideRoot = false;
+        std::string normalizedTarget = notes::normalizeNoteTarget( rawTarget, d.root, outsideRoot );
+        if( outsideRoot )
+        {
+            rw::emitTo( stderr, "codecortex: --note-add: target '{}' resolves outside the root '{}' — refusing (notes must stay root-relative/portable)\n", rawTarget.c_str(), d.root.c_str() );
+            return 1;
+        }
+        // H1: the target is a SELECTOR — resolve it the way every read verb does before anything is stored.
+        const NoteTargetResolution resolved = resolveNoteAddTarget( d, rawTarget, std::move( normalizedTarget ) );
+        if( resolved.refused )
+        {
+            return 1;
+        }
+        const std::string& target = resolved.target;
+        std::string date = rw::quality::gitCommitterDateIso( d.root );
+        if( date.empty() )
+        {
+            // 2026-09-06 stranger audit: this used to store 1970-01-01 — an epoch nobody explained, read as a
+            // real date by every consumer. "undated" is the honest value: there is no committer date to anchor to.
+            DISCLOSE( "notes: non-git root — the note is stored undated" );
+            date = "undated";
+            rw::emitTo( stderr, "codecortex: --note-add: {} is not a git checkout — the note is stored undated (d=\"undated\"; a git checkout stamps the committer date)\n", d.root.c_str() );
+        }
+        // provenance stamp (the day's costliest lesson): anchor the note to the commit it was written under.
+        // gitHeadSha resolves empty exactly when date's own gitCommitterDateIso lookup would have (same
+        // non-git-root / no-HEAD condition, already alerted above) — no second DISCLOSE needed.
+        // "no sha shown rather than a wrong one": an empty sha here means addNote writes the plain LEGACY
+        // 3-field line, never a hollow or guessed stamp.
+        const std::string sha    = rw::quality::gitHeadSha( d.root );
+        const std::string branch = sha.empty() ? std::string()
+                                  : notes::sanitizeField( rw::quality::gitOneLine( d.root, "rev-parse --abbrev-ref HEAD 2>/dev/null" ) );
+        const std::string path = notes::notesPath( d.root );
+        notes::NotesReadStats noteStats;
+        const std::string     line = notes::addNote( path, noteStats, target, date, text, sha, branch );
+        if( noteStats.linesSkipped != 0 )
+        {
+            rw::emitTo( stderr, "codecortex: --note-add: {} holds {} line(s) that are not <target>\\t<date>\\t<text> — refusing to rewrite it, "
+                                "which would delete them (fix or remove those lines first; --notes counts them as lines_skipped=)\n",
+                        path.c_str(), noteStats.linesSkipped );
+            return 1;
+        }
+        if( line.empty() )
+        {
+            rw::emitTo( stderr, "codecortex: --note-add: could not write {}\n", path.c_str() );
+            return 1;
+        }
+        std::fwrite( line.data(), 1, line.size(), stdout );
+        std::fputc( '\n', stdout );
+        return 0;
+    }
+
+    // ── --notes: list grouped by target, dangling targets flagged. ─────────────────────────────────────────
+    if( cfg.notesList )
+    {
+        // D5: read + normalize every stored target to ROOT-RELATIVE (readNotesRelative) — a legacy absolute
+        // entry from before this fix keeps matching correctly instead of always reading dangling="1".
+        notes::NotesReadStats    noteStats;
+        std::vector<notes::Note> all = notes::readNotesRelative( notes::notesPath( d.root ), d.root, noteStats );
+        notes::sortNotes( all );
+
+        // the set of LIVE targets in the indexed tree: every symbol's canonical id + every file path, BOTH
+        // relativized against d.root (relForHash) to match the root-relative `all` targets above.
+        HashMap<std::string, std::uint8_t> live;
+        live.reserve( ing.symbols.size() + ing.files.size() );
+        for( NodeId i = 0; i < ing.symbols.size(); ++i )
+        {
+            const Symbol& s = ing.symbols[i];
+            if( s.fileId < ing.files.size() )
+            {
+                live[canonicalId( relForHash( ing.files[s.fileId], d.root ), s.scope, s.name )] = 1;
+            }
+        }
+        for( const std::string& fp : ing.files )
+        {
+            live[std::string( relForHash( fp, d.root ) )] = 1;
+        }
+
+        std::size_t targetCount = 0, danglingCount = 0;
+        for( std::size_t i = 0; i < all.size(); )
+        {
+            std::size_t j = i;
+            while( j < all.size() && all[j].target == all[i].target )
+            {
+                ++j;
+            }
+            ++targetCount;
+            if( live.find( all[i].target ) == live.end() )
+            {
+                ++danglingCount;
+            }
+            i = j;
+        }
+
+        {
+            XmlWriter        w( stdout );
+            std::vector<char> esc;
+            // The note-row attribute definitions live HERE because this header is the --notes reader's ONLY
+            // legend (legendcoveragecheck arm A): d= ISO date, sha=/branch= the provenance stamp, whose
+            // omitted-not-empty contract is appendOneNote's (serialize.h). NB: no `--` inside an XML comment.
+            char hdr[ 512 ];
+            rw::formatTo( hdr, sizeof( hdr ),
+                           "<ctx><!-- codecortex field notes: notes={} targets={} dangling={} (a target with no matching indexed symbol/file — legal: listed here, surfaced nowhere)."
+                           " Each note row: d= is the ISO date it was recorded (\"undated\" when the root was not a git checkout at record time); sha= the abbreviated commit and branch= the branch checked out at record time,"
+                           " both omitted entirely on a note stored before provenance stamping (absent means none recorded, never empty) -->",
+                           all.size(), targetCount, danglingCount );
+            w.write( hdr );
+            // The read's own shortfall, on <notes> itself and ONLY when there is one (a clean sidecar's bytes are
+            // unchanged), each carrying its definition in the same write so the attribute is never undefined where met.
+            if( noteStats.symlinkRefused )
+            {
+                w.write( "<!-- refused=\"symlink\": the sidecar at the notes name is a SYMLINK, refused unopened, so no note was read (not the same answer as no sidecar) -->"
+                         "<notes refused=\"symlink\">" );
+            }
+            else if( noteStats.linesSkipped != 0 )
+            {
+                w.write( "<!-- lines_skipped= counts sidecar lines that are not <target>TAB<date>TAB<text> (or have an empty target): on disk, "
+                         "absent below and from notes=; note-add refuses to rewrite the sidecar while any remain -->" );
+                w.write( "<notes lines_skipped=\"" + std::to_string( noteStats.linesSkipped ) + "\">" );
+            }
+            else
+            {
+                w.write( "<notes>" );
+            }
+            for( std::size_t i = 0; i < all.size(); )
+            {
+                std::size_t j = i;
+                while( j < all.size() && all[j].target == all[i].target )
+                {
+                    ++j;
+                }
+                const bool dangling = ( live.find( all[i].target ) == live.end() );
+                w.write( "<target id=\"" );  w.write( escapeXml( all[i].target, esc ) );
+                w.write( dangling ? "\" dangling=\"1\">" : "\" dangling=\"0\">" );
+                for( std::size_t k = i; k < j; ++k )
+                {
+                    appendOneNote( w, all[k], esc );
+                }
+                w.write( "</target>" );
+                i = j;
+            }
+            w.write( "</notes></ctx>" );
+        }
+        std::fputc( '\n', stdout );
+        return 0;
+    }
+
+    return std::nullopt;
+}
+
+
+// §P6.8: when --token-budget is set, the map body must be MEASURED before any byte of it reaches the real
+// stdout — the whole reason a caller sets a budget is to keep an oversized artifact out of a CI log, and
+// streaming it anyway (even behind a non-zero exit) defeats that; a CI log then holds the exact artifact
+// the gate just rejected. Mirrors --recall's own fix for the identical class (src/recall.h's
+// emitRecallBudgeted: "measure, decide, then write — the order lives here, beside buildRecall, so no
+// caller can re-order it") via the SAME open_memstream technique --max-tokens' own binary search uses.
+// Lifted out of runDefaultMap (same reason as lintSymbolLevelChecks/dedupeLintFindings above it) so that
+// function stays under the complexity/verbosity bar.
+//
+// Open the buffer into `stream` (a MemoryStream the caller owns for the whole map, so an early return still closes
+// and frees it) and return what the caller should write the map body to: the buffer when budgeting, else `real`. A
+// memstream-open failure degrades to `real` directly (DISCLOSE) rather than losing the map — the budget is
+// still ASSERTED afterward by finishTokenBudgetGate, it just can no longer WITHHOLD an over-budget map on that one run
+// (the stream never opened, so finishTokenBudgetGate's write-or-withhold branch is a no-op and the content — already
+// streamed straight to `real` — is left exactly where it is).
+//
+// The buffer opens through rw::openChargeStream, the tree's one charge-buffer seam, so the fault switch that reaches every
+// other measuring buffer reaches this one too (it was the one that bypassed it).
+//
+// TokenBudgetStream is the DISCLOSE sink for both degrades. An unopened buffer means an over-budget map has ALREADY been
+// streamed, so finishTokenBudgetGate must not say it withheld it (it used to print withheld_est_tokens= on stderr beside
+// the very map it claimed to withhold); a buffer that lost a write means the map is withheld and the run exits 1.
+struct TokenBudgetStream
+{
+    enum class DisclosureWhy : std::uint8_t
+    {
+        OpenFailed,   // the map streams straight to `real`: the budget is still asserted, but nothing can be withheld
+        LostWrite,    // the buffered map is not whole: withheld, never printed short, exit 1
+    };
+    bool isUnbuffered = false;
+    bool isLost       = false;
+    void disclose( DisclosureWhy why ) noexcept
+    {
+        switch( why )
+        {
+            case DisclosureWhy::OpenFailed: isUnbuffered = true; break;
+            case DisclosureWhy::LostWrite:  isLost       = true; break;
+        }
+    }
+};
+
+inline std::FILE* openTokenBudgetBuffer( rw::MemoryStream& stream, TokenBudgetStream& sink, std::size_t tokenBudget, std::FILE* real )
+{
+    if( tokenBudget == 0 )
+    {
+        return real;
+    }
+    if( std::FILE* const buffer = rw::openChargeStream( stream ) )
+    {
+        return buffer;
+    }
+    DISCLOSE( sink, TokenBudgetStream::DisclosureWhy::OpenFailed, "openTokenBudgetBuffer: open_memstream failed — falling back to direct stdout" );
+    return real;
+}
+
+// Finish the buffer, decide against the budget, and either write the buffered body to `real` (under budget
+// — byte-identical to the unflagged run, measuring never shapes) or withhold it and print a small refusal
+// record instead (shaped as XML or JSON to match what the caller asked for), naming actual vs budget on
+// stderr. Returns 3 when over budget (the caller must return it immediately — nothing may write to `real`
+// after that), 1 when the buffer did not finish whole, std::nullopt otherwise (caller continues normally).
+//
+// THE BUFFER IS THE ANSWER HERE. Every other memstream in the tree measures a document it can still write another
+// way; this one holds the map itself, rendered once, and nothing can render it again. So a buffer that did not finish
+// whole (rw::MemoryStream::finish: a write lost inside it, or the close failed) is not printed short. The run says so
+// on stderr in every build and exits 1, the exit code main's own A4-F18 check gives a short write to stdout.
+// L1: the PRICE a compact-posture run will actually print for this body. The budget gate decides BEFORE the compact
+// layer (runWithCompactLegend) rewrites stdout, so without this it withheld a map on its FULL-dialect price — a map the
+// caller would have received inside the budget, lost to prose it was never going to be sent. The body is compacted
+// here the same way the layer will compact it and repriced by the same rule (compactlegend.h compactRepricedTokens),
+// so the number decided on is the number the root prints. A body the dialect cannot shape keeps its own price — an
+// empty one (the map streamed unbuffered) and a --json one (no posture) included.
+static std::size_t compactPostureMapPrice( const rw::Config& cfg, std::string_view body, std::size_t fullEstTokens )
+{
+    if( cfg.legend != "compact" || fullEstTokens == 0 )
+    {
+        return fullEstTokens;
+    }
+    std::string compacted( body );
+    if( rw::applyCompactDialect( compacted, compactLegendHint( cfg, compacted ) ) != rw::CompactOutcome::Rewritten )
+    {
+        return fullEstTokens;
+    }
+    return static_cast<std::size_t>( rw::compactRepricedTokens( static_cast<long long>( fullEstTokens ), body.size(), compacted.size() ) );
+}
+
+inline std::optional<int> finishTokenBudgetGate( rw::MemoryStream& stream, TokenBudgetStream& sink, std::FILE* real,
+                                                 std::size_t fullEstTokens, std::size_t tokenBudget, const rw::Config& cfg )
+{
+    const bool                  asJson     = cfg.json;
+    const bool                  isBuffered = stream.isOpen();
+    const rw::MemoryStreamBytes body       = isBuffered ? stream.finish() : rw::MemoryStreamBytes{};
+    if( isBuffered && !body.isWhole )
+    {
+        DISCLOSE( sink, TokenBudgetStream::DisclosureWhy::LostWrite, "finishTokenBudgetGate: the --token-budget buffer did not finish whole — map withheld, exit 1" );
+    }
+    if( sink.isLost )
+    {
+        rw::emitRaw( stderr, "codecortex: write error — the --token-budget buffer lost bytes; the map is withheld, not printed short\n" );
+        return 1;
+    }
+    const std::size_t mapEstTokens = compactPostureMapPrice( cfg, body.bytes, fullEstTokens );
+    if( tokenBudget > 0 && mapEstTokens > tokenBudget && sink.isUnbuffered )
+    {
+        // The map above went straight to stdout: it carries its own est_tokens=, and it was NOT withheld. Say that, and
+        // exit 3 as any over-budget run does — never the withheld_ spelling, which names a map the caller did not get.
+        rw::emitTo( stderr, "codecortex: --token-budget exceeded: est_tokens={} > budget={} — the map above was NOT withheld: its measuring buffer "
+                            "could not open, so it streamed directly\n", mapEstTokens, tokenBudget );
+        return 3;
+    }
+    if( tokenBudget > 0 && mapEstTokens > tokenBudget )
+    {
+        // §B7.8 — withheld_est_tokens=, not est_tokens=. `est_tokens` is normatively about what THIS RUN
+        // PRINTED (pageview.h's truncation vocabulary, rule 1), and on this record the run printed the record
+        // itself and nothing else: the number describes the artifact the caller did NOT receive. --recall
+        // renamed the identical semantic for exactly that reason (recall.h's emitRecallBudgeted, N3) and this
+        // sibling — inside the same round's own fix — kept the old spelling. Same vocabulary now, all three
+        // channels (XML record, JSON record, stderr), so a script can key on one name.
+        rw::emitTo( stderr, "codecortex: --token-budget exceeded: withheld_est_tokens={} > budget={}\n", mapEstTokens, tokenBudget );
+        if( isBuffered )
+        {
+            if( asJson )
+            {
+                rw::emitTo( real, "{{\"withheld_est_tokens\":{},\"budget\":{},\"withheld\":true}}", mapEstTokens, tokenBudget );
+            }
+            else
+            {
+                rw::emitTo( real, "<r withheld_est_tokens=\"{}\" budget=\"{}\" withheld=\"1\"/>", mapEstTokens, tokenBudget );
+            }
+        }
+        return 3;
+    }
+    if( isBuffered )
+    {
+        std::fwrite( body.bytes.data(), 1, body.bytes.size(), real );
+    }
+    return std::nullopt;
+}
+
+// §A9.6 — --rank-by=churn's teleport AND the window label the map has to disclose, as ONE answer. git
+// change-frequency as the PageRank teleport is a proven prior (bias importance toward where the action is);
+// no git in PATH / no history → churnTeleport returns uniform, so the whole verb degrades cleanly.
+// --since=REV|DATE scopes the window to recent churn instead of the fixed 18-month default; an
+// unresolvable value degrades to inactive → the default window, and the label says so.
+//
+// Lifted out of runDefaultMap because the ranking and its label are the same decision — which window was
+// mined — and returning only the ranking left the caller to re-derive the label from cfg. That split is
+// exactly how the churn map came to ship byte-shaped like a PageRank map for a whole release line.
+// Multi-root has no per-root --since resolution (the workspace teleport mines the default window; churn is
+// a rank prior there, not a report), so it reports the default label.
+// §B2.2: whether the window mined ANY commits is the THIRD part of the same decision, and it belongs here for
+// the same reason the label does. A window that mined nothing returns the uniform prior, so the ranking IS the
+// structural one (ranks byte-identical to --rank-by=pagerank, stderr empty before this) and the label alone
+// cannot tell the reader which of the two they are holding. So this function stamps the disclosure into the
+// window (churnWindowStamp, the machine surface) AND prints the human line, in the shape --map-diff's
+// git-unavailable degrade uses ("using uniform ranking") — one place owns "which window was mined, what to
+// call it, and saying so when it was empty". Multi-root emits no stamp at all (mapAnn is single-root), which
+// makes stderr its ONLY disclosure — another reason for the note to live on this side of the return.
+// W2-F: `pr` rides along because churn ranking IS a PageRank run — a teleport variant, not a separate
+// method — so the map it produces owes the same pr_iters= / pr_converged= disclosure a uniform one does.
+struct ChurnRanking
+{
+    std::vector<float>          rank;
+    std::string                 window;
+    rw::RankDisclosure          pr;
+    std::vector<rw::RecentFile> recent;       // F3: churn-decay, single-root only — the map's <recent> rows
+    std::size_t                 recentOf = 0; // files any mined commit touched (the of= the rows were cut from)
+    std::uint32_t               mergeBombsSkipped = 0;   // commits the >kChurnMergeBombMaxFiles rule skipped in the window (<recent merge_bombs_skipped=>)
+    // WAS HISTORY MINED — the fact, carried, not re-derived (CodeRabbit, review 5195637558). It used to be read
+    // back off the output (`recent.empty() && mergeBombsSkipped == 0` ⇒ no block), and a window whose commits
+    // touch no INDEXED file — the commit that deletes a file is the smallest such window — has zero rows AND a
+    // mined history, so it was reported as "no history was mined". Different answers must not share a document.
+    // Only the decay pass sets it: it is the pass that builds <recent>, and a plain --rank-by=churn run has no
+    // block for the fact to be about (src/prcontext.h E1: gate on the count, never on a match over the body).
+    bool                        recentAnyHistory = false;
+    // C1-b (2026-09-12): --in=DIR — ONE page of DIR's rows from the SAME mining pass (hasScoped ⇒ the block is emitted, even
+    // empty); scopedOf = DIR's files any counted commit touched (its of=); scopedOffset = the row the page started at.
+    std::vector<rw::RecentFile> scoped;
+    std::size_t                 scopedOf     = 0;
+    std::size_t                 scopedOffset = 0;
+    bool                        hasScoped    = false;
+};
+inline constexpr std::size_t kRecentRows = 40;   // F3: ~45 B a row; the file-level answer, not the file list
+
+// P0-4: the DEFAULT window label of each churn ranker, which is also the difference between them that a
+// reader has to see. Plain churn mines a bounded 18-month wall-clock window; churn-decay mines the whole
+// history and lets the half-life do the windowing, so its label says so AND names the half-life — the
+// constant is a choice, and a choice that is not in the output is not disclosed.
+inline std::string churnDecayWindowLabel( std::string_view minedSpan )
+{
+    std::string label{ minedSpan };
+    label += " half-life=";
+    label += std::to_string( int( rw::kChurnDecayHalfLifeDays ) );
+    label += "d";
+    return label;
+}
+
+// C1-b (2026-09-12): --in=DIR's page of <recent scope=> rows, from the SAME mining pass as the global block. The prefix is
+// matched on the ROOT-RELATIVE spelling the map prints (serialize.h pathRel: rootRelativeUri against the crawl root as
+// typed), so a scoped row is byte-identical to its global twin — a sub-root-relative spelling missed every held-out gold
+// (0/30 raw vs 19/30 prefixed). DIR's trailing slash is stripped the way the crawl root's is (sarif::rootPrefixOf), so
+// `db/` and `db` are one answer and one next=. The page is [--offset, --offset + max(--limit, kRecentRows)).
+// C1-b (Fable review on #212) — THE ONE COMPOSER behind both next= strings the scoped map carries.
+//
+// THE DEFECT. Both were hand-spelled as "--rank-by=churn-decay [--since=V]" and nothing else, so every flag
+// that shapes the CORPUS was dropped from the invocation the tool told the caller to paste: --exclude,
+// --no-ignore, --ignore-tests, --stable, --legend, --max-tokens, --token-budget. `--in=a --exclude=b` reported
+// total="6" and handed back a next= that yields twelve rows — a page pointer into a different corpus, which is
+// worse than no pointer at all. And the scoped next= had no LENGTH cap, while every other next= in the tool
+// returns "" past kNextAttrMaxBytes (forPageInvocation, flipimpact): a long --since plus a deep DIR plus
+// --limit/--offset sails past 120 bytes and pastes wrong.
+//
+// THE SHAPE. One function, two callers, one cap. `withIn` picks the scoped page (--in=DIR carried, at the next
+// offset) or the stub's "same run without --in".
+//
+// WHAT IT REPLAYS, and the line: the flags that decide WHICH ROWS EXIST — the CORPUS (--exclude,
+// --max-file-size, --no-ignore, --ignore-tests) and the WINDOW (--since, --limit/--offset) — and nothing else.
+// A presentation flag (--legend=compact, --max-tokens, --token-budget) changes how the same rows are rendered,
+// never which rows the page holds, so replaying it would spend the 120-byte budget on bytes that cannot make
+// the pasted page name a different answer. of= is the number this attribute is a page INTO, and of= moves only
+// with the corpus and the window.
+//
+// They are named explicitly because they are parseArgs' hand-written arms (--exclude= is repeatable;
+// --limit/--offset/--rank-by are closed-value arms) and no table row can see them; the TABLE-ROW flags cannot
+// appear at all, because inPreemptedBy refuses every one that is not a ride-along before this run reaches the
+// map. Past the cap it returns "" — a hint that pastes wrong is worse than none.
+//
+// --max-file-size WAS MISSING (CodeRabbit, review 5195637558), and one miss is the evidence that the list was
+// hand-picked rather than enumerated against the flags that can ride here: the SIZE CEILING drops files out of
+// ing.files (ingest_crawl.h, why=oversize), so a hint emitted under --max-file-size=2K named a page of a
+// corpus three files wide where the run that emitted it had two — MEASURED of="2" against of="3"
+// (recentscopecheck arm 12). So the set is now ENUMERATED, and this is the enumeration. Everything that can be
+// set beside --in is either a table row on kInRideAlong or a member the firstFlagOutside walk cannot see
+// (a vector, an int, a size_t); each one is either replayed above or listed here with the reason it is not:
+//   --exclude / --max-file-size / --no-ignore / --ignore-tests  REPLAYED: each one decides which files the
+//       crawl indexes, and <recent>'s rows are indexed files.
+//   --since / --limit / --offset                                REPLAYED: the window and the page itself.
+//   --cache= / --no-cache    NOT corpus: the blob is keyed on realpath(root) + the lean/rich class and stores
+//       per-FILE parse records (ingest_cache.h v15); the CRAWL decides membership, and a subset run reads only
+//       its own records. Warm and cold index the same files.
+//   --refetch                NOT replayed, and deliberately the other way round: it re-clones a git-URL root,
+//       so replaying it could fetch a NEWER tree — omitting it is what keeps the page on the corpus this run
+//       cloned.
+//   --scip=                  NOT corpus: a precision overlay on call EDGES (prov="scip"); it adds and removes
+//       no file, and <recent> is a file-level answer.
+//   --max-tokens / --token-budget   NOT corpus: the first shapes the ranked map (which --in has already
+//       stubbed) and the second only asserts a ceiling; neither can move of=.
+//   --legend / --stable / --no-stable / --order aliases / --route / --no-route / --no-post-check / --compress
+//       / --pin-census / --json   NOT corpus: presentation, ranking posture or a side file. The rows' order is
+//       decayedRecentRowsSorted's (newest commit first) whatever these say. (--json is refused beside --in.)
+//   --top-k / --pack-top-n / --expand / --outline / --export=cc.json / a second root   cannot be here at all:
+//       inPreemptedBy and validateModifierGuards refuse each one before the map is built.
+inline std::string scopedMapNextInvocation( const rw::Config& cfg, std::string_view scopeDir, bool withIn, std::size_t nextOffset )
+{
+    std::string inv = "--rank-by=churn-decay";
+    if( !cfg.since.empty() )
+    {
+        inv += " " + rw::nextFlag( "--since=", cfg.since );
+    }
+    for( const std::string& x : cfg.excludes )
+    {
+        inv += " " + rw::nextFlag( "--exclude=", x );
+    }
+    // The ceiling is replayed as the BYTE COUNT it resolved to, not as the caller's "2K": parseByteSize accepts
+    // plain digits, and the number is what shaped the crawl. Omitted at the default, so the common hint is
+    // unchanged to the byte.
+    if( cfg.maxFileBytes != rw::kDefaultMaxFileBytes )
+    {
+        inv += " --max-file-size=" + std::to_string( cfg.maxFileBytes );
+    }
+    if( cfg.noIgnore )     { inv += " --no-ignore"; }
+    if( cfg.ignoreTests )  { inv += " --ignore-tests"; }
+    if( withIn )
+    {
+        inv += " " + rw::nextFlag( "--in=", scopeDir );
+        inv += " --offset=" + std::to_string( nextOffset );
+        if( cfg.pageLimit > 0 )
+        {
+            inv += " --limit=" + std::to_string( cfg.pageLimit );
+        }
+    }
+    return inv.size() > rw::kNextAttrMaxBytes ? std::string() : inv;
+}
+
+inline void scopedRecentPage( const MainDispatch& d, const std::vector<rw::RecentFile>& sorted, ChurnRanking& cr )
+{
+    using namespace rw;
+    const std::string rootPrefix = sarif::rootPrefixOf( d.cfg.roots[0] );
+    const std::string dirPrefix  = sarif::rootPrefixOf( d.cfg.inDir ) + "/";
+    const auto        underDir   = [ & ]( std::uint32_t f ) { return sarif::rootRelativeUri( d.ing.files[f], rootPrefix ).starts_with( dirPrefix ); };
+    const std::size_t pageRows   = std::size_t( effectiveRowCap( d.cfg.pageLimit, int( kRecentRows ) ) );
+    cr.scopedOffset              = d.cfg.pageOffset > 0 ? std::size_t( d.cfg.pageOffset ) : 0;
+    // The SAME sorted list the global block was cut from — one build, one sort, one HEAD-epoch read for both pages.
+    cr.scoped                    = recentPageFromSorted( sorted, underDir, pageRows, cr.scopedOffset, &cr.scopedOf );
+    cr.hasScoped                 = true;
+}
+
+// C1-b (Fable review on #212) — THE SECOND HALF of validating --in=DIR, and the only half that can tell a
+// directory from a typo.
+//
+// inDirIsUnderRoot (below) asks the FILESYSTEM, and the filesystem answers a different question from the one
+// the block will be built from. On APFS `--in=DB` resolves to `db/` and is a directory; `--in=dblink` where
+// dblink -> db is a directory; `--exclude=tests --in=tests` is a directory the crawl was told to drop. All
+// three passed, and all three produced `<recent scope=… n="0" of="0">` — the typo-reads-as-nothing-changed
+// answer the refusal exists to prevent, in the exact shape the flag's own comment promised it would not take.
+//
+// The crawl's root-relative spellings are the ground truth, so the check is against THEM, byte-exact: at least
+// one indexed file must begin `DIR/`. A case-folded name, a symlink alias and an excluded subtree all fail it
+// for the same honest reason — nothing under that spelling is in the corpus this answer is about — and the
+// message says which three causes to look at, because they are the three that make a real directory miss.
+inline bool inDirMatchesCrawl( const rw::Config& cfg, const rw::IngestResult& ing, const std::string& rootArg )
+{
+    using namespace rw;
+    const std::string rootPrefix = sarif::rootPrefixOf( rootArg );
+    const std::string dirPrefix  = sarif::rootPrefixOf( cfg.inDir ) + "/";
+    for( const std::string& f : ing.files )
+    {
+        if( sarif::rootRelativeUri( f, rootPrefix ).starts_with( dirPrefix ) )
+        {
+            return true;
+        }
+    }
+    rw::emitTo( stderr, "codecortex: --in={}: no indexed file is under \"{}\" — the directory exists but this crawl holds nothing spelled that way, "
+                          "so a scoped block would say \"nothing changed\" for a directory it never read. Name it as the map spells it "
+                          "(case-exact, the real path and not a symlink to it, and not a subtree --exclude dropped); "
+                          "codecortex <dir> --rank-by=churn-decay lists the spellings under p=\n",
+                std::string_view( cfg.inDir.data(), cfg.inDir.size() ), std::string_view( dirPrefix.data(), dirPrefix.size() - 1 ) );
+    return false;
+}
+
+// The uniform-ranking fallback disclosure, shared by all three arms below: a churn map whose window mined
+// NOTHING is byte-identical to --rank-by=pagerank, and this stderr line is the only place that fact appears.
+// A free function rather than the capturing lambda it was, because the decay arm is its own function now
+// (churnDecayRanking) and a lambda cannot be shared across the two without being handed to it.
+// THE SCOPED RUN RANKS NOTHING, so it cannot have fallen back to a ranking (CodeRabbit, review of #212). The
+// no-evidence notice said three things that are false under --in=DIR, on a real path
+// (`--rank-by=churn-decay --in=src --since=HEAD`, a window that reads no commit): "using uniform (structural)
+// ranking" names a computation that did not run — the stub default-constructs the rank vector and zero-fills
+// it, which is why no pr_iters= rides the header; "this map" names a document the run does not contain, since
+// the map IS the counted stub and the <recent> blocks are both absent; and the comparison it offers,
+// --rank-by=pagerank, is REFUSED beside --in, so the reader was pointed at a command this tool rejects.
+// One wrong sentence, three ways, in shipped output — the disclosure rule's own subject.
+//
+// The scoped branch states what actually happened and keeps the pagerank equivalence where it IS true: on the
+// unscoped run the reader gets by dropping --in.
+inline void discloseUniformChurnFallback( bool hasChurnEvidence, bool stubbed, const char* verbLabel, const std::string& windowStamp )
+{
+    if( hasChurnEvidence )
+    {
+        return;
+    }
+    if( stubbed )
+    {
+        rw::emitTo( stderr, "codecortex: {} found no commits in its window, so NEITHER <recent> block rides this run and the symbol map is the "
+                              "counted stub — nothing was ranked at all, so there is no ranking to have fallen back (header: window=\"{}\"). "
+                              "Widen the window (--since), or drop --in=DIR for the map, which is then byte-identical to --rank-by=pagerank\n",
+                    verbLabel, windowStamp.c_str() );
+        return;
+    }
+    rw::emitTo( stderr, "codecortex: {} found no commits in its window; using uniform (structural) ranking — this map is "
+                          "byte-identical to --rank-by=pagerank (header: window=\"{}\")\n", verbLabel, windowStamp.c_str() );
+}
+
+// --rank-by=churn-decay's ARM, lifted whole out of churnRankedGraph — which is a three-way dispatcher that was
+// carrying this entire body inline. C1-b's stub branch pushed that function from ccx 18 to 24 against a bar of
+// 15, and the answer to a dispatcher growing a fourth concept is a name for the concept, not an ack: the decay
+// arm mines once and spends that one pass three ways (the teleport prior, the global <recent> page, and under
+// --in=DIR the scoped page), which is a nameable job and now has the name.
+inline ChurnRanking churnDecayRanking( const MainDispatch& d, const rw::SinceScope& sinceScope, bool isScoped, const char* verbLabel )
+{
+    using namespace rw;
+    // F3: ONE mining pass feeds both the teleport prior (churnPriorFromDecayed, exactly what churnDecayTeleport
+    // builds) and the map's file-level <recent> rows — so the file-level answer costs no second git walk.
+    const std::string       windowArgs = isScoped ? sinceLogArgs( sinceScope, "" ) : std::string{};
+    const DecayedChurnMined mined      = gitLogDecayedFileMining( d.root, d.ing, windowArgs, kChurnMergeBombMaxFiles );   // same merge-bomb cap as churnTeleport
+
+    // C1-b efficiency: under --in=DIR the symbol map is a STUB — not one ranked row is printed — so the
+    // power iteration that produces those rows' k= is work whose entire output is discarded. It is SKIPPED,
+    // and the header then carries no pr_iters=/pr_converged= because no iteration ran: an honest absence,
+    // not a number for a computation that did not happen (prconverge.h isPageRank=false). The rank vector is
+    // still SIZED (zero-filled) so every index serialize takes stays in range on a stubbed document.
+    const bool      stubbed = !d.cfg.inDir.empty();
+    rw::RankedGraph ranked  = stubbed ? rw::RankedGraph{} : rankGraphTeleport( d.g, churnPriorFromDecayed( d.ing, mined.weights, mined.anyHistory ) );
+    if( stubbed )
+    {
+        ranked.rank.assign( d.ing.symbols.size(), 0.0f );
+    }
+    std::string window = churnWindowStamp( churnDecayWindowLabel( isScoped ? std::string_view( d.cfg.since ) : std::string_view( "all-history" ) ),
+                                           mined.anyHistory );
+    discloseUniformChurnFallback( mined.anyHistory, stubbed, verbLabel, window );
+    ChurnRanking cr{ std::move( ranked.rank ), std::move( window ), { ranked.iterationCount, ranked.hasConverged, !stubbed } };
+    // ONE build + ONE sort of the decayed rows, shared by both blocks (gitmine.h decayedRecentRowsSorted).
+    const std::vector<rw::RecentFile> sorted = decayedRecentRowsSorted( d.root, d.ing, mined );
+    cr.recent            = recentPageFromSorted( sorted, []( std::uint32_t ) { return true; }, kRecentRows, 0, &cr.recentOf );
+    cr.mergeBombsSkipped = mined.mergeBombsSkipped;
+    cr.recentAnyHistory  = mined.anyHistory;   // the fact this pass learned, handed on rather than left to be guessed
+    if( stubbed )
+    {
+        scopedRecentPage( d, sorted, cr );   // C1-b: --in=DIR's page, from the same pass and the same sort
+    }
+    return cr;
+}
+
+inline ChurnRanking churnRankedGraph( const MainDispatch& d )
+{
+    using namespace rw;
+    const bool isDecay          = ( d.cfg.rankBy == RankBy::ChurnDecay );
+    const char* const verbLabel = isDecay ? "--rank-by=churn-decay" : "--rank-by=churn";
+    bool hasChurnEvidence       = false;
+
+    if( d.multiRoot )
+    {
+        std::vector<std::string> rootDirs;
+        for( const WorkspaceRoot& r : d.ws )
+        {
+            rootDirs.push_back( r.arg );
+        }
+        rw::RankedGraph    ranked = isDecay ? rankGraphTeleport( d.g, churnDecayTeleportWorkspace( rootDirs, d.ing, &hasChurnEvidence ) )
+                                            : rankGraphTeleport( d.g, churnTeleportWorkspace( rootDirs, d.ing, "18 months ago", &hasChurnEvidence ) );
+        std::string        window = churnWindowStamp( isDecay ? churnDecayWindowLabel( "all-history" ) : rw::defaultWindowLabel( d.root, "18mo" ), hasChurnEvidence );
+        // stubbed=false: the workspace (multi-root) arm cannot be scoped — --in=DIR is refused under multi-root
+        // and outside --rank-by=churn-decay — so this arm always ranked, and the uniform wording is correct here.
+        discloseUniformChurnFallback( hasChurnEvidence, false, verbLabel, window );
+        return { std::move( ranked.rank ), std::move( window ), { ranked.iterationCount, ranked.hasConverged, true } };
+    }
+
+    const SinceScope sinceScope = resolveSinceScope( d.root, d.cfg.since );
+    const bool       isScoped   = !d.cfg.since.empty() && sinceScope.active;   // the §P9 N7 rule, one verb over
+    if( isDecay )
+    {
+        return churnDecayRanking( d, sinceScope, isScoped, verbLabel );
+    }
+    rw::RankedGraph    ranked = rankGraphTeleport( d.g, churnTeleport( d.root, d.ing, "18 months ago", d.cfg.since.empty() ? nullptr : &sinceScope, &hasChurnEvidence ) );
+    // F1: the DEFAULT window's stamp names the anchor that produced it ("18mo@HEAD"); an ACTIVE --since is
+    // the user's own value and is stamped verbatim, exactly as before.
+    const std::string  defaultWindow = rw::defaultWindowLabel( d.root, "18mo" );
+    std::string        window = churnWindowStamp( isScoped ? std::string_view( d.cfg.since ) : std::string_view( defaultWindow ), hasChurnEvidence );
+    // stubbed=false: this is the undecayed --rank-by=churn arm, which --in=DIR does not ride (it is refused
+    // outside churn-decay), so a ranking really did run and the uniform sentence is the true one.
+    discloseUniformChurnFallback( hasChurnEvidence, false, verbLabel, window );
+    return { std::move( ranked.rank ), std::move( window ), { ranked.iterationCount, ranked.hasConverged, true } };
+}
+
+// ── M6 (density audit 2026-08-08): --expand cheapest-complete-answer serving, the two decisions ──────
+// Hoisted out of runDefaultMap (already this file's largest dispatcher) because both are nameable
+// concepts with pure inputs; the emission stays in runDefaultMap where the streams live.
+//
+// THE SCOPE: a bare --expand and nothing else. No explicit --top-k (the agent asked for the map, or for
+// its absence at 0 — serve exactly that), no --outline/--pack-signatures/--pack-top-n (composed payloads
+// keep the classic envelope), no --query/--adaptive/--max-tokens (all three shape the MAP, so the map is
+// wanted), no --json (it refuses --expand anyway), no range slice (SYM:START-END asks for LESS than the
+// symbol — serving the whole file would invert the ask; test/expandrangecheck.sh pins that contract),
+// and only when the §H7 pre-render succeeded — a degraded render has no measured bytes to compare.
+// D2 (audit regressions, 2026-08-08): --compress and --pack-budget-bytes are deliberately NOT in this
+// predicate — they are body-SHAPING modifiers, and shaping COMPOSES with mode selection instead of
+// disabling it: renderWholeFiles compresses the whole-file candidate, chooseExpandServe holds the
+// whole-file candidate to the same pack budget packBodies enforces on the bundle, and the reason=
+// disclosure compares the shaped candidates. Gates: compresscheck / overbudgetcommentcheck.
+// #60: …and NOT when every expanded symbol is a module-scope owner. Such a symbol is bodyless by
+// construction (its Symbol extent is empty — ingest_model.h assignSymbols), so the bundle costs almost
+// nothing and the whole file always undercuts it. Serving the file would answer a question nobody asked:
+// the module scope is the statements OUTSIDE every definition, and the file is mostly the definitions.
+// Every legend that names this kind says it has no body to expand, so the verb must not hand back one.
+inline bool expandAutoServeScope( const rw::Config& cfg, bool anyExpandRange, bool bodiesRendered, bool allModuleScope )
+{
+    return !cfg.expand.empty() && !cfg.topKExplicit && !cfg.json
+        && cfg.outline.empty() && !cfg.packSignatures && cfg.packTopN == 0
+        && cfg.query.empty() && !cfg.adaptive && cfg.maxTokens == 0
+        && !anyExpandRange && bodiesRendered && !allModuleScope;
+}
+
+// THE CHOICE: whole-file when the served file bytes undercut the measured bundle, else bundle; ties go
+// to the bundle (the richer answer at equal cost). A wf.complete=false render (a file unreadable NOW)
+// makes whole-file not a candidate, and the reason says so instead of fabricating a byte comparison.
+// D2 (audit regressions, 2026-08-08): both candidates are SHAPED before they are compared — wf.rawBytes
+// is post---compress when that flag is on (renderWholeFiles), and bundleBytes was always the shaped
+// bundle — so the disclosure never claims a comparison between two forms the caller was not offered.
+// And --pack-budget-bytes composes rather than being silently outrun: a whole file cannot be
+// budget-truncated and still be "the complete answer", so a file over the budget is NOT a candidate
+// (the bundle's packBodies enforces that same budget with its over-budget omission markers), with the
+// reason saying exactly that. The disclosure is mandatory and deterministic — every number is measured,
+// never estimated. &lt; in the reason spelling: a raw '<' is ill-formed inside an XML attribute (G4).
+struct ExpandServeChoice
+{
+    bool        serveWholeFile = false;
+    std::string ctxOpen;
+};
+
+// The whole-file serving's own legend (PR #215 review item 9), as ONE constant: the bytes CHARGED in the
+// bundle-vs-file comparison below and the bytes APPENDED to the root in runDefaultMap are the same object, so
+// the choice cannot be made on a price the document does not pay. It carries no "--": it rides inside an XML
+// comment, where a double hyphen is ill-formed (G4).
+inline constexpr std::string_view kExpandWholeFileLegend =
+    "<!-- codecortex expand (whole file): <src p=file sym=\"name:line,...\"> wraps the file's own "
+    "text; an <s n= sc= l=/> row names each requested symbol that has an enclosing scope, and "
+    "its full id composes as p::sc::n from the src row's p=. -->";
+
+// #289's ride-along `note=` FORMAT STRING, as ONE constant shared by every site that prices or prints it
+// (the §F5 top-K search, the §F5 ceiling verdict, and the actual noteBuf fill in runDefaultMap) — CodeRabbit
+// PR #292 findings 4052087920 (the search/verdict must charge these bytes, not just the bundle selector) and
+// 4052087924 (payload-neutral wording: `noteAppliesToBundle` also covers an outline-only request, which
+// emits <outline>, never <bodies>). "payload" covers --expand's <bodies> and --outline's <outline> alike
+// without naming either — the same neutral word the --top-k=0 --help text already uses for this exact
+// concept ("Use it when you want the body ... PAYLOAD-ONLY", docs/COMMANDS.md).
+inline constexpr const char* kMapRidesAlongFmt =
+    " note=\"the ranked top-{} map below rides along with the requested payload; --top-k=0 for the payload "
+    "alone (--top-k=1 for a minimal map)\"";
+
+// ── ONE PRICE FOR BOTH SERVING CANDIDATES (CodeRabbit, PR #215, second round on this comparison) ─────
+// THE DEFECT was not a missing addend, it was two counters. The bundle candidate was priced to the byte
+// (envelope, root attributes, the unproven residue, the map, the rendered <bodies>, the closing tag) by the
+// arithmetic in runDefaultMap, while the file candidate was priced HERE as `wf.rawBytes + the legend` — no
+// `<ctx>` envelope, no root attributes, no `</ctx>`, and the file's RAW bytes instead of the <src p= sym=>
+// blocks that actually carry them. Measured on an 864 B file: reason= said "file 1100B" for a document that
+// came out 1263 B, and inside that 163 B band the tool chose — and DISCLOSED — the whole-file form while the
+// bundle it rejected was the smaller document (pre-fix binary: 1262 B served under
+// reason="file 1100B &lt; bundle 1193B"). The FIRST asymmetry in this same comparison, found one review round
+// earlier, was the whole-file legend; a second occurrence of one defect class means the comparison is being
+// built by hand on each side, which is the bug to fix.
+//
+// THE RULE APPLIED is the one src/prcontext.h states verbatim above its own estimator — "ONE estimator for
+// every root, never two counters (serialize.h's standing rule)". Each candidate DESCRIBES itself as an
+// ExpandServeDocument and both are priced by priceExpandServeDocument, so the comparison is symmetric by
+// construction: a field one side fills and the other forgets is the only way to reintroduce the defect, and a
+// third candidate is priced by the same function or not priced at all.
+struct ExpandServeDocument
+{
+    std::size_t payloadBytes  = 0;     // this mode's payload AS EMITTED: the <bodies> section, or the whole file's <src> blocks
+    std::size_t mapBytes      = 0;     // the ranked map, when this mode emits one (0 when it does not)
+    std::size_t rootAttrBytes = 0;     // <ctx> attributes only this mode carries (root=, topk_default=, a payload-priced est_tokens=)
+    std::size_t legendBytes   = 0;     // legend comments only this mode emits
+    double      selfPriceRate = 0.0;   // >0: this mode prices ITSELF on its <ctx> root (est_tokens=), at this B/token rate
+    std::ptrdiff_t compactDeltaBytes = 0; // L1 fix round (rv-r1-L1 MED-7): under the compact posture, how many bytes the compact
+                                        // layer ADDS to this candidate (negative: takes out) — its prose legend out, the compact
+                                        // legend and schema= in (the whole-file legend GROWS: a longer compact legend),
+                                        // measured on the candidate itself — so the choice and the reason= figures are the
+                                        // DELIVERED sizes. 0 in the full posture: nothing moves.
+};
+
+// The whole served document, envelope included. `disclosureBytes` is the mode=/reason= attribute pair the
+// choice itself writes onto the root: it is self-referential — its digits ARE the numbers it reports — so the
+// caller solves it the way pricedRootAttr solves est_tokens, and hands the settled spelling's length back in.
+inline std::size_t priceExpandServeDocument( const ExpandServeDocument& doc, std::size_t sharedRootBytes, std::size_t disclosureBytes )
+{
+    std::size_t total = ( sizeof( "<ctx>" ) - 1 ) + sharedRootBytes + doc.rootAttrBytes + disclosureBytes
+                      + doc.legendBytes + doc.mapBytes + doc.payloadBytes + ( sizeof( "</ctx>" ) - 1 );
+    if( doc.selfPriceRate > 0.0 )
+    {
+        // …through pricedRootAttr itself, not a re-derived digit count: the attribute this charges is the one
+        // the emission path splices, from the same fixpoint over the same byte total (serialize.h).
+        std::size_t estTokens = 0;
+        total += rw::pricedRootAttr( total, doc.selfPriceRate, 0, &estTokens ).size();
+    }
+    const std::ptrdiff_t delivered = static_cast<std::ptrdiff_t>( total ) + doc.compactDeltaBytes;
+    return delivered > 0 ? static_cast<std::size_t>( delivered ) : total;
+}
+
+inline ExpandServeChoice chooseExpandServe( const ExpandServeDocument& bundleDoc, const ExpandServeDocument& fileDoc,
+                                            std::size_t sharedRootBytes, const rw::WholeFileRender& wf, std::size_t budgetBytes )
+{
+    ExpandServeChoice c;
+    char              open[ 200 ];
+    if( !wf.complete )
+    {
+        rw::formatTo( open, sizeof( open ), "<ctx mode=\"bundle\" reason=\"whole-file unavailable (file unreadable)\">" );
+        c.ctxOpen = open;
+        return c;
+    }
+    // The pack-budget ceiling is deliberately still read off wf.rawBytes: that question is about the FILE's own
+    // size against --pack-budget-bytes, not about which of two documents is cheaper to serve. No comparison is
+    // made on this path, so no price is claimed and none is charged.
+    if( wf.rawBytes > budgetBytes )
+    {
+        rw::formatTo( open, sizeof( open ), "<ctx mode=\"bundle\" reason=\"whole-file {}B over pack-budget {}B\">",
+                       wf.rawBytes, budgetBytes );
+        c.ctxOpen = open;
+        return c;
+    }
+
+    // THE FIXPOINT. Each candidate carries its own mode=/reason= pair when it wins, so each is charged its own
+    // spelling: price, spell, re-price, at most four passes — pricedRootAttr's bound, for pricedRootAttr's
+    // reason. Digit counts are the only thing that can move, so it settles on pass two on every real input;
+    // a fourth pass that still disagrees keeps the last spelling, which is the one the document receives.
+    char        fileOpen[ 200 ]   = { 0 };
+    char        bundleOpen[ 200 ] = { 0 };
+    std::size_t fileBytes = 0, bundleBytes = 0, fileDisclosure = 0, bundleDisclosure = 0;
+    for( int pass = 0; pass < 4; ++pass )
+    {
+        fileBytes   = priceExpandServeDocument( fileDoc,   sharedRootBytes, fileDisclosure );
+        bundleBytes = priceExpandServeDocument( bundleDoc, sharedRootBytes, bundleDisclosure );
+        rw::formatTo( fileOpen, sizeof( fileOpen ), "<ctx mode=\"whole-file\" reason=\"file {}B &lt; bundle {}B\">",
+                       fileBytes, bundleBytes );
+        rw::formatTo( bundleOpen, sizeof( bundleOpen ), "<ctx mode=\"bundle\" reason=\"bundle {}B &lt;= file {}B\">",
+                       bundleBytes, fileBytes );
+        // the subtraction's precondition: both spellings begin with the literal "<ctx" and end with '>', so
+        // neither can be shorter than the envelope it is measured against (formatTo always NUL-terminates).
+        ASSUME( std::strlen( fileOpen ) >= ( sizeof( "<ctx>" ) - 1 ) && std::strlen( bundleOpen ) >= ( sizeof( "<ctx>" ) - 1 ) );
+        const std::size_t nextFile   = std::strlen( fileOpen ) - ( sizeof( "<ctx>" ) - 1 );
+        const std::size_t nextBundle = std::strlen( bundleOpen ) - ( sizeof( "<ctx>" ) - 1 );
+        if( nextFile == fileDisclosure && nextBundle == bundleDisclosure )
+        {
+            break;
+        }
+        fileDisclosure   = nextFile;
+        bundleDisclosure = nextBundle;
+    }
+    // Ties still go to the bundle — the richer answer at equal cost.
+    c.serveWholeFile = fileBytes < bundleBytes;
+    c.ctxOpen        = c.serveWholeFile ? fileOpen : bundleOpen;
+    return c;
+}
+
+int runDefaultMap( const MainDispatch& d )
+{
+    using namespace rw;
+    const Config&                     cfg          = d.cfg;
+    const IngestResult&               ing          = d.ing;
+    const Graph&                      g            = d.g;
+    const std::string&                root         = d.root;
+    const bool                        multiRoot    = d.multiRoot;
+    const std::vector<WorkspaceRoot>& ws           = d.ws;
+    const std::vector<std::uint32_t>* fanInPtr     = d.fanInPtr;
+    const std::vector<std::uint32_t>* cboPtr       = d.cboPtr;
+    const std::vector<std::uint8_t>*  testedPtr    = d.testedPtr;
+    const std::vector<std::uint32_t>* lcom4Ptr     = d.lcom4Ptr;
+    const std::vector<std::uint32_t>* ampPtr       = d.ampPtr;
+    const std::vector<char>*          impurePtr    = d.impurePtr;
+    RedactCounts*                     redactPtr    = d.redactPtr;
+    RedactCounts&                     redactCounts = d.redactCounts;
+    // R-E (2026-08-17 harvest): the SAME single-root condition emitGrepReport uses, so the default map's
+    // root="…" and --grep's cannot diverge on when it appears. Multi-root already carries its own
+    // roots=/<root label=…> disclosure inside serialize() and is untouched (rootArg stays empty there).
+    const bool             mapSingleRoot = ing.realPaths.empty() && cfg.roots.size() == 1;
+    const std::string_view mapRootArg    = mapSingleRoot ? cfg.roots[0] : std::string_view();
+
+    // C1-b: the crawl-side half of --in=DIR's validation, taken as soon as the corpus exists and BEFORE any
+    // history is mined — a directory this crawl does not hold cannot be answered about, and must not be
+    // answered about with an empty block. (The filesystem half ran at root resolution; see inDirMatchesCrawl.)
+    if( !cfg.inDir.empty() && !inDirMatchesCrawl( cfg, ing, std::string( mapRootArg ) ) )
+    {
+        return 1;   // the refusal is on stderr (inDirMatchesCrawl)
+    }
+
+    std::vector<float> rank;
+    // W2-F: the map header's pr_iters= / pr_converged= (src/prconverge.h). Default-constructed is
+    // isPageRank=false — CORRECT for the arms below that run no power iteration (a lexical query score, the
+    // HITS vectors that overwrite `rank`); the PageRank arms fill it via rw::takeRank (graph.h), never apart.
+    rw::RankDisclosure rankDisclosure;
+    std::string        queryRouteNote;   // leading routed comment for --query (empty under --no-route)
+    std::size_t        mapDiffChanged = 0;      // D6: teleport-seed file count, only meaningful when mapDiffActive
+    bool               mapDiffActive  = false;  // true only under --map-diff — gates the header's changed= attribute
+    std::vector<rw::RecentFile> recentFiles;   // F3: rank-by=churn-decay's file-level <recent> rows (0 rows is an ANSWER, see recentAnyHistory)
+    std::size_t                 recentOf = 0;
+    bool                        recentAnyHistory = false;      // did the decay pass READ a commit — the fact the block's presence is gated on
+    std::uint32_t               recentMergeBombsSkipped = 0;   // <recent merge_bombs_skipped=>: the window's skipped >100-file commits
+    std::vector<rw::RecentFile> scopedRecent;                  // C1-b: --in=DIR's page of rows (hasScopedRecent ⇒ the block is emitted)
+    std::size_t                 scopedRecentOf = 0;
+    std::size_t                 scopedOffset   = 0;
+    bool                        hasScopedRecent = false;
+    std::string        churnWindowLabel = rw::defaultWindowLabel( root, "18mo" );   // §A9.6: churn's window label (F1: "@HEAD" when anchored); an ACTIVE --since overrides it below
+    if( !cfg.query.empty() )
+    {
+        // --query: PURE lexical (BM25) relevance. eval-at-scale showed fusing PageRank importance
+        // into the lexical signal HURTS relatedness (RRF(struct,lex) lost to lex on 25/35 commits) —
+        // PageRank ranks centrality, not relevance-to-a-query. So --query is lexical only.
+        // ROUTING (default on, same confidence-gated classifier as --for): name-exact when the query NAMES a
+        // symbol, else subtoken+body. --no-route forces subtoken+body (the pre-default behavior, byte-identical).
+        // The map header comes from serialize (not ours to extend), so the routed pick is a LEADING comment
+        // before the map, mirroring how --adaptive on --query surfaces its cut.
+        // §P4 tier de-prioritization — same query-independent multiplier as --for's computeLensRanking
+        // (filter.h): --query is a ranking lens too. --recall (docs lane) deliberately does NOT take this.
+        const std::vector<float> tierMul = rankTierSymbolMultipliers( ing );
+        if( !cfg.noRoute )
+        {
+            const RouteChoice rc = chooseForRanker( ing, cfg.query );
+            rank = ( rc.which == LexMode::NameExact ) ? lexicalScoresNameExactRanked( ing, cfg.query, &tierMul )
+                                                      : lexicalScoresTiered( ing, g.outOff, g.outTargets, cfg.query, 0, nullptr, &tierMul );
+            // §B4 (capture-audit-4) — the SEVENTH comment-echo site, and the only one W3FIX M3 missed. It
+            // hand-rolled the std::unique dash collapse that xmlCommentText's header names as the pattern it
+            // replaced, and scrubbed NEITHER control bytes nor invalid UTF-8 — while RouteChoice::reason
+            // embeds `identifierHit`, the user's own query token (lexical.h). So `--query=$'parseArgs\001x'`
+            // put a raw 0x01 inside an XML comment and `--query=$'parseArgs\377x'` an invalid UTF-8 byte:
+            // codecortex exited 0 and xmllint rejected the whole document, which is a G4 breach at exit 0 —
+            // the ONE real breach a control byte swept through 19 value-taking verbs found.
+            //
+            // The dash collapse is byte-identical to what stood here (both reduce a run of '-' to one), so
+            // every input that carried no control byte and no invalid sequence emits exactly the bytes it did
+            // before; the fix is purely what the hand-rolled version could not see. The wrapping <!-- / -->
+            // delimiters are still added AFTER, so they stay intact.
+            queryRouteNote = "<!-- routed: " + std::string( rw::xmlCommentText( rc.reason ) ) + " -->";
+        }
+        else
+        {
+            rank = lexicalScoresTiered( ing, g.outOff, g.outTargets, cfg.query, 0, nullptr, &tierMul );
+        }
+    }
+    else if( cfg.mapDiff )
+    {
+        // Multi-root (§5 / A8): the teleport seed is the UNION of the per-root diffs, each mined per repo.
+        std::vector<char> changed( ing.files.size(), 0 );
+        bool gitOk = false;
+        if( multiRoot )
+        {
+            for( std::uint32_t r = 0; r < ws.size(); ++r )
+            {
+                if( gitChangedFiles( ws[r].arg, ing, changed, r ) )
+                {
+                    gitOk = true;
+                }
+            }
+        }
+        else
+        {
+            gitOk = gitChangedFiles( root, ing, changed );
+        }
+        mapDiffActive = true;   // D6: header emits changed= regardless of gitOk — 0 on a clean tree / no-git degrade too
+        for( char c : changed )
+        {
+            if( c )
+            {
+                ++mapDiffChanged;
+            }
+        }
+        if( gitOk )
+        {
+            rank = rw::takeRank( rankGraphTeleport( g, diffTeleport( ing, changed ) ), rankDisclosure );
+        }
+        else
+        {
+            rw::emitRaw( stderr, "codecortex: --map-diff requires git in PATH; using uniform ranking\n" );
+            rank = rw::takeRank( rankGraph( g ), rankDisclosure );
+        }
+    }
+    else if( cfg.rankBy == RankBy::Churn || cfg.rankBy == RankBy::ChurnDecay )
+    {
+        ChurnRanking cr = churnRankedGraph( d );        // §A9.6: the ranking and the window label it must disclose
+        rank             = std::move( cr.rank );
+        rankDisclosure   = cr.pr;                    // W2-F: churn is a PageRank TELEPORT variant — it runs the power iteration too
+        churnWindowLabel = std::move( cr.window );   // §B2.2: already carries "(no churn evidence)" when the window mined nothing
+        recentFiles      = std::move( cr.recent );   // F3: the <recent> rows (churn-decay, single-root; empty otherwise)
+        recentOf         = cr.recentOf;
+        recentMergeBombsSkipped = cr.mergeBombsSkipped;
+        recentAnyHistory = cr.recentAnyHistory;   // B: propagated, never re-derived from the rows below
+        scopedRecent     = std::move( cr.scoped );
+        scopedRecentOf   = cr.scopedOf;
+        scopedOffset     = cr.scopedOffset;
+        hasScopedRecent  = cr.hasScoped;
+    }
+    else
+    {
+        rank = rw::takeRank( rankGraph( g ), rankDisclosure );
+    }
+
+    // HITS: surface hubs (entrypoints/orchestrators) or authorities (core APIs) instead of the default
+    // PageRank order. (Churn is a PageRank-teleport variant handled above, not a HITS axis.)
+    if( cfg.rankBy == RankBy::Authority || cfg.rankBy == RankBy::Hub || cfg.rankBy == RankBy::Rrf )
+    {
+        auto [ authority, hub ] = hits( g );
+        if( cfg.rankBy == RankBy::Rrf )
+        {
+            rank = rrfFuse( { &rank, &authority, &hub } );   // fuse pagerank + authority + hub
+        }
+        else
+        {
+            // W2-F: hub and authority REPLACE the PageRank vector, so its disclosure must not survive either
+            // (rrf above KEEPS it — pagerank is one of the three vectors it fuses, so that run shaped the order).
+            rankDisclosure = rw::RankDisclosure{};
+            rank           = ( cfg.rankBy == RankBy::Hub ) ? std::move( hub ) : std::move( authority );
+        }
+    }
+
+    // R6 (A4-R6) — --format=candidates on --query: the same FLAT top-K export as the --for path, over the
+    // lexical (BM25) rank. Bypasses the map/adaptive/html emission below (a single <candidates> root, G4-clean).
+    // Guarded to a real --query (cli.h refuses --format=candidates without --for/--query); capped by --top-k.
+    //
+    // §P12.2 fix: --adaptive used to no-op here for the same "bypasses adaptive" reason stated above —
+    // emitCandidates() now cuts BEFORE the bypass, exactly like --query's own default-map cut below
+    // (scanFullDistribution=false: --query's ceiling is already the full top-k, no "capped at 40" to correct).
+    if( cfg.candidates && !cfg.query.empty() )
+    {
+        // §A4f: --query does not go through --for's ranker router at all — it exports the query-personalized
+        // graph rank, so route= names THAT and anchored= is 0 by construction (the §B8 mention anchor is a
+        // --for-lens stage). Naming it explicitly beats leaving a reranker to assume the --for scale.
+        emitCandidates( stdout, ing, rank, cfg.topK, cfg.adaptive, /*scanFullDistribution=*/false,
+                        CandidateProvenance{ "query-personalized", 0, false }, redactPtr, mapRootArg );
+        reportRedactions( stderr, d.redactCounts );      // W3-N1: same seam, same disclosure, on the --query arm
+        return 0;
+    }
+
+    // --max-tokens=N: binary-search the largest top-K whose serialized map fits ~N tokens. T1: the map
+    // output tokenizes at ~2.4-2.6 B/tok (MEASURED vs tiktoken; NOT 4) — the old ×4 over-filled by ~1.6×.
+    // We size the byte budget with kMinBytesPerToken (the DENSEST language rate) × kBudgetHeadroom (90%)
+    // so N is a real CEILING: the packed map's actual token count stays under N for any language mix.
+    // (Claude's tokenizer isn't public → calibration + headroom, never a vendored BPE table; §2f.)
+    //
+    // §B13.4 — the two Ns are NOT the same unit, and now the map says so. --max-tokens=N fits BYTES
+    // (N x 2.36 x 0.90) while est_tokens reports this corpus's own language-weighted rate, so a conformant fit
+    // lands under N in the reported currency — MEASURED on src/: N=1500 honoured 3155 of its 3186-byte ceiling
+    // and reported est_tokens=1216, i.e. 81% of the budget, with the shortfall disclosed nowhere and a --help
+    // that invited composing --max-tokens with --token-budget as though the numbers were comparable. The
+    // conservative ceiling STAYS — a cap that can be overshot is not a cap, and the tokenizer we are estimating
+    // against is not public, so the densest-language rate plus a headroom factor is the only bound that holds
+    // for any corpus. What was wrong was the silence, so mapAnn below carries max_tokens= and fit_bytes= onto
+    // the shaped map, kMaxTokensFitLegend defines them, and --help states the relationship.
+    // §F5 — THE ANNOTATIONS, RESOLVED ONCE, so the probe below and the emission at the bottom of this function
+    // cannot describe two different documents. `mapAnn` used to be built ~250 lines down, AFTER the search, and
+    // the search hand-built a second, SHORTER one (`probeAnn`: the fit only). Every annotation the probe did not
+    // carry became a silent ceiling breach in the emitted map — MEASURED on src/: `--map-diff` +31 B (changed=,
+    // at=) over the cap at N=3000/6000/12000, `--rank-by=churn` +118..204 B (rank_by=, window=, kChurnRankLegend)
+    // over it at nearly every N up to 12000. `at=` is the one part that costs anything to compute, and its guard
+    // is unchanged, so this hoist adds no git subprocess to any path that did not already run one.
+    const bool        isChurnRanked = ( cfg.rankBy == RankBy::Churn || cfg.rankBy == RankBy::ChurnDecay ) && !multiRoot;
+    const std::string mapDiffAt     = ( mapDiffActive && !multiRoot ) || isChurnRanked ? gitstamp::stampAt( root ) : std::string();
+    // §A4d: BOTH serializations take the same per-edge provenance vector — resolved once here rather than
+    // spelled as the same empty-check ternary on each arm, so the two formats cannot drift on this input.
+    const std::vector<std::uint8_t>* mapProvPtr = g.outProv.empty() ? nullptr : &g.outProv;
+
+    int                               mapTopK = cfg.topK;
+    rw::MapAnnotations::MaxTokensFit maxTokensFit;
+    // §B1.2: the run-provenance annotations, resolved ONCE for both serializations for the same reason
+    // mapProvPtr is — the churn stamp used to be spelled on the XML arm only, so `--rank-by=churn --json`
+    // and `--rank-by=pagerank --json` emitted keyset-identical headers over differently-meaning k=.
+    // §B2.1: the windowless ranker label, from the ONE table serialize.h holds — so "which rankers stamp"
+    // is a property of that table rather than of a switch here that a new ranker could be added without.
+    // Churn is deliberately excluded: it stamps through churnWindowLabel (it has a window to disclose), and
+    // the two fields are mutually exclusive by construction, which is what the serializer's `else if` asserts.
+    const char* const rankByLabel = ( cfg.rankBy == RankBy::Authority ) ? "authority"
+                                  : ( cfg.rankBy == RankBy::Hub )       ? "hub"
+                                  : ( cfg.rankBy == RankBy::Rrf )       ? "rrf"
+                                                                       : nullptr;
+    rw::MapAnnotations mapAnn{ mapDiffActive ? &mapDiffChanged : nullptr, &mapDiffAt,
+                                isChurnRanked ? &churnWindowLabel : nullptr,
+                                cfg.rankBy == RankBy::ChurnDecay ? "churn-decay" : "churn",   // P0-4
+                                cfg.maxTokens > 0 ? &maxTokensFit : nullptr,   // §B13.4
+                                rankByLabel,                                   // §B2.1
+                                rankDisclosure,                                // W2-F: pr_iters= / pr_converged=
+                                // F3: <recent> rows, churn-decay single-root only. The POINTER is the rows; whether the block RIDES is
+                                // decided by recentAnyHistory below — the mining fact, propagated. This slot used to carry the decision as
+                                // well ("empty rows and no skipped bomb ⇒ nullptr"), which inferred "no history was mined" from what
+                                // happened to be emitted: an all-bomb window (a shallow clone of a large tree: one 183,835-file commit) and
+                                // a window whose only commit touched no indexed file BOTH have zero rows, and only one of them read nothing.
+                                &recentFiles,
+                                recentOf };
+    mapAnn.recentMinedHistory = recentAnyHistory;   // the block rides on the FACT (serialize.h writeRecentRows)
+    mapAnn.recentMergeBombsSkipped = recentMergeBombsSkipped;   // rides <recent> (the rows' own window), filled by assignment like seed
+    mapAnn.notesDegraded = d.notesDegraded;   // L3 follow-up (CodeRabbit 4053600616): onto every <r> this run emits
+    // C1-b (2026-09-12): --in=DIR — the scoped block and the map stub, filled by assignment like seed. The two next= strings
+    // outlive every serialize() call below (mapAnn holds views into them). The scoped next= is the SAME run at the next
+    // offset, page size carried when the caller set one; the stub's next= is the same run without in= (the map it stubbed).
+    std::string scopedNext;
+    std::string stubNext;
+    const std::string scopeDirStr = hasScopedRecent ? rw::sarif::rootPrefixOf( cfg.inDir ) : std::string();
+    if( hasScopedRecent )
+    {
+        mapAnn.scopedRecent   = &scopedRecent;
+        mapAnn.scopeDir       = scopeDirStr;
+        mapAnn.scopedRecentOf = scopedRecentOf;
+        mapAnn.scopedOffset   = scopedOffset;
+        mapAnn.scopedLimit           = cfg.pageLimit;
+        const std::size_t nextOffset = scopedOffset + scopedRecent.size();
+        if( nextOffset < scopedRecentOf )
+        {
+            scopedNext        = scopedMapNextInvocation( cfg, mapAnn.scopeDir, /*withIn=*/true, nextOffset );
+            mapAnn.scopedNext = scopedNext;   // "" past kNextAttrMaxBytes: has_more= still says a page exists
+        }
+        stubNext           = scopedMapNextInvocation( cfg, mapAnn.scopeDir, /*withIn=*/false, 0 );
+        mapAnn.stubSymbols = true;
+        mapAnn.stubNext    = stubNext;
+    }
+    // T3's auto-flip changes the order= spelling ("important-last(auto:fill)" is 11 bytes longer than
+    // "important-first"), so it is a BYTE fact, not only an ordering one — the comment that used to sit here
+    // claimed the search was "unaffected by emit order", and at N=20000 on src/ the flip fires. One value,
+    // read by the probe and by the emission.
+    const bool mapAutoOrder = !cfg.noAutoOrder;
+
+    // §F5 — ONE measurement of the map's own emitted bytes, used by the --max-tokens search below AND by the
+    // ceiling VERDICT taken further down (`maxTokensFit.isOverCeiling`). Parameterized on extraPayloadTokens
+    // because est_tokens is printed twice in the map's own header, so charging an appended §H7 payload grows
+    // the map's own digit count: MEASURED on src/ at N=6000 --pack-signatures the map portion is 12 749 B
+    // against a 12 744 B cap — 5 bytes over, from digits alone. The SEARCH prices the map alone (that is what
+    // --max-tokens has always shaped, and the payload is not charged until ~250 lines below); the VERDICT is
+    // taken afterwards, with the real number, so the label cannot miss that member either.
+    //
+    // DEGRADE: open_memstream failure returns 0, which reads as "fits" — the pre-§F5 behaviour, and the safe
+    // direction here: a size this path could not measure must not mint an over_ceiling label it cannot support.
+    // L1 fix round: the map's TEXT, for the one caller that must compact a candidate to price what it delivers (--expand's
+    // serving choice under the compact posture). The same render measureMapBytes measures; empty when the buffer failed.
+    const auto renderMapText = [ & ]( int k, std::size_t extraPayloadTokens ) -> std::string
+    {
+        rw::MemoryStream probe;
+        std::FILE* const m = rw::openChargeStream( probe );
+        if( !m )
+        {
+            return {};
+        }
+        serialize( m, ing, rank, g.outOff, g.outTargets, k, cfg.mostImportantLast, cfg.metrics, fanInPtr, &g.ambOut, cfg.stable, mapProvPtr, cboPtr, testedPtr, lcom4Ptr, ampPtr, &g.unresolvedOut, g.bindLabel.empty() ? nullptr : &g.bindLabel, mapAutoOrder, /*outEstTokens=*/nullptr, extraPayloadTokens, mapAnn, /*statsFirstScreen=*/false, mapRootArg, &g.locPinOut, g.externalCalls, &g.declinedOut );
+        const rw::MemoryStreamBytes measured = probe.finish();
+        return measured.isWhole ? std::string( measured.bytes ) : std::string();
+    };
+    const auto measureMapBytes = [ & ]( int k, std::size_t extraPayloadTokens ) -> std::size_t
+    {
+        rw::MemoryStream probe;
+        std::FILE* const m = rw::openChargeStream( probe );
+        if( !m )
+        {
+            DISCLOSE( maxTokensFit, rw::MapAnnotations::MaxTokensFit::DisclosureWhy::ProbeUnmeasured, "runDefaultMap: open_memstream failed for the --max-tokens fit probe — the map is emitted unshaped and its ceiling unverified" );
+            return 0;
+        }
+        serialize( m, ing, rank, g.outOff, g.outTargets, k, cfg.mostImportantLast, cfg.metrics, fanInPtr, &g.ambOut, cfg.stable, mapProvPtr, cboPtr, testedPtr, lcom4Ptr, ampPtr, &g.unresolvedOut, g.bindLabel.empty() ? nullptr : &g.bindLabel, mapAutoOrder, /*outEstTokens=*/nullptr, extraPayloadTokens, mapAnn, /*statsFirstScreen=*/false, mapRootArg, &g.locPinOut, g.externalCalls, &g.declinedOut );
+        const rw::MemoryStreamBytes measured = probe.finish();
+        if( !measured.isWhole )
+        {
+            // a short size would read as a SMALLER map and pass a ceiling the real one breaks; 0 is the documented unmeasured answer
+            DISCLOSE( maxTokensFit, rw::MapAnnotations::MaxTokensFit::DisclosureWhy::ProbeUnmeasured, "runDefaultMap: the --max-tokens fit probe's buffer did not finish whole — the map is emitted unshaped and its ceiling unverified" );
+            return 0;
+        }
+        return measured.bytes.size();
+    };
+
+    // §C4 (capture-audit-4, wave 3) — the same measurement in THE DIALECT THAT WILL ACTUALLY BE BUILT.
+    //
+    // measureMapBytes above calls serialize(), i.e. it prices the XML rendering, and under --json the document
+    // that reaches stdout is serializeJson()'s. serialize.h's own §C4 note calls that out and records the fix as
+    // "a main.cpp change, not smuggled in here" — this is that change, taken at the VERDICT and deliberately
+    // NOT at the search (see the verdict site below for why the split, and what is still routed).
+    //
+    // MEASURED on src/, sweeping --max-tokens: the JSON document is under the ceiling up to N≈6000 and OVER it
+    // from N≈6500 — +49 B at 6500, +319 B at 10000, +1545 B at 20000 — with no over_ceiling label anywhere,
+    // because the label was decided from the XML measurement. So this is not a hypothetical dialect mismatch:
+    // `--max-tokens=10000 --json` emitted 21559 B against the fit_bytes=21240 it printed in its own header and
+    // called the cap honoured. Trap #8, on the key that exists to stop exactly that.
+    //
+    // serializeJson takes no extraPayloadTokens because it has no payload to take: jsonUnsupportedVerb refuses
+    // every payload verb (--expand/--outline/--pack-signatures/--pack-top-n) under --json, so that argument is
+    // provably 0 on this path — asserted rather than assumed.
+    const auto measureEmittedMapBytes = [ & ]( int k, std::size_t extraPayloadTokens ) -> std::size_t
+    {
+        if( !cfg.json )
+        {
+            return measureMapBytes( k, extraPayloadTokens );
+        }
+
+        ASSUME( extraPayloadTokens == 0 );          // the payload verbs are all refused under --json
+        rw::MemoryStream probe;
+        std::FILE* const m = rw::openChargeStream( probe );
+        if( !m )
+        {
+            DISCLOSE( maxTokensFit, rw::MapAnnotations::MaxTokensFit::DisclosureWhy::ProbeUnmeasured, "runDefaultMap: open_memstream failed for the --max-tokens JSON ceiling probe — the ceiling verdict is unverified" );
+            return 0;                                // reads as "fits" — the same safe direction measureMapBytes takes
+        }
+        serializeJson( m, ing, rank, g.outOff, g.outTargets, k, cfg.mostImportantLast, cfg.metrics,
+                       fanInPtr, &g.ambOut, cfg.stable, cboPtr, testedPtr, lcom4Ptr, ampPtr, &g.unresolvedOut,
+                       g.bindLabel.empty() ? nullptr : &g.bindLabel, mapAutoOrder, /*outEstTokens=*/nullptr, mapProvPtr, mapAnn, mapRootArg, &g.locPinOut, g.externalCalls, &g.declinedOut );
+        const rw::MemoryStreamBytes measured = probe.finish();
+        if( !measured.isWhole )
+        {
+            DISCLOSE( maxTokensFit, rw::MapAnnotations::MaxTokensFit::DisclosureWhy::ProbeUnmeasured, "runDefaultMap: the --max-tokens JSON ceiling probe's buffer did not finish whole — the ceiling verdict is unverified" );
+            return 0;                                // the same "unmeasured" answer the open failure above gives
+        }
+        return measured.bytes.size();
+    };
+    const std::size_t maxTokensCeilingBytes = budgetBytesForTokens( std::size_t( cfg.maxTokens ) );
+    // §F5 (cont.) — THE <ctx> WRAPPER IS PART OF THE MAP PORTION THE CALLER RECEIVES. A payload verb
+    // (--pack-signatures / --pack-top-n / --expand / --outline) opens `<ctx>` BEFORE serialize()'s own bytes
+    // (the fprintf below, ahead of the §H7 pre-render), so everything through `</r>` is 5 bytes larger than
+    // what measureMapBytes measures — and neither the search nor the verdict charged them: MEASURED on src/
+    // at N=6000 --pack-signatures, serialize's own portion fit the 12 744 B cap by 4 bytes and the delivered
+    // map portion was 12 745 B — 1 byte over, unlabelled (estchargecheck #5b's exact red). Charged in BOTH
+    // the search and the verdict so the two keep describing the same delivered document. Computed from
+    // `hasExtension` itself (hoisted to here — pure cfg, nothing the search changes) so the charge and the
+    // wrapper fprintf below can never drift; every payload verb is refused under --json, so the JSON path's
+    // charge is provably 0. The closing `</ctx>` lands AFTER `</r>`, in payload territory, and stays
+    // charged to est_tokens like the rest of the payload, not to fit_bytes.
+    const bool        hasExtension    = cfg.packSignatures || cfg.packTopN > 0 || !cfg.expand.empty() || !cfg.outline.empty();
+    const std::size_t mapCtxOpenBytes = ( hasExtension && !cfg.json ) ? sizeof( "<ctx>" ) - 1 : 0;
+    // CodeRabbit PR #292 finding 4052087920: the ride-along `note=` attribute (kMapRidesAlongFmt, formatted
+    // into `noteBuf` below once `mapTopK` is settled) lands INSIDE the same `<ctx ...>` open tag mapCtxOpenBytes
+    // charges — so like mapCtxOpenBytes itself, it belongs to the map portion the ceiling gates, not to
+    // payload territory. Neither the search below nor §F5's verdict charged it, so a near-limit map could
+    // emit `note=` past `fit_bytes` with `over_ceiling` never set. `noteWouldApplyGivenTopK` is
+    // `noteAppliesToBundle` minus its `mapTopK > 0` term (every candidate this search tries is >= 1, so that
+    // term is trivially true here); `noteBytesForTopK` FORMATS the real string for each candidate k rather
+    // than hand-deriving its digit count, so this can never drift from what `noteBuf` itself prints — the
+    // same "measure, don't assume" discipline `measureEmittedMapBytes` already applies. Shares
+    // kMapRidesAlongFmt with the actual `noteBuf` fill below so the two format strings cannot drift apart.
+    const bool noteWouldApplyGivenTopK = !cfg.topKExplicit && ( !cfg.expand.empty() || !cfg.outline.empty() ) && !cfg.json;
+    const auto noteBytesForTopK = [ & ]( int k ) -> std::size_t
+    {
+        if( !noteWouldApplyGivenTopK )
+        {
+            return 0;
+        }
+        char probeBuf[ 220 ] = { 0 };
+        rw::formatTo( probeBuf, sizeof( probeBuf ), kMapRidesAlongFmt, k );
+        return std::strlen( probeBuf );
+    };
+    if( cfg.maxTokens > 0 )
+    {
+        maxTokensFit = { std::size_t( cfg.maxTokens ), maxTokensCeilingBytes, /*isOverCeiling=*/false };   // maxTokens is > 0 here (guarded above)
+        // §B13.4 — the probe must price the shape it will actually BUILD. The disclosure this item adds
+        // (max_tokens=/fit_bytes= plus kMaxTokensFitLegend) is ~215 bytes charged against this very ceiling, so
+        // a probe that did not carry the same annotations chose a top-K whose real emission overran the ceiling
+        // by exactly the disclosure's own size — MEASURED at N=1200: 3029 B against a 2548 B cap, caught by
+        // estchargecheck #5. climbCeilingLadder states the general rule ("a caller can never price a shape it
+        // then fails to build"); this is that rule at the map's own ceiling, and §F5 is the same rule again for
+        // the three annotations the hand-built probeAnn dropped — hence `mapAnn`, the one the emission uses.
+        int lo = 1, hi = int( ing.symbols.size() ), best = 1;
+        while( lo <= hi )
+        {
+            const int mid = lo + ( hi - lo ) / 2;
+            if( measureMapBytes( mid, 0 ) + mapCtxOpenBytes + noteBytesForTopK( mid ) <= maxTokensCeilingBytes ) { best = mid; lo = mid + 1; }
+            else
+            {
+                hi = mid - 1;
+            }
+        }
+        mapTopK = best;
+    }
+
+    // routed pick for --query: a LEADING comment before the map (serialize owns the map header, not ours to
+    // extend) — mirrors how --adaptive surfaces its cut. Emitted only for a real --query with routing on, and
+    // NOT on the --html path (which returns above with its own document). Under --no-route the note is empty.
+    if( !cfg.query.empty() && !cfg.html && !queryRouteNote.empty() )
+    {
+        std::fputs( queryRouteNote.c_str(), stdout );
+    }
+
+    // --adaptive on --query (lever 2): cut the ranked map at the relevance cliff, exactly like
+    // the --for path. --query's rank IS the lexical score, so the cliff is meaningful; floor=5, ceiling=the
+    // current mapTopK (post --max-tokens). We emit the note as a LEADING comment (the map header comes from
+    // serialize and is not ours to extend). Only fires with --query (the guard in cli.h requires --for OR
+    // --query); on a plain map cfg.adaptive is false → mapTopK untouched, output byte-identical.
+    if( cfg.adaptive && !cfg.query.empty() )
+    {
+        const AdaptiveCut ac = adaptiveCut( rank, 5, std::size_t( mapTopK ) );
+        char nb[ 208 ];
+        if( !ac.hitCeiling && ac.cliffRank < ac.kept )
+        {
+            rw::formatTo( nb, sizeof( nb ), "<!-- adaptive: kept {} of {} - sharp cliff at rank {} ({}% drop), clamped up to the floor of {} -->",
+                           ac.kept, mapTopK, ac.cliffRank, ac.dropPct, ac.kept );
+        }
+        else if( !ac.hitCeiling )
+        {
+            rw::formatTo( nb, sizeof( nb ), "<!-- adaptive: kept {} of {} - cliff at rank {}, {}% drop -->",
+                           ac.kept, mapTopK, ac.cliffRank, ac.dropPct );
+        }
+        else if( ac.positiveHits <= ac.kept )
+        {
+            rw::formatTo( nb, sizeof( nb ), "<!-- adaptive: kept {} of {} - only {} symbols matched this query (sharp query, short tail) -->",
+                           ac.kept, mapTopK, ac.positiveHits );
+        }
+        else
+        {
+            rw::formatTo( nb, sizeof( nb ), "<!-- adaptive: kept {} of {} - no relevance cliff (broad query saturates the score); capped at the ceiling -->",
+                           ac.kept, mapTopK );
+        }
+        std::fputs( nb, stdout );
+        mapTopK = int( ac.kept );
+    }
+
+    // --html[=FILE]: emit self-contained HTML force-directed graph instead of the default XML map.
+    // Purely additive: when absent the default path is completely unchanged.
+    if( cfg.html )
+    {
+        // churn for the --color-by=churn lens: THE shared per-file pass (mineChurnPerFile — also
+        // --export=cc.json's and --hotspots'). Costs one git subprocess per root, matching cc.json's
+        // posture; no evidence ⇒ the page's CHURN_OK legend note discloses instead of lying zeros.
+        std::vector<std::uint32_t> htmlChurn( ing.files.size(), 0 );
+        const rw::SinceScope       htmlScope;   // inactive: --html has no --since form
+        // ONE spelling of the window, mined with it and then printed by the page's churn legend. It used to
+        // be a bare literal here and the legend said only "0 1-2 3-9 10-29 30+" — five buckets of an unnamed
+        // unit over an unstated horizon, which reads as "commits ever". Naming a constant and passing it is
+        // what keeps the page from making a claim the run cannot back.
+        static constexpr const char* kHtmlChurnWindow = "18 months ago";
+        const bool htmlChurnOk = mineChurnPerFile( ing, root, multiRoot, ws, std::string_view(), htmlScope, kHtmlChurnWindow, htmlChurn );
+
+        // tested for the --color-by=tested lens: QMetrics is computed upstream only under
+        // --metrics/--for/--exemplar, so on a bare --html run testedPtr is null and every node would
+        // read ts:0 — a "not computed" masquerading as "untested". Compute it here instead
+        // (computeQMetrics is pure graph work, no git subprocess) so ts= is always a measured fact.
+        QMetrics htmlQm;
+        if( !testedPtr )
+        {
+            htmlQm    = computeQMetrics( ing, g );
+            testedPtr = &htmlQm.tested;
+        }
+
+        std::FILE* htmlOut = stdout;
+        if( !cfg.htmlFile.empty() )
+        {
+            // open the target file for writing; report failure and exit cleanly
+            const std::string htmlPath( cfg.htmlFile );
+            htmlOut = std::fopen( htmlPath.c_str(), "wb" );
+            if( !htmlOut )
+            {
+                DISCLOSE( Diagnostics::answerRefused, "--html exits 1 naming the file it cannot open on stderr; nothing is written",
+                          "writeHtml: could not open output file" );
+                rw::emitTo( stderr, "codecortex: --html={}: cannot open file for writing\n", htmlPath.c_str() );
+                return 1;
+            }
+        }
+        // 2026-09-06 stranger audit: the page names what it maps (last path segment only — the path itself never
+        // reaches the page), anchors to the commit like every XML root does, and says which binary drew it.
+        HtmlColorExtras       htmlColor{ testedPtr, &htmlChurn, htmlChurnOk, cfg.colorBy, kHtmlChurnWindow, cfg.rankBy };
+        const HtmlProvenance  htmlProv = htmlProvenanceFor( root, multiRoot );
+        htmlColor.atStamp  = htmlProv.atStamp;
+        htmlColor.rootName = htmlProv.rootName;
+        htmlColor.version  = kCodeCortexVersion;
+        writeHtml( htmlOut, ing, rank, g, mapTopK, htmlColor, mapRootArg );   // R-R
+        if( htmlOut != stdout )
+        {
+            std::fclose( htmlOut );
+        }
+        return 0;
+    }
+
+    // When an extension verb appends additional blocks after the main <r> map, the combined output
+    // would have multiple XML root elements — invalid per the XML spec (G4 violation). Fix: wrap
+    // the ENTIRE output (map + extension blocks) in a single <ctx> root whenever extension output
+    // is present. The DEFAULT map (no extension verb) is emitted UNwrapped, exactly as before, so
+    // the golden and all existing callers that parse the bare <r>…</r> are unaffected.
+    // (`hasExtension` itself is defined beside mapCtxOpenBytes above, so the wrapper's 5 delivered
+    // bytes and the --max-tokens search/verdict that charge them read the same predicate.)
+
+    // --expand est_tokens bugfix: the <bodies> block that packBodies appends AFTER the map is
+    // part of the payload the caller receives, so the header's est_tokens must include it (before this fix it
+    // reported the map only — a --token-budget gate on a large --expand under-budgeted by ~2×). Resolve the
+    // expand nodes HERE (once) so both the header estimate below and the packBodies emission later reuse the
+    // SAME node/range set — no drift between "estimated" and "emitted", and no double name-resolution.
+    // D7: a miss exits 1, like --callers/--impact.
+    // r27-emitters T3: the resolution now runs BEFORE the first stdout byte, and a miss returns immediately —
+    // --expand was the only verb that paired a refusal (exit 1) with a 22 KB payload of UNRELATED map, which
+    // reads to a caller as "here is your answer" with a stray non-zero code. Refuse and write nothing, exactly
+    // like --callers/--callees/--impact/--lego/--around/--edit-check.
+    std::vector<NodeId>         expandNodes;
+    HashMap<NodeId, LineRange>  expandRanges;
+    // H1: the decl→def residue of every --expand and --outline item, SUMMED: the two verbs share one <ctx> root, a bare
+    // NAME item adds 0, and the remedy is the same for any item (widen its file:name spelling). Unreported, a file:name
+    // item whose definitions were dropped served the declaration's text alone with nothing saying what was left out.
+    std::size_t                 ctxUnprovenDefs = 0;
+    if( !cfg.expand.empty() )
+    {
+        bool expandMissed = false;
+        for( const std::string& tok : cfg.expand )
+        {
+            // §P8 seam 1: resolveAllByNameQualified — the SAME resolver --callers/--callees/--impact use,
+            // so `file:name` / `file:line:name` / a canonical id / a bare name all mean here exactly what
+            // they mean there. On a bare name it is byte-identical to the resolveAllByName it replaces.
+            const ExpandToken         et              = parseExpandToken( tok, "--expand" );
+            std::size_t               tokUnprovenDefs = 0;
+            const std::vector<NodeId> matches         = resolveAllByNameQualified( ing, et.selector, &tokUnprovenDefs );
+            ctxUnprovenDefs += tokUnprovenDefs;
+            if( matches.empty() )
+            {
+                // §M7 (W3FIX): --expand takes the same file:name grammar as --uses/--callers and refused in the
+                // pre-§B4.2 dialect — a bare did-you-mean about a NAME that may well exist, when the fault is
+                // the path half. selectorFaultClause does the split (and states when the path itself is
+                // unindexed); this arm keeps its own flag-first sentence byte-for-byte ahead of it.
+                expandMissed = true;
+                rw::emitTo( stderr, "codecortex: --expand={} matched no symbol{}\n", et.selector.c_str(),
+                              rw::selectorFaultClause( ing, et.selector, "--expand=" ).c_str() );
+            }
+            else if( matches.size() > 8 )
+            { // final-segment names (reset/size/update) collide widely
+                rw::emitTo( stderr, "codecortex: --expand={} matches {} symbols; emitting all up to --pack-budget-bytes (qualify with file:name to narrow)\n",
+                              et.selector.c_str(), matches.size() );
+            }
+            for( NodeId id : matches )
+            {
+                expandNodes.push_back( id );
+                if( et.range.hasRange )
+                {
+                    expandRanges[id] = et.range; // same range applies to every match of this token
+                }
+            }
+        }
+        if( expandMissed )
+        {
+            return 1; // refusal + empty stdout — nothing has been printed yet
+        }
+    }
+
+    // V1 (routing note ugrep RN2, 2026-08-15): an EXACT-NAME --expand — one token that resolved to exactly
+    // one symbol — needs no orientation map: the caller already named the exact target, so the top-200
+    // ranked map is pure overhead in front of the one body it exists to summarize (MEASURED on this repo:
+    // 12,944 est_tokens of map ahead of a ~1.4 KB body). Default top-k to 0 for this shape. An explicit
+    // --top-k=N (0 included) always overrides — see the explicit-top-k guard just below. A MULTI-match name
+    // (matches.size() > 1) or a multi-token --expand keep the caller's ordinary default: there IS something
+    // to disambiguate/orient there, the exact reason expandAutoServeScope's lean-does-not-auto-compete
+    // rationale still holds. Composed verbs already claim the map for their own purpose, so they are
+    // excluded here exactly like expandAutoServeScope excludes them below.
+    const bool exactNameExpandDefault = cfg.expand.size() == 1 && expandNodes.size() == 1 && !cfg.topKExplicit
+        && cfg.outline.empty() && !cfg.packSignatures && cfg.packTopN == 0 && cfg.query.empty()
+        && !cfg.adaptive && cfg.maxTokens == 0 && !cfg.json;
+    if( exactNameExpandDefault )
+    {
+        mapTopK = 0;
+    }
+
+    // --outline=NAME,...: same resolution, same refusal contract. A miss used to emit the map and exit 0,
+    // so a typo'd outline was indistinguishable from a successful one.
+    std::vector<NodeId> outlineNodes;
+    if( !cfg.outline.empty() )
+    {
+        bool outlineMissed = false;
+        for( const std::string& rawNm : cfg.outline )
+        {
+            // --outline has no range form (a control-flow skeleton is a whole-symbol shape), but SYM:START-END
+            // is the muscle memory --expand teaches. Strip the range and say so, rather than letting the
+            // literal "SYM:5-10" miss and get reported as a TYPO with a did-you-mean — the name was fine.
+            // §P10 X7: `verb` is passed so a malformed range on --outline no longer emits a note blaming
+            // --expand. §P8 seam 1: the file:name / file:line:name selector resolves here exactly as it does
+            // on --expand and --callers (same resolveAllByNameQualified), so an --outline of ONE overload is
+            // finally expressible.
+            const ExpandToken ot = parseExpandToken( rawNm, "--outline" );
+            const std::string nm = ot.range.hasRange ? ot.selector : rawNm;
+            if( ot.range.hasRange )
+            {
+                rw::emitTo( stderr, "codecortex: --outline={}: --outline has no line-range form — outlining the whole symbol "
+                                      "(use --expand={}:{}-{} for a body slice)\n",
+                              rawNm.c_str(), ot.selector.c_str(), ot.range.startLine, ot.range.endLine );
+            }
+
+            std::size_t               nmUnprovenDefs = 0;
+            const std::vector<NodeId> matches        = resolveAllByNameQualified( ing, nm, &nmUnprovenDefs );
+            ctxUnprovenDefs += nmUnprovenDefs;   // H1: onto the <ctx> root --expand shares
+            if( matches.empty() )
+            {
+                // §M7 (W3FIX): same grammar, same shared refusal as --expand above.
+                outlineMissed = true;
+                rw::emitTo( stderr, "codecortex: --outline={} matched no symbol{}\n", nm.c_str(),
+                              rw::selectorFaultClause( ing, nm, "--outline=" ).c_str() );
+            }
+            for( NodeId id : matches )
+            {
+                outlineNodes.push_back( id );
+            }
+        }
+        if( outlineMissed )
+        {
+            return 1;
+        }
+    }
+
+    // H1: the residue's attribute and its clause, for the <ctx> root --expand and --outline share. Built ONCE, because
+    // three things read their bytes and must agree: the payload charge below (so est_tokens covers them in every serving
+    // mode), the M6 bundle price, and the --max-tokens ceiling verdict. All three are empty at zero, so an answer that
+    // dropped nothing prices, chooses and emits byte-identically.
+    const std::string ctxUnprovenAttr   = rw::unprovenDefsAttrXml( ctxUnprovenDefs );
+    const std::string ctxUnprovenLegend = rw::unprovenDefsVerbComment( rw::UnprovenDefsVerb::Expand, ctxUnprovenDefs > 0, "<!-- codecortex expand: " );
+    const std::size_t ctxUnprovenBytes  = ctxUnprovenAttr.size() + ctxUnprovenLegend.size();
+
+    // §P6.8: `out` replaces every `stdout` from here through the map body's closing tag, so nothing reaches
+    // the real stdout until finishTokenBudgetGate below has measured and decided (see openTokenBudgetBuffer's
+    // comment above runDefaultMap). No-op when --token-budget is unset — `out` is just `stdout`.
+    rw::MemoryStream  tbStream;
+    TokenBudgetStream tbSink;   // what the buffer could not do, read back by finishTokenBudgetGate below
+    std::FILE* const  out = openTokenBudgetBuffer( tbStream, tbSink, cfg.tokenBudget, stdout );
+
+    // (M6: the `<ctx>` opener used to be printed HERE, before the §H7 pre-render. Nothing writes to `out`
+    // between here and the emission below — the pre-render goes to memstreams — so the open moved down to
+    // where the mode decision can decorate it; byte order on the wire is unchanged.)
+
+    // §H7 — PRE-RENDER every block that gets appended after the map, and CHARGE it from its own emitted bytes.
+    // The ordering constraint is real and it is the whole reason this block sits HERE, above serialize(): the
+    // header states est_tokens, so it can only be written once the payload it describes has been measured, but
+    // it is written FIRST in the document. Before this, only --expand fed the header (through a bespoke
+    // ~90-line estimator), and <sigs>/<src>/<outline> fed it nothing — so a --token-budget gate saw a 507-token
+    // map and let 67 KB through (§H7's own repro). Each section is charged at the rate for what its bytes ARE:
+    // <sigs> is markup + signatures (the mid-band rate the --for lens's own bundle estimate uses), while <src>,
+    // <bodies> and <outline> are code TEXT, which BPE merges far more aggressively (kBytesPerTokenBody).
+    // rw::chargeSection degrades to isRendered=false, and the emission below then streams that section
+    // directly — uncharged for that one run, with an alert, never a fabricated number.
+    rw::ChargedSection sigsSection, srcSection, bodiesSection, outlineSection;
+    if( cfg.packSignatures )
+    {
+        sigsSection = rw::chargeSection( [ & ]( std::FILE* f )
+            { packSignatures( f, ing, rank, cfg.packTopN > 0 ? cfg.packTopN : 50, cfg.packBudgetBytes, false, nullptr, impurePtr, redactPtr,
+                              nullptr, nullptr, nullptr, nullptr, false, 0, nullptr, mapRootArg ); },
+            rw::kBytesPerTokenDefault );
+    }
+    else if( cfg.packTopN > 0 )
+    {
+        srcSection = rw::chargeSection( [ & ]( std::FILE* f )
+            { packSource( f, ing, rank, cfg.packTopN, cfg.packBudgetBytes, redactPtr ); },
+            rw::kBytesPerTokenBody );
+    }
+    if( !expandNodes.empty() )
+    {
+        bodiesSection = rw::chargeSection( [ & ]( std::FILE* f )
+            { packBodies( f, ing, expandNodes, cfg.packBudgetBytes, g.outOff, g.outTargets, cfg.compress, redactPtr,
+                          expandRanges.empty() ? nullptr : &expandRanges, d.notesPtr, /*outEmitted=*/nullptr,
+                          /*truncateOversizedFirst=*/true, /*withFileContext=*/true, mapRootArg ); },   // V1: octocode F2 sibs=/inc=
+            rw::kBytesPerTokenBody );
+    }
+    if( !outlineNodes.empty() )
+    {
+        outlineSection = rw::chargeSection( [ & ]( std::FILE* f )
+            { packOutline( f, ing, outlineNodes, cfg.packBudgetBytes, cfg.compress, redactPtr, mapRootArg ); },
+            rw::kBytesPerTokenBody );
+    }
+
+    // The --expand fallback: estimateExpandBodyTokens is no longer the primary estimate (measured bytes are),
+    // but it remains the honest answer on the degrade path — better than dropping the <bodies> block out of the
+    // charge entirely, which is the defect this whole item is about.
+    const std::size_t payloadTokens = sigsSection.tokens + srcSection.tokens + outlineSection.tokens
+        + ( ( !expandNodes.empty() && !bodiesSection.isRendered )
+                ? estimateExpandBodyTokens( ing, expandNodes, cfg.packBudgetBytes, g.outOff, g.outTargets, cfg.compress,
+                                            expandRanges.empty() ? nullptr : &expandRanges )
+                : bodiesSection.tokens )
+        + ( ctxUnprovenBytes > 0 ? rw::tokensForEmittedBytes( ctxUnprovenBytes, rw::kBytesPerTokenDefault ) : 0 );   // H1: charged at the markup rate
+    // A requested section whose chargeSection degraded (its sink cleared isRendered) streams uncharged, or is priced by the
+    // --expand model: the est_tokens this run prints then labels itself est_measured="0" (serialize's MapEstimate).
+    mapAnn.payloadUncharged = ( cfg.packSignatures && !sigsSection.isRendered ) || ( !cfg.packSignatures && cfg.packTopN > 0 && !srcSection.isRendered )
+                           || ( !expandNodes.empty() && !bodiesSection.isRendered ) || ( !outlineNodes.empty() && !outlineSection.isRendered );
+
+    // ── M6 (density audit 2026-08-08, owner directive: ONE call does the smart thing, no two-step) ──────
+    // CHEAPEST-COMPLETE-ANSWER SERVING for a BARE --expand. The verb could always serve three forms:
+    //   (a) bundle     = ranked map + <bodies> (+ inline callee sigs) — today's default;
+    //   (b) lean       = the --top-k=0 bodies-only form;
+    //   (c) whole-file = the requested symbols' own file(s), CDATA-wrapped, line anchors kept.
+    // Measured on this repo, (a) is 5.65x LARGER than the whole file for a small-file symbol
+    // (--expand=pageRankDouble: 27,890 B vs src/pagerank.cpp 4,936 B — and even (b) is 1.08x the file),
+    // while on a big file (a) saves ~26x over reading the file. So with NO explicit --top-k the verb now
+    // compares (a) against (c) — both rendered-and-measured, not estimated — and emits the smaller,
+    // disclosing the choice deterministically on the root: mode="bundle|whole-file" reason="the two byte
+    // counts compared". (b) deliberately does NOT compete in the auto choice: it is a strict byte-subset
+    // of (a), so a three-way minimum could never serve the map and a bare --expand would silently lose its
+    // orientation value — lean stays the caller's EXPLICIT choice. An explicit --top-k=N (including 0)
+    // overrides auto-selection entirely and keeps the legacy undecorated shape: the agent asked for the
+    // map (or its absence), serve exactly that. Ties go to the bundle (the richer answer at equal cost).
+    // Scope and choice are the two free functions above runDefaultMap (expandAutoServeScope /
+    // chooseExpandServe — the rationale lives on them); the emission below stays here with the streams.
+    // Gate: test/expandmodecheck.sh.
+    //
+    // §F1: this was a local lambda declared below, beside the §H7 appended-sections block; hoisted here
+    // (unchanged) so #289's early-bodies emission (inside the mapTopK>0 branch below) can call it too.
+    const auto emitSection = [ & ]( const rw::ChargedSection& sec, auto&& renderDirect )
+    { rw::emitChargedSection( out, sec, renderDirect ); };
+    bool                serveWholeFile     = false;
+    bool                bodiesEmittedEarly = false;   // #289: set when the mapTopK>0 branch below already served <bodies>
+    rw::WholeFileRender wholeFile;
+    // V1: the exact-name default's root disclosure — "assert absence + a root attribute" (ugrep RN2). Set as
+    // the INITIAL value so it survives even when expandAutoServeScope below does not run (a range slice, or
+    // a pre-render degrade) — every path exactNameExpandDefault can reach ends up with SOME <ctx ...> to
+    // decorate, since hasExtension is provably true whenever --expand is non-empty.
+    std::string         ctxOpenStr = exactNameExpandDefault ? "<ctx topk_default=\"0\">" : "<ctx>";
+    // R-E fix (2026-08-19): the payload document root DISCLOSES the root its p= are relative to, on the two
+    // shapes where the ride-along map's <r root=…> is NOT there to do it — no map at all (mapTopK==0, which
+    // the exact-name --expand default always picks) and whole-file mode. The first R-E landing made
+    // packBodies/packOutline emit root-relative p= and left both of those serving relative paths against an
+    // unnamed root. Gated on the map's absence rather than emitted unconditionally because rootrelcheck.sh's
+    // own contract is that a document discloses its root ONCE — a <ctx root=> beside an <r root=> is two.
+    // Computed HERE, ahead of the bundle price below, because those bytes are part of the document that
+    // price describes (expandtopk0check §G-b compares the priced number to the real --top-k=0 byte count).
+    std::vector<char>  ctxRootEsc;
+    const std::string  ctxRootAttr = ( mapRootArg.empty() || cfg.json )
+                                   ? std::string()
+                                   : ( " root=\"" + std::string( rw::escapeXml( mapRootArg, ctxRootEsc ) ) + "\"" );
+    // M11: with no map the <ctx> root also carries est_tokens="<payloadTokens>" — priced here so the M6
+    // chooser's reason= figure is the document actually served (expandtopk0check G-b is that identity).
+    const std::size_t  ctxEstBytesWhenNoMap  = ( mapTopK == 0 ) ? ( sizeof( " est_tokens=\"\"" ) - 1 ) + std::to_string( payloadTokens ).size() : 0;
+    // L3 follow-up (CodeRabbit 4053600616, review round): the notes sidecar's own read state, on the SAME two
+    // shapes ctxRootAttr covers — whole-file mode and a bare bundle with no map riding (mapTopK==0). When a
+    // map DOES ride (mapTopK>0), MapAnnotations::notesDegraded already puts the marker on the map's OWN <r>
+    // root (serialize.h), inside the bytes measureEmittedMapBytes below re-renders and measures for real — so
+    // charging it again on <ctx> here would double it. d.notesDegraded is set once, in MainDispatch, where
+    // d.notesPtr itself is built (before notesPtr is nulled for emptiness).
+    const std::string  ctxNotesDegradedAttr   = d.notesDegraded ? std::string( rw::notes::kNotesDegradedAttr ) : std::string();
+    const std::string  ctxNotesDegradedLegend = d.notesDegraded ? std::string( rw::notes::kNotesDegradedComment ) : std::string();
+    const std::size_t  ctxNotesDegradedBytes  = ctxNotesDegradedAttr.size() + ctxNotesDegradedLegend.size();
+    const std::size_t  ctxRootBytesWhenNoMap = ( mapTopK == 0 ) ? ctxRootAttr.size() + ctxEstBytesWhenNoMap + ctxNotesDegradedBytes : 0;
+    // #289: the ride-along `note=` attribute's bytes, priced HERE — ahead of the M6 fixpoint below — because
+    // the note is bundle-only (never printed in whole-file mode, exactly like the pre-existing stderr note
+    // it doubles), so it must be counted as part of the BUNDLE CANDIDATE's price that chooseExpandServe
+    // compares, not spliced in afterward (expandmodecheck.sh (4d) asserts the bundle reason="…B" IS the
+    // delivered document — an uncounted attribute breaks that identity). `noteAppliesToBundle` is every term
+    // of the eventual firing condition EXCEPT `!serveWholeFile`, which is what this fixpoint is deciding —
+    // read as "would the note fire if bundle wins", the same stance bundleDoc's other fields already take.
+    char               noteBuf[ 220 ] = { 0 };
+    std::size_t        noteBytes      = 0;
+    const bool         noteAppliesToBundle = !cfg.topKExplicit && ( !cfg.expand.empty() || !cfg.outline.empty() )
+        && !cfg.json && mapTopK > 0;
+    if( noteAppliesToBundle )
+    {
+        // In-band first: xmllint-safe (an XML comment may not carry "--", an attribute value can), so this is
+        // a `note=` attribute rather than the comment style ctxUnprovenLegend/kExpandWholeFileLegend use.
+        // kMapRidesAlongFmt is the SAME constant noteBytesForTopK (above, §F5 search/verdict) formats — the
+        // two can never drift, which is the whole point of sharing it (CodeRabbit PR #292, findings
+        // 4052087920/4052087924).
+        rw::formatTo( noteBuf, sizeof( noteBuf ), kMapRidesAlongFmt, mapTopK );
+        noteBytes = std::strlen( noteBuf );
+    }
+    const bool expandAllModuleScope = !expandNodes.empty()
+        && std::all_of( expandNodes.begin(), expandNodes.end(),
+                        [ & ]( rw::NodeId n ) { return n < ing.symbols.size() && ing.symbols[ n ].kind == rw::SymKind::ModuleScope; } );
+    if( expandAutoServeScope( cfg, !expandRanges.empty(), bodiesSection.isRendered, expandAllModuleScope ) )
+    {
+        // Bundle total = "<ctx>" + the map as it would actually be emitted (payload token digits included)
+        // + the pre-rendered <bodies> + "</ctx>". Rendering-and-measuring beats arithmetic here: the map's
+        // est_tokens digits depend on the payload charge, and a probe that prices a shape it then fails to
+        // build is the exact climbCeilingLadder failure mode this file already documents.
+        // V1 fix (verifier finding 1, 2026-08-15): mapTopK==0 means UNLIMITED inside serialize(), not "no
+        // map" — an unguarded call here priced the whole-repo map (~1MB on this tree) that the emission
+        // path below never prints (mapTopK==0 skips straight to the topK>0 branch's `else`, see the two
+        // guarded siblings at the ceiling verdict and the topK>0 emission gate). Same guard here: a map
+        // that will not be emitted must not be charged, exactly like every other measureEmittedMapBytes
+        // call site in this function.
+        wholeFile = rw::renderWholeFiles( ing, expandNodes, redactPtr, d.notesPtr, cfg.compress, mapRootArg );   // D2: shaped candidate (R-R: root-relative <src p=>)
+        // BOTH CANDIDATES, DESCRIBED IN THE SAME FIELDS (CodeRabbit, PR #215 — chooseExpandServe's own header
+        // carries the defect this replaced). The two documents differ by exactly what these fields say they
+        // differ by: the bundle rides a map (when one will be emitted) and the pre-rendered <bodies>; the file
+        // rides its <src p= sym=> blocks, its own legend, and an est_tokens= it prices ITSELF at the BODY rate
+        // because every byte on that path is raw code text — the same rate and the same pricedRootAttr fixpoint
+        // the whole-file emission below applies. topk_default="0" and the unproven residue ride BOTH openers, so
+        // the first is charged to both documents and the second is passed as the shared root bytes.
+        const std::size_t         topkDefaultBytes = exactNameExpandDefault ? ( sizeof( " topk_default=\"0\"" ) - 1 ) : 0;
+        ExpandServeDocument       bundleDoc;
+        bundleDoc.payloadBytes  = bodiesSection.xml.size();
+        bundleDoc.mapBytes      = mapTopK > 0 ? measureEmittedMapBytes( mapTopK, payloadTokens ) : 0;
+        bundleDoc.rootAttrBytes = ctxRootBytesWhenNoMap + topkDefaultBytes + noteBytes;   // root=/est_tokens= only where no map carries them; note= only where a map does
+        ExpandServeDocument       fileDoc;
+        fileDoc.payloadBytes  = wholeFile.xml.size();                         // as EMITTED, not the raw file bytes
+        fileDoc.rootAttrBytes = ctxRootAttr.size() + topkDefaultBytes + ctxNotesDegradedBytes;   // whole-file mode always carries root= (no <r root=> rides with it) and, when degraded, the marker too
+        fileDoc.legendBytes   = kExpandWholeFileLegend.size();
+        fileDoc.selfPriceRate = rw::kBytesPerTokenBody;
+        // L1 fix round (rv-r1-L1 MED-7): under the compact posture each candidate is priced as the compact layer will deliver
+        // it — the two documents, assembled with the same parts the fields above describe, compacted, and the difference
+        // taken off each price. reason= then names the sizes of documents that exist, and the choice is made on them.
+        // MED-7 of rv-r1-L1-2: the two postures price differently, so they can serve differently — the compact default a
+        // BUNDLE (a body plus sibs= names) where --legend=full serves the whole FILE (every sibling's source). The choice is
+        // right for the bytes each delivers, but the default then carries less source with no way to get the rest. So when
+        // the full dialect's own comparison would serve the file, the default's bundle root carries next= naming the call
+        // that serves it; its bytes are priced into the bundle before the choice (it rides only if the bundle wins).
+        std::string wholeFileNext;
+        if( cfg.legend == "compact" && !cfg.json && chooseExpandServe( bundleDoc, fileDoc, ctxUnprovenBytes, wholeFile, cfg.packBudgetBytes ).serveWholeFile )
+        {
+            std::string expandArg;
+            for( const std::string& e : cfg.expand )
+            {
+                expandArg += ( expandArg.empty() ? "" : "," ) + e;
+            }
+            wholeFileNext = rw::nextAttrXml( "--expand=" + expandArg + " --legend=full" );
+            bundleDoc.rootAttrBytes += wholeFileNext.size();
+        }
+        if( cfg.legend == "compact" && !cfg.json )
+        {
+            const auto deltaOf = []( const std::string& candidate ) -> std::ptrdiff_t
+            {
+                const std::size_t delivered = rw::compactDeliveredBytes( candidate, "expand" );
+                return delivered > 0 ? static_cast<std::ptrdiff_t>( delivered ) - static_cast<std::ptrdiff_t>( candidate.size() ) : 0;
+            };
+            const std::string mapText = mapTopK > 0 ? renderMapText( mapTopK, payloadTokens ) : std::string();
+            // the ROOT ATTRIBUTES ride too: the compact legend reads root=/est_tokens=/topk_default= etc. present-only, so a
+            // candidate without them would price a legend shorter than the one delivered. The est_tokens= values are the
+            // candidates' own prices (the layer reprices them, and a placeholder of another digit count would move the delta).
+            const std::string topk       = exactNameExpandDefault ? " topk_default=\"0\"" : "";
+            const std::string fileEst    = std::to_string( static_cast<std::size_t>( double( wholeFile.xml.size() + kExpandWholeFileLegend.size() + ctxRootAttr.size() ) / rw::kBytesPerTokenBody ) + 1 );
+            const std::string bundleRoot = "<ctx" + ctxUnprovenAttr + ( mapTopK == 0 ? ctxRootAttr + " est_tokens=\"" + std::to_string( payloadTokens ) + "\"" : std::string() ) + topk + noteBuf + wholeFileNext + " mode=\"bundle\">";
+            const std::string fileRoot   = "<ctx" + ctxUnprovenAttr + ctxRootAttr + topk + " mode=\"whole-file\" est_tokens=\"" + fileEst + "\">";
+            // in the order the bundle is EMITTED — the bodies first, the ride-along map after them: the layer reads its
+            // head terms off the root's first child, so a map-first candidate priced a different legend (rv-r1-L1-2: 107 B)
+            bundleDoc.compactDeltaBytes = deltaOf( bundleRoot + ctxUnprovenLegend + bodiesSection.xml + mapText + "</ctx>" );
+            fileDoc.compactDeltaBytes   = deltaOf( fileRoot + ctxUnprovenLegend + std::string( kExpandWholeFileLegend ) + wholeFile.xml + "</ctx>" );
+        }
+        ExpandServeChoice choice = chooseExpandServe( bundleDoc, fileDoc, ctxUnprovenBytes, wholeFile, cfg.packBudgetBytes );
+        serveWholeFile = choice.serveWholeFile;
+        ctxOpenStr     = std::move( choice.ctxOpen );
+        if( !serveWholeFile && !wholeFileNext.empty() )
+        {
+            ASSUME( ctxOpenStr.rfind( "<ctx", 0 ) == 0 );
+            ctxOpenStr.insert( 4, wholeFileNext );
+        }
+        if( exactNameExpandDefault )
+        {
+            // chooseExpandServe's four formatted opens all start "<ctx mode=\"...\" reason=\"...\">" — insert
+            // right after "<ctx" so the self-describing default rides alongside whichever mode/reason M6
+            // independently picked (bundle-without-a-map still beats a huge whole-file, so this composes).
+            ASSUME( ctxOpenStr.rfind( "<ctx", 0 ) == 0 );
+            ctxOpenStr.insert( 4, " topk_default=\"0\"" );
+        }
+    }
+    // …and the insert itself, same technique topk_default= uses right above (the four chooseExpandServe
+    // openers all start with that literal). Fires only where no map will carry the disclosure — see the
+    // ctxRootAttr comment above the bundle price.
+    if( !ctxRootAttr.empty() && ( serveWholeFile || mapTopK == 0 ) )
+    {
+        ASSUME( ctxOpenStr.rfind( "<ctx", 0 ) == 0 );
+        ctxOpenStr.insert( 4, ctxRootAttr );
+    }
+    // L3 follow-up (CodeRabbit 4053600616, review round): same gate as ctxRootAttr just above — fires only on
+    // the two shapes with no <r> to carry the marker itself (whole-file, or a bare bundle with mapTopK==0);
+    // a map that rides already carries it via MapAnnotations::notesDegraded (serialize.h), so this and that
+    // path can never both fire for the same delivered document. Already priced into ctxRootBytesWhenNoMap /
+    // fileDoc.rootAttrBytes above, ahead of the M6 choice this condition itself depends on.
+    if( !ctxNotesDegradedAttr.empty() && ( serveWholeFile || mapTopK == 0 ) )
+    {
+        ASSUME( ctxOpenStr.rfind( "<ctx", 0 ) == 0 );
+        ctxOpenStr.insert( 4, ctxNotesDegradedAttr );
+        ctxOpenStr += ctxNotesDegradedLegend;
+    }
+    // H1: the residue rides the root in EVERY serving mode (whole-file, bundle with its map, bodies alone), and its clause
+    // rides straight after the start tag, ahead of the map or the payload, so the reader meets it before the text it
+    // qualifies. The later est_tokens splices find the start tag's own '>' first, so they still land on the root.
+    if( ctxUnprovenDefs > 0 )
+    {
+        ASSUME( ctxOpenStr.rfind( "<ctx", 0 ) == 0 );
+        ctxOpenStr.insert( 4, ctxUnprovenAttr );
+        ctxOpenStr += ctxUnprovenLegend;
+    }
+
+    // PR #215 review item 9: the whole-file serving prints <s n= sc= l=/> anchor rows inside <src p=>, and
+    // carried NO legend at all — sc= (and id= before it) was an undefined first-screen attribute on the one
+    // --expand shape that has no other legend to read. One clause, on the shape that emits the rows. No "--"
+    // anywhere: it rides inside an XML comment, where a double hyphen is ill-formed (G4).
+    if( serveWholeFile )
+    {
+        ctxOpenStr += kExpandWholeFileLegend;   // …the SAME bytes chooseExpandServe charged the file candidate
+    }
+
+    // r27-emitters T2: the ride-along map. A bare `--expand=SYM` costs ~24 KB for a ~1.4 KB body because the
+    // 200-symbol default map is emitted alongside it, and nothing ever said so. The M6 auto-selection above
+    // now drops the whole bundle when the FILE is cheaper; when the bundle (map included) IS the cheaper
+    // complete answer, the map still rides and the caller is still TOLD, with --top-k=0 as the documented off
+    // switch. Fires only when the user did not choose a top-k themselves, and never in whole-file mode (there
+    // is no map riding along to warn about).
+    // V1: also never fires when mapTopK==0 via exactNameExpandDefault — there is no map riding along to warn
+    // about there either, and printing "top-0 map rides along" would be both false and confusing.
+    //
+    // #289: `noteAppliesToBundle` (every term of this condition except `!serveWholeFile`) and `noteBuf` were
+    // computed ONCE, ahead of the M6 fixpoint above, so chooseExpandServe's own bundle price already counts
+    // these bytes (expandmodecheck.sh (4d)). `!serveWholeFile` is the one term that could not be known until
+    // M6 ran, so it is applied here, at the two PRINT sites (stderr, kept for a human tailing the terminal,
+    // and the new `note=` attribute, so a caller reading only stdout — the common case for a tool-calling
+    // agent — sees it too). The issue's own POC lost test/shapingflagcheck.sh (A)'s pinned --top-k read-site
+    // count by copy-pasting the condition into a second `if`; reading one precomputed bool at two call sites
+    // is not a second read site.
+    const bool mapRidesAlongNotice = noteAppliesToBundle && !serveWholeFile;
+    if( mapRidesAlongNotice )
+    {
+        // In-band first: xmllint-safe (an XML comment may not carry "--", an attribute value can), so this is
+        // a `note=` attribute rather than the comment style ctxUnprovenLegend/kExpandWholeFileLegend use.
+        ASSUME( noteBytes > 0 && ctxOpenStr.rfind( "<ctx", 0 ) == 0 );
+        ctxOpenStr.insert( 4, noteBuf );
+        // CodeRabbit PR #292 finding 4052087924: "bodies" assumed --expand; an --outline-only request emits
+        // <outline>, never <bodies>. "payload" (same word kMapRidesAlongFmt's note= uses) covers both.
+        rw::emitTo( stderr, "codecortex: note — the ranked top-{} map rides along with your requested payload; add --top-k=0 for the payload alone (or --top-k=1 for a minimal map)\n", mapTopK );
+    }
+
+    // §F5 — THE CEILING VERDICT, taken here because this is the first point where every input to the map's own
+    // byte count is settled: mapTopK (post --max-tokens, post --adaptive) and payloadTokens (the §H7 charge that
+    // grows the header's est_tokens digits). `best` in the search above is INITIALISED to 1 — "emit one symbol
+    // even if nothing fits" — and nothing ever checked that floor against the ceiling: on src/ at N<=450 the
+    // floor alone (envelope + legend + this round's own disclosure clause) is 975 B against an 849 B cap, i.e.
+    // 15% over at rc=0 with empty stderr and the 849 printed inside the 975-byte document. A cap that can be
+    // overshot is not a cap, so where the map provably does not fit, it SAYS so — the over_ceiling treatment
+    // --for/--pack-task/--recall already give the identical state. MEASURED, never assumed. Monotone: the label
+    // only ADDS bytes to a document already past the ceiling, so there is no verdict to iterate.
+    //
+    // §C4 (wave 3): the verdict measures the EMITTED dialect (measureEmittedMapBytes), the search above still
+    // prices XML. That split is deliberate and it is the honest half of a two-part fix:
+    //   * the VERDICT is a claim about the document the caller receives, so it must measure that document —
+    //     and it is entirely inside this file, so it lands here, complete;
+    //   * the SEARCH picking a top-K from the XML rendering is disclosed by serialize.h's
+    //     `fit_measured_in":"xml"`, which is TRUE today and becomes FALSE the moment the search changes
+    //     dialect. That one word lives in serialize.h, which this lane does not own, so changing the search
+    //     here would ship a document whose own disclosure contradicts it. ROUTED, with the measurement, to
+    //     whoever owns both halves — the cap does not yet HOLD under --json, but from here it is LABELLED.
+    // §F5 (cont.): + mapCtxOpenBytes — the `<ctx>` opener a payload verb prints ahead of serialize()'s bytes
+    // is inside the delivered map portion (everything through `</r>`), so the verdict charges it exactly as
+    // the search above did; see mapCtxOpenBytes's own comment for the 1-byte-over measurement that found it.
+    // + (mapRidesAlongNotice ? noteBytes : 0) — CodeRabbit PR #292 finding 4052087920: the ride-along
+    // `note=` attribute lands inside that same `<ctx ...>` open tag exactly when mapRidesAlongNotice fires
+    // (just above, and already decided by here — unlike the search, which runs before `serveWholeFile` is
+    // known and so uses noteBytesForTopK's "would it apply" price instead), so it is map-portion bytes
+    // exactly like mapCtxOpenBytes; the verdict must charge it or a near-limit map can emit `note=` past
+    // fit_bytes with over_ceiling never set. `noteBytes` is already the real formatted length for the
+    // FINAL mapTopK (computed above at the noteAppliesToBundle fill), so this reuses it exactly rather than
+    // reformatting.
+    if( cfg.maxTokens > 0 && mapTopK > 0
+        && measureEmittedMapBytes( mapTopK, cfg.json ? 0 : payloadTokens ) + mapCtxOpenBytes + ctxUnprovenBytes
+               + ( mapRidesAlongNotice ? noteBytes : 0 ) > maxTokensCeilingBytes )
+    {
+        maxTokensFit.isOverCeiling = true;
+    }
+
+    std::size_t mapEstTokens = 0;   // --token-budget reads this — the SAME value serialize() puts in the header, never a second counter
+    if( serveWholeFile )
+    {
+        // M6 whole-file serving: the file IS the complete answer — no map, no <bodies>. The bytes were
+        // rendered (and the choice measured) above; --token-budget still gates the real document, charged
+        // at the BODY rate because this payload is raw code text, exactly like <src>/<bodies> sections.
+        // M11: no <r> header carries the price here, so the <ctx> root does — the SAME number the gate reads.
+        {
+            const std::size_t fixedBytes = ctxOpenStr.size() + wholeFile.xml.size() + ( sizeof( "</ctx>" ) - 1 );
+            std::size_t       estTokens  = 0;
+            // everything on this path is raw code text, so the whole document is priced at the BODY rate
+            const std::string attr       = rw::pricedRootAttr( fixedBytes, rw::kBytesPerTokenBody, 0, &estTokens );
+            rw::spliceRootAttrs( ctxOpenStr, attr );
+            mapEstTokens = estTokens;
+        }
+        std::fwrite( ctxOpenStr.data(), 1, ctxOpenStr.size(), out );
+        std::fwrite( wholeFile.xml.data(), 1, wholeFile.xml.size(), out );
+        std::fputs( "</ctx>", out );
+    }
+    else if( mapTopK > 0 )          // --top-k=0: payload only — skip the ranked map entirely (never the payload below)
+    {
+        if( hasExtension )
+        {
+            std::fwrite( ctxOpenStr.data(), 1, ctxOpenStr.size(), out );   // "<ctx>", or M6 bundle mode's decorated form
+        }
+        // #289: serve the requested bodies BEFORE the ranked map, not after. The map is orientation for a
+        // name the caller could not fully pin down (or chose to keep alongside an exact one); the bodies are
+        // the terminal answer §9 (methodology) says the document should lead with. bodiesSection was already
+        // fully rendered into memory above (rw::chargeSection, ahead of payloadTokens), so this is a pure
+        // reorder of already-computed bytes — no re-render, no byte-count change, so it does not touch
+        // chooseExpandServe's pricing fixpoint or the map's own est_tokens= (both already counted these bytes
+        // via payloadTokens/bodiesSection.tokens). §H7 below skips its own bodies emission when this fires
+        // (bodiesEmittedEarly).
+        //
+        // #289 review fix (rv-p5-expand HIGH): gated on `noteAppliesToBundle`, the SAME precomputed firing
+        // condition `note=` uses — not `!expandNodes.empty()` alone. An unguarded reorder also fired on an
+        // EXPLICIT non-zero --top-k (unique or ambiguous name alike), which docs/COMMANDS.md's --help text
+        // promises "keeps the classic undecorated shape" for — an explicit top-k choice opts OUT of every
+        // M6/§289 auto-decoration, ordering included. `noteAppliesToBundle` already carries the explicit-
+        // top-k exclusion, so reusing it (rather than adding a second field read for the same exclusion)
+        // keeps test/shapingflagcheck.sh (A)'s pinned read-site count exact — spelled around here in prose,
+        // not as the literal source token, for that same reason (the count is a naive grep over this file).
+        if( !expandNodes.empty() && noteAppliesToBundle )   // !serveWholeFile is this whole branch's precondition (see the if above)
+        {
+            emitSection( bodiesSection, [ & ]{ packBodies( out, ing, expandNodes, cfg.packBudgetBytes, g.outOff, g.outTargets, cfg.compress, redactPtr,
+                                                           expandRanges.empty() ? nullptr : &expandRanges, d.notesPtr, /*outEmitted=*/nullptr,
+                                                           /*truncateOversizedFirst=*/true, /*withFileContext=*/true, mapRootArg ); } );
+            bodiesEmittedEarly = true;
+        }
+        // T3: fill-aware auto important-last — ONLY on this, the default map emission. --no-auto-order opts
+        // out; an explicit --most-important-last or --stable always wins (serialize.h). test/fixture
+        // (est_tokens=619) and src/ (~10.6K) both stay under the ~16K threshold, so the default/golden output is
+        // unchanged — this only engages on large maps. §F5: the flip also LENGTHENS the order= spelling by 11
+        // bytes, which the --max-tokens probe above now prices because it reads the same `mapAutoOrder`; the
+        // comment that used to sit here asserted the opposite ("cannot affect the --max-tokens binary search").
+        PROFILE_SCOPE_DESCRIBE( "emit: serialize ranked map" );
+        // L2: --json's default-map sibling. jsonUnsupportedVerb() already refused every combination this
+        // path doesn't cover (--scip/--map-diff/--pack-signatures/--expand/--outline/--pack-top-n), so the
+        // extension blocks below (hasExtension) are correctly no-ops since their trigger flags are all
+        // refused above. §A4b: MULTI-ROOT was never in that refusal list despite serialize.h's comment
+        // claiming it was — the JSON sibling emits the roots table itself now, as the XML always has.
+        // §F5: mapAnn / mapProvPtr / mapAutoOrder are resolved once, ABOVE the --max-tokens search, so the
+        // probe and this emission describe the same document — see their definitions there (that hoist carries
+        // the r26-stamp / §A9.6 / §A4d / §B1.2 rationale the ternaries used to carry here).
+        if( cfg.json )
+        {
+            serializeJson( out, ing, rank, g.outOff, g.outTargets, mapTopK, cfg.mostImportantLast, cfg.metrics,
+                           fanInPtr, &g.ambOut, cfg.stable, cboPtr, testedPtr, lcom4Ptr, ampPtr, &g.unresolvedOut,
+                           g.bindLabel.empty() ? nullptr : &g.bindLabel, mapAutoOrder, &mapEstTokens, mapProvPtr, mapAnn, mapRootArg, &g.locPinOut, g.externalCalls, &g.declinedOut );
+        }
+        else
+        {
+            serialize( out, ing, rank, g.outOff, g.outTargets, mapTopK, cfg.mostImportantLast, cfg.metrics, fanInPtr, &g.ambOut, cfg.stable, mapProvPtr, cboPtr, testedPtr, lcom4Ptr, ampPtr, &g.unresolvedOut, g.bindLabel.empty() ? nullptr : &g.bindLabel, mapAutoOrder, &mapEstTokens, payloadTokens, mapAnn, /*statsFirstScreen=*/false, mapRootArg, &g.locPinOut, g.externalCalls, &g.declinedOut );
+        }
+    }
+    else
+    {
+        // --top-k=0: serialize() (which normally folds payloadTokens into mapEstTokens for exactly this
+        // reason) never ran, so --token-budget would gate on 0 and pass no matter how large the payload is.
+        // The payload IS the emitted output here — budget against it. (Explicit --top-k=0 never enters the
+        // M6 auto scope, so ctxOpenStr is the bare "<ctx>" on this path.)
+        if( hasExtension )
+        {
+            // M11: the <ctx> root prices the payload-only document — the SAME number --token-budget gates on
+            // (mapEstTokens below), so a parser reads the price the map's <r> header would otherwise carry.
+            rw::spliceRootAttrs( ctxOpenStr, " est_tokens=\"" + std::to_string( payloadTokens ) + "\""
+                                              + ( mapAnn.payloadUncharged ? " est_measured=\"0\"" : "" ) );
+            std::fwrite( ctxOpenStr.data(), 1, ctxOpenStr.size(), out );
+            if( mapAnn.payloadUncharged )
+            {
+                rw::emitRaw( out, rw::kEstModelledLegend );   // the attribute is defined where it is met
+            }
+        }
+        mapEstTokens = payloadTokens;
+    }
+
+    // §H7: the appended sections, in the same order as before — from the bytes already RENDERED and CHARGED
+    // above, so what the header priced and what stdout receives are the same bytes by construction, not by two
+    // pieces of code agreeing. A section whose pre-render degraded (isRendered=false) is emitted here directly.
+    //
+    // --expand=NAME,... or --expand=NAME:START-END,...: the full (or, with a range, a SLICED) def bodies for
+    // the named symbols — the L4 "one definition, not the whole file" rung, plus octocode's partial-fetch rung
+    // on top of it. --outline=NAME,...: control-flow skeletons (L3), the ladder's middle rung. Both compose
+    // with --pack-signatures (skeleton + bodies).
+    // §F1: rw::emitChargedSection, shared with the four emission points the --for / --pack-task / --around
+    // lenses gained (serialize.h, beside chargeSection — the two halves of one contract belong together).
+    // emitSection itself is declared above, beside serveWholeFile — #289's early-bodies emission needs it too.
+    if( cfg.packSignatures )
+    {
+        emitSection( sigsSection, [ & ]{ packSignatures( out, ing, rank, cfg.packTopN > 0 ? cfg.packTopN : 50, cfg.packBudgetBytes, false, nullptr, impurePtr, redactPtr,
+                                                         nullptr, nullptr, nullptr, nullptr, false, 0, nullptr, mapRootArg ); } );
+    }
+    else if( cfg.packTopN > 0 )
+    {
+        emitSection( srcSection, [ & ]{ packSource( out, ing, rank, cfg.packTopN, cfg.packBudgetBytes, redactPtr ); } );
+    }
+    if( !expandNodes.empty() && !serveWholeFile && !bodiesEmittedEarly )   // #289: already served ahead of the map below
+    {
+        emitSection( bodiesSection, [ & ]{ packBodies( out, ing, expandNodes, cfg.packBudgetBytes, g.outOff, g.outTargets, cfg.compress, redactPtr,
+                                                       expandRanges.empty() ? nullptr : &expandRanges, d.notesPtr, /*outEmitted=*/nullptr,
+                                                       /*truncateOversizedFirst=*/true, /*withFileContext=*/true, mapRootArg ); } );   // L3: --expand bodies surface notes; V1: sibs=/inc=
+    }
+    if( !outlineNodes.empty() )
+    { // resolved (and refused on a miss) above, before the first stdout byte
+        emitSection( outlineSection, [ & ]{ packOutline( out, ing, outlineNodes, cfg.packBudgetBytes, cfg.compress, redactPtr, mapRootArg ); } );
+    }
+
+    if( hasExtension && !serveWholeFile )   // M6: the whole-file branch closed its own root
+    {
+        rw::emitRaw( out, "</ctx>" );
+    }
+
+    reportRedactions( stderr, redactCounts );
+
+    // --token-budget=N: repomix-style CI contract — ASSERTS the emitted map's est_tokens against a ceiling
+    // (composes freely with --max-tokens, which SHAPES the map to hit a target instead). §P6.8: closes the
+    // buffer, and on exit 3 the buffered body never reaches stdout (finishTokenBudgetGate's own comment has
+    // the full reasoning) — a small refusal record instead, shaped to match --json.
+    if( std::optional<int> gated = finishTokenBudgetGate( tbStream, tbSink, stdout, mapEstTokens, cfg.tokenBudget, cfg ) )
+    {
+        return *gated;
+    }
+
+    // A4-F18: a short fwrite anywhere in the emitters (disk full, closed pipe) sets ferror(stdout);
+    // fail loudly instead of exiting 0 with a silently-truncated map (CI gates trust the exit code)
+    if( std::fflush( stdout ) != 0 || std::ferror( stdout ) )
+    {
+        rw::emitRaw( stderr, "codecortex: write error — output truncated\n" );
+        return 1;
+    }
+
+    return 0;
+}
+
+// L2: --json is scoped to the CI/scripting core verbs (default map, --for, --pack-task,
+// --callers/--callees/--impact, --quality-delta, --test-gate, --metrics).
+// Returns the flag name to name in the refusal, or nullptr when the request is one of the 7 supported
+// shapes. Deliberately enumerates every OTHER verb-selecting flag (the ALLOW list is exactly 7 things;
+// everything else defaults to REFUSED) rather than trying to recognize "is this the plain default map" —
+// a newly-added verb this list forgets to update stays safely refused under --json instead of silently
+// emitting stale/wrong XML, the safe failure direction for an additive flag.
+//
+// §B1.1 (capture-audit-4, 2026-07-30, owner ruling: REFUSE-ALL): eight verb surfaces reached a --json
+// caller with NO arm here at all — whereis/stray-content/abi/exercises/community=ID/doc-drift/flags
+// (darkFlags)/layout — so they fell all the way through to `return nullptr` and dispatched normally,
+// emitting XML at exit 0 under --json. That falsified this function's own contract ("everything else
+// defaults to REFUSED"): the contract was true of every verb this list knew about, not every verb that
+// dispatches. Added below as their own group so the next verb added to main() is the only thing that can
+// go stale again — not this whole tail.
+//
+// §B1.4: the tail of this list is NOT verbs — --format=columnar/candidates, --detail and --scip are output-
+// SHAPE modifiers, and a refusal that enumerates them against "supported verbs" sends the reader hunting for
+// a verb to drop instead of an encoding to pick. The return value says which kind it found, so the caller can
+// word the two cases differently.
+// §B11.4 — THE REPORT-VERB PRECEDENCE TABLE, in codecortex's real DISPATCH order (main()'s handler chain, then
+// each handler's own arm order). One row per verb-selecting flag, so adding a verb is adding a ROW rather
+// than editing a message — the house rule for exactly this shape.
+//
+// §M1 (audit 2026-08-08) — this table used to EXCLUDE --for/--query/--pack-task, on the claim that "X9(c)
+// above already discloses those three". That claim was false in the direction that mattered: X9(c) discloses
+// collisions AMONG the three and nothing else, so a query-family flag paired with any of the ~50 report verbs
+// below was dropped in TOTAL silence — stderr empty, exit 0 — the exact hazard this table exists to close.
+// The silence was also not uniform, so no caller could infer the rule from one observation: --for dispatches
+// ahead of the whole table, --query behind all of it, and --pack-task in between (it loses to --skipped and
+// wins over --lint). All three are now ROWS, at their real dispatch positions, which is this table's own
+// house rule — a verb is a row, not a special case. M1 changed no behaviour: the same verb still won every
+// pair; only the silence was gone.
+//
+// §A2 (audit 2026-08-08) — M1 disclosed the order and, in doing so, made it legible enough to see it was
+// indefensible: three flags of one family gave three different answers to "does a typed task outrank a
+// report verb?". The family now dispatches UNIFORMLY FIRST, so the three rows below are contiguous at the
+// TOP. A typed task is the caller's PRIMARY intent; a report verb passed alongside it is incidental. This IS
+// a behaviour change — --skipped/--hotspots no longer beat --pack-task, and no report verb beats --query —
+// and it is the point, not a side effect. Intra-family order stays X9(c)'s: --for > --pack-task > --query.
+//
+// The one true half of the old claim is kept as `isQueryFamily`: one run must never print two warnings about
+// the same collision, so an ignored query-family flag is skipped when the WINNER is also query-family —
+// that pair is X9(c)'s, and X9(c) words it better. Every other combination is this table's.
+//
+// §F1 (audit 2026-08-08) — the adversarial verifier found the table was still INCOMPLETE, in the same way
+// and with the same symptom M1 had closed for the query family: eleven verb-shaped flags selected a handler
+// yet owned no row, so each collided with a real verb at stderr-EMPTY, exit 0. `--quality-panel --lint`
+// emitted panel bytes and said nothing; `--expand=SYM --lint` emitted LINT bytes and threw --expand away. A
+// sweep of --help against this table (rather than trusting the reported list) turned up all of them:
+//
+//   --index-out                                            pre-ingest, ahead of EVERY verb incl. the family
+//   --ensemble, --context-ratio                            runMaintenanceViews arms 1-2, ahead of --hotspots
+//   --readability, --comment-coherence, --nonlocal-state,   runQualityViews arms 1-6, ahead of --dead-code
+//   --quality-panel, --naming-calibration, --naming-consistency
+//   --handoff                                              runChangeViews arm 1, ahead of --situ
+//   --field-affinity                                       between --layout and --doc-drift
+//
+// All eleven are rows now, at their REAL dispatch positions. Like M1, this changed no behaviour: the same
+// verb still wins every pair; only the silence is gone. --quality-panel losing to --hotspots and beating
+// --lint is not the §A2 non-uniformity — §A2 was about ONE FAMILY answering one question three ways. A
+// single flag sitting at one position and being disclosed there is exactly what every other row does.
+//
+// --index-out is the one row that can beat a query-family flag, because it runs before ingest (it IS the
+// ingest-artifact generator). That is why X9(c) is now gated on the family actually winning: a run that
+// --index-out answered must not also print "--for takes precedence".
+//
+// Still excludes pure MODIFIERS (--metrics, --stable, --format=, --top-k, --rank-by…), which shape whatever
+// verb runs rather than selecting one, and --scan-skills/--scan-skill, which dispatch before the graph is
+// built and never reach this chain. §F1 verified the modifier side too: every refuse-alone flag
+// (--compress, --with-graph, --gateability, --plan, --adaptive…) already names its host verb, and --metrics/
+// --rank-by/--top-k tune the SAME <r> map document rather than replacing it.
+//
+// §F1 also introduces a THIRD class these two never covered — see kMapModifiers below.
+//
+// The order below is not asserted by reading: test/dispatchordercheck.sh runs every PAIR and checks that the
+// verb this table names as the winner is the verb whose bytes actually came out, so a table that rots reds
+// by name instead of shipping a confident lie.
+// isQueryFamily marks the three flags X9(c) speaks for; it defaults to false, so the ~50 report rows below
+// stay two-field and only the three query-family rows spell the third value.
+struct ReportVerbSlot { const char* flag; bool isActive; bool isQueryFamily = false; };
+
+// The scan is separate from the printing because TWO callers need the winner: this table's own warning, and
+// X9(c), which may only speak when the query family is the thing that actually answered (§F1 — --index-out
+// is a row ahead of the family, so "the family always wins if present" stopped being true).
+struct VerbPrecedence
+{
+    const char* winner              = nullptr;
+    bool        winnerIsQueryFamily = false;
+    std::string ignored;
+};
+
+VerbPrecedence scanReportVerbPrecedence( const rw::Config& c )
+{
+    const ReportVerbSlot slots[] = {
+        // §F1: --index-out dispatches BEFORE ingest, so it outranks even the query family. One row, at the top.
+        { "--index-out",        !c.indexOut.empty()       },
+        { "--help-task",        !c.helpTask.empty()       },
+        // §A2: the query family, contiguous and first among the report verbs — these three outrank every one below.
+        { "--for",              !c.forTask.empty(), true  }, { "--pack-task",     c.packTaskFlag,    true },
+        { "--query",            !c.query.empty(),   true  },
+        { "--lego",             !c.legoType.empty()       }, { "--exemplar",     !c.exemplar.empty()      },
+        { "--recall",           !c.recall.empty()         }, { "--deps",          c.deps                  },
+        { "--arch",             !c.archRules.empty()      },
+        { "--ensemble",          c.ensemble               }, { "--context-ratio", c.contextRatio          },   // §F1: runMaintenanceViews arms 1-2
+        { "--hotspots",          c.hotspots               },
+        { "--clones",            c.clones                 }, { "--cochange",      c.cochange              },
+        { "--owners",            c.owners                 }, { "--quality-baseline", c.qualityBaseline    },
+        { "--quality-delta",     c.qualityDelta           }, { "--dmm",           c.dmm                   },
+        // §F1: runQualityViews' six lenses, in its own arm order, all ahead of --dead-code
+        { "--readability",       c.readability            }, { "--comment-coherence", c.commentCoherence  },
+        { "--nonlocal-state",    c.nonlocalState          }, { "--quality-panel", c.qualityPanel          },
+        { "--naming-calibration", c.namingCalibration     }, { "--naming-consistency", c.namingConsistency },
+        { "--dead-code",         c.deadCode               },   // the row order IS the dispatch order (test/dispatchordercheck.sh pins every pair) — never re-pair for layout
+        { "--edit-check",       !c.editCheckSym.empty()   }, { "--safe-delete",  !c.safeDeleteSym.empty()  },
+        { "--slice",            !c.sliceSpec.empty()      },   // lane/paper-slice: dispatches right after --safe-delete (runSlice)
+        // lane/tc-sliceat: beside --slice, the at flag is that verb's LINE SEED (runSlice consumes it —
+        // ARISE seeds its slicer at (file, line[, variable])), so the pair COMPOSES and never surfaces
+        // as a dropped-verb warning; alone, the at flag is still the enclosing-chain report (runAt).
+        { "--at",               !c.atSpec.empty() && c.sliceSpec.empty() },
+        { "--eval",              c.eval                   },
+        { "--eval-retrieval",    c.evalRetrieval          }, { "--eval-skills",  !c.evalSkills.empty()    },
+        { "--callers",          !c.callers.empty()        }, { "--callees",      !c.callees.empty()       },
+        { "--graph-query",      !c.graphQuery.empty()     }, { "--uses",         !c.usesSym.empty()       },
+        { "--verify",           !c.verifyClaim.empty()    },   // G4: dispatches between --uses and --external-surface (runVerify)
+        { "--external-surface",  c.externalSurface        }, { "--path",         !c.pathSpec.empty()      },
+        { "--connect",          !c.connectSpec.empty()    }, { "--impact",       !c.impactSym.empty()     },
+        { "--mentions",         !c.mentionsSym.empty()    }, { "--affected",     !c.affectedFiles.empty() },
+        { "--exercises",         c.exercisesFlag          },
+        { "--handoff",           c.handoff                },   // §F1: runChangeViews' first arm, ahead of --situ
+        { "--situ",              c.situ                   },
+        { "--test-gate",         c.testGate               }, { "--pr-context",    c.prContext             },
+        { "--export=cc.json",    c.exportCcJson           }, { "--merge-scout",   c.mergeScoutFlag        },
+        { "--plan-lanes",        c.planLanesFlag          }, { "--stray-content", c.strayContent          },
+        // H12 (capture-audit 2026-09-04): --abi used to own a row here, but it never independently
+        // dispatches — src/verbs_change.h::runCrossRef only ever reads cfg.abiFlag NESTED inside
+        // `if( cfg.strayContent )`, and --abi alone refuses ("composes with --stray-content's sweep —
+        // pass both", cli.h) exactly like --plan/--gateability/--detail/--partition, none of which own a
+        // row either. Giving it one made this table claim --stray-content beats --abi and print "IGNORED
+        // this run: --abi" while stdout was the <abi> root the whole time — the table naming a winner
+        // dispatch never asked. --abi is a MODE of --stray-content (like --plan), not a competing verb,
+        // so `--stray-content --abi` composes silently, same as `--stray-content --plan` already does.
+        { "--eval-stray",       !c.evalStray.empty()      },
+        { "--flags",             c.darkFlags              }, { "--whereis",       c.whereisFlag           },
+        { "--layout",            c.layoutFlag             },
+        { "--field-affinity",    c.fieldAffinity          },   // §F1: runFieldAffinity, between --layout and --doc-drift
+        { "--doc-drift",         c.docDrift               },
+        { "--plan-lint",        !c.planLintFile.empty()   },   // P3.2: runPlanLint, right after runDocDrift
+        { "--from-trace",       !c.fromTrace.empty()      }, { "--run-trace",     !c.runTrace.empty()     },
+        { "--note-add",          c.noteAddFlag            },
+        { "--notes",             c.notesList              }, { "--skipped",       c.skippedList           },
+        { "--communities",       c.communities            },
+        { "--community",         c.communityFlag          }, { "--zoom",          c.zoom                  },
+        { "--seams",             c.seams                  }, { "--report",        c.report                },
+        { "--tree",              c.tree                   }, { "--grep",         !c.grep.empty()          },
+        { "--match",            !c.match.empty()          }, { "--pattern",      !c.pattern.empty()       },
+        { "--lint",              c.lint                   },
+        { "--around",           !c.around.empty()         },
+    };
+
+    VerbPrecedence prec;
+    for( const ReportVerbSlot& s : slots )
+    {
+        if( !s.isActive )
+        {
+            continue;
+        }
+        if( prec.winner == nullptr )
+        {
+            prec.winner              = s.flag;
+            prec.winnerIsQueryFamily = s.isQueryFamily;
+            continue;
+        }
+        if( s.isQueryFamily && prec.winnerIsQueryFamily )
+        {
+            continue;   // X9(c) already disclosed this exact pair — one collision, one warning
+        }
+        if( !prec.ignored.empty() )
+        {
+            prec.ignored += ", ";
+        }
+        prec.ignored += s.flag;
+    }
+    return prec;
+}
+
+void warnReportVerbPrecedence( const VerbPrecedence& prec )
+{
+    if( prec.ignored.empty() )
+    {
+        return; // 0 or 1 verb — nothing was dropped, so nothing is said
+    }
+
+    rw::emitTo( stderr, "codecortex: {} takes precedence when several verbs are given — IGNORED this run: {}. "
+                          "The winner is fixed by codecortex's dispatch order, NOT by the order you typed them; "
+                          "pass one verb per run.\n", prec.winner, prec.ignored.c_str() );
+}
+
+// §F1 — THE MAP-MODIFIER CLASS, the third kind §B11.4's two classes never covered.
+//
+// --expand / --outline / --pack-signatures / --pack-top-n / --map-diff are NOT verbs: not one of them selects
+// a handler. They shape what runDefaultMap RENDERS, and runDefaultMap serves exactly two runs — a flagless
+// map, and --query (which, as main() puts it, "owns no handler of its own: runDefaultMap serves it and is
+// also this chain's fallback"). That single architectural fact settles the question the audit called hard,
+// and settles it UNIFORMLY:
+//
+//   a map-modifier COMPOSES with any run that reaches the default map, and is VOIDED by any report verb that
+//   answers before it — and being voided is DISCLOSED.
+//
+// So --expand is a modifier, always; it is never a verb that "lost". It does not lose to --lint — --lint
+// returns before the map it shapes is ever rendered. Giving it a table ROW would encode the opposite claim
+// and would be provably wrong in one case the gate pins: under `--query --expand` stdout is NOT --query's
+// solo output, because the two compose, and a row means winner-or-loser with nothing in between.
+//
+// The disclosure is not cosmetic. A silently dropped --expand does not return a thinner answer to the
+// caller's question the way a dropped --top-k would; it returns an answer to a DIFFERENT question — the
+// bodies that were asked for are simply absent — which is precisely non-negotiable #3's "a zero means none
+// found, never none exists".
+//
+// composesWithQuery / composesWithFor are per-flag because the composition genuinely is: --pack-top-n also
+// budgets --for's bodies, and --map-diff is the one --query overrides (its lexical-rank branch replaces the
+// diff scope). Both are measured facts, pinned pair-by-pair in test/dispatchordercheck.sh's mapmod arm, not
+// assertions of intent.
+struct MapModifierSlot
+{
+    const char* flag;
+    bool        isActive;
+    bool        composesWithQuery;
+    bool        composesWithFor;
+};
+
+void warnMapModifierDiscarded( const rw::Config& c, const VerbPrecedence& prec )
+{
+    if( prec.winner == nullptr )
+    {
+        return;   // no verb answered, so the default map IS the run — every map-modifier applied
+    }
+
+    const MapModifierSlot mods[] = {
+        { "--expand",           !c.expand.empty(),   true,  false },
+        { "--outline",          !c.outline.empty(),  true,  false },
+        { "--pack-signatures",   c.packSignatures,   true,  false },
+        { "--pack-top-n",        c.packTopN > 0,     true,  true  },
+        { "--map-diff",          c.mapDiff,          false, false },
+    };
+
+    const bool winnerIsQuery = std::strcmp( prec.winner, "--query" ) == 0;
+    const bool winnerIsFor   = std::strcmp( prec.winner, "--for" )   == 0;
+
+    std::string discarded;
+    for( const MapModifierSlot& m : mods )
+    {
+        if( !m.isActive )
+        {
+            continue;
+        }
+        if( ( winnerIsQuery && m.composesWithQuery ) || ( winnerIsFor && m.composesWithFor ) )
+        {
+            continue;   // this one composed with the winner — nothing was dropped, so nothing is said
+        }
+        if( !discarded.empty() )
+        {
+            discarded += ", ";
+        }
+        discarded += m.flag;
+    }
+    if( discarded.empty() )
+    {
+        return;
+    }
+
+    rw::emitTo( stderr, "codecortex: {} answered, so the default map never rendered — DISCARDED this run: {}. "
+                          "Those flags shape the map only; pass them with --query=TERMS or with no verb at all.\n",
+                  prec.winner, discarded.c_str() );
+}
+
+// L2 — the ALLOW-list, and why it is walked over the flag TABLES rather than written as an if-chain.
+//
+// Capture-audit 2026-09-04 (H2): this function was a 77-arm DENY chain that its own header called an
+// allow-list. A deny chain allows by omission, so every verb nobody added to it — twelve of them, the whole
+// newer quality-lens family plus --dmm/--handoff/--lint-catalog/--field-affinity, and --index-out, which
+// WROTE its artifacts at exit 0 — accepted --json and emitted XML with nothing on stderr. The family had
+// been closed twice before (§B1.1's "eight surfaces this list forgot", §B1.5's five self-eval verbs), each
+// time by enumerating members, and each time it re-opened on the member nobody enumerated.
+//
+// Now the supported set is the enumeration and everything else refuses BY DEFAULT: the two tables below
+// name (a) the verbs that own a JSON emitter and (b) the flags that may ride along with one, and
+// firstFlagOutside() walks kBoolFlags/kViewFlags — the same rows parseArgs matched — for any set flag that
+// is in neither. A verb added tomorrow is refused tomorrow, and test/jsoncheck.sh's arm #8b sweeps the same
+// universe (test/flaguniverse.py) so a silent XML fallback cannot ship. The hand-written parseArgs arms the
+// tables cannot see (kHandWrittenFlagArms) are named one by one at the top, which is the honest cost of
+// that residue.
+
+// the verbs with a JSON twin — the read sites of cfg.json outside this refusal (`codecortex . --grep=cfg.json`)
+inline constexpr std::string_view kJsonVerbs[] =
+{
+    "--for", "--pack-task", "--callers", "--callees", "--impact", "--quality-delta", "--test-gate", "--metrics",
+    "--plan-lanes",   // JSON-NATIVE: emits JSON with or without the flag, and says so (the redundancy note in main)
+};
+
+// the flags that may ride along under --json without selecting a verb of their own: the map-shaping flags (a
+// bare --json run IS the default map, and these shape it), the lens toggles of the JSON verbs above, and the
+// shape modifiers whose collision the SECOND sentence below reports (--scip, --legend). A modifier of a verb
+// that itself refuses --json is deliberately NOT here — its verb is named first, which is the answer.
+inline constexpr std::string_view kJsonRideAlongFlags[] =
+{
+    "--json", "--ignore-tests", "--no-cache", "--no-ignore", "--no-stable", "--refetch", "--compress", "--no-redact",
+    "--cache", "--since", "--pin-census", "--scip", "--legend",
+    "--anchor", "--no-route", "--adaptive", "--no-mention-boost", "--cochange-boost", "--no-doc-mention", "--signatures-only",
+    "--auto-bodies", "--with-graph", "--scope", "--task", "--brief",
+};
+
+// the first flag set on this invocation that is NEITHER a JSON verb NOR a ride-along — the verb to name in the
+// refusal. Bool rows first so a verb outranks the modifier typed beside it (`--lint --lint-select=x` names
+// --lint); a value row whose companion bool is a different spelling (--listen= → mcp) is named explicitly by
+// the caller ahead of this walk.
+std::string_view firstFlagOutside( const rw::Config& c, std::span<const std::string_view> verbs, std::span<const std::string_view> rideAlong )
+{
+    const auto isAllowed = [ & ]( std::string_view name ) noexcept
+    {
+        return std::ranges::find( verbs, name ) != verbs.end() || std::ranges::find( rideAlong, name ) != rideAlong.end();
+    };
+    for( const rw::BoolFlag& f : rw::kBoolFlags )
+    {
+        if( c.*f.member && !isAllowed( f.lit ) )
+        {
+            return f.lit;
+        }
+    }
+    for( const rw::ViewFlag& f : rw::kViewFlags )
+    {
+        const std::string_view name = f.prefix.substr( 0, f.prefix.size() - 1 );   // "--callers=" → "--callers"
+        if( !( c.*f.member ).empty() && !isAllowed( name ) )
+        {
+            return name;
+        }
+    }
+    return {};
+}
+
+// the flags that shape the bare map without selecting a verb: a run whose every set table flag is in here, and
+// whose hand-written riders (--expand/--outline/--pack-top-n/--export=cc.json) are off, IS the default map.
+// --metrics and --map-diff ride it without bodies; --pack-signatures is deliberately NOT here (it serves
+// signature bodies through redactPtr, so --no-redact composes with it).
+inline constexpr std::string_view kMapShapingFlags[] =
+{
+    "--json", "--ignore-tests", "--no-cache", "--no-ignore", "--no-stable", "--refetch", "--compress", "--no-redact",
+    "--cache", "--since", "--pin-census", "--scip", "--legend", "--metrics", "--map-diff",
+};
+
+bool isBareMapRun( const rw::Config& c )
+{
+    return firstFlagOutside( c, {}, kMapShapingFlags ).empty()
+        && c.expand.empty() && c.outline.empty() && c.packTopN <= 0 && !c.exportCcJson;
+}
+
+// capture-audit 2026-09-04 (M16): two modifiers that were silently INERT alone — bare, each emitted the
+// byte-identical default map at exit 0 with an empty stderr, while their siblings (--run-timeout,
+// --slice-depth, --ack-only) refuse naming the pairing. Both need main's knowledge to judge "alone" (the flag
+// universe walk, the root list), so they are refused here rather than in cli.h's validateModifierGuards.
+//   --no-redact  serves BODIES verbatim — redactPtr is what the body emitters take (--expand/--for/--pack-task/
+//                --recall/--slice/--connect/--from-trace/--batch/--mcp …). The default map carries no bodies
+//                (identifiers and signatures are never redacted, by design): on the bare map there is nothing
+//                to un-redact, so the refusal names a body-serving verb.
+//   --refetch    re-clones a git-URL root and reaches nothing on a local path.
+//   --html       H1 (2026-09-06): writeHtml() is called from ONE place — runDefaultMap — and every
+//                navigation/report verb pre-empts the default map in the dispatch chain below, so
+//                `--around=SYM --html=F` exited 0, wrote no file, and said nothing. See kHtmlRideAlong.
+
+// H1 — the flags --html composes WITH, beyond kMapShapingFlags.
+//
+// THE DEFECT. `codecortex <dir> --around=writeHtml --html=/tmp/h.html` exited 0 and wrote nothing; the same
+// argv without --around wrote 59 KB. Same for --callers/--impact/--for/--lint/--hotspots, and a derived
+// sweep of the whole flag universe (test/htmlhostcheck.sh) found 74 flag x --html combinations in that
+// state. The MIRROR of this guard already existed and was loud: `--color-by` without `--html` refuses and
+// names --html (cli.h validateModifierGuards). This is the other half.
+//
+// REFUSE, NOT HONOUR — the decision, and why. Honouring would mean rendering the verb's scoped node set as
+// the page, and that is a worse answer than it sounds: the page's three views are an overview of Louvain
+// MODULES, a module subgraph, and a depth-bounded EGO GRAPH, all computed client-side over the whole
+// selected map. Over a 20-node --around slice the module overview is empty and the ego graph is a
+// re-derivation of the slice itself, so `--around=X --html=F` would produce a page answering a different
+// question from the one --around answers, with no tell. The page ALREADY does what that caller wants, and
+// now does it by name: `#node/X/2` is the depth-2 neighbourhood of X, so the refusal has somewhere real to
+// point. Refusing is also the smaller change (one predicate, no new emit path) and it is the one that
+// satisfies non-negotiable #3 — a caller can tell a no-op from a typo.
+//
+// DERIVED, NOT ENUMERATED. The 74 verbs are not listed here. firstFlagOutside() walks kBoolFlags/kViewFlags
+// — the rows parseArgs itself matched — so the refusal is "anything that is not on the compose list",
+// which makes a verb added tomorrow refuse tomorrow with nobody editing anything. Every previous closure of
+// this family in this repo was done by enumerating members and re-opened on the member nobody enumerated
+// (jsonUnsupportedVerb's 77-arm chain missed 12; the shaping-flag guards missed 18). The residual risk runs
+// the OTHER way — a new MAP-SHAPING flag would refuse until it is added below — and that direction is the
+// safe one: a loud refusal on a legal combination is noticed the first time it happens, a silent drop is
+// not. test/htmlhostcheck.sh arm (B) pins the compose list from the behaviour side.
+//
+// The list itself: kMapShapingFlags (a bare --json run IS the default map and these shape it) plus --html's
+// own two spellings, --query (the dispatch chain hoists it straight into runDefaultMap), the map's
+// body-serving riders that append blocks to the same map (--expand/--outline/--pack-signatures), and the
+// crawl/ordering shapers. Verified against the sweep: every one of these still WRITES the page.
+inline constexpr std::string_view kHtmlRideAlong[] =
+{
+    "--html", "--query", "--expand", "--outline", "--pack-signatures", "--exclude",
+    "--most-important-last", "--no-auto-order", "--no-post-check", "--route", "--stable",
+};
+
+// C1-b (CodeRabbit + Fable review on #212) — --in=DIR's own preemption sweep, the SAME shape as --html's above
+// and for the same reason, one layer deeper.
+//
+// THE DEFECT. cli.h's guard can say "--rank-by=churn-decay is not selected"; it cannot say "something else is
+// going to ANSWER". `--in=src --map-diff` exited 0 with 28 KB of map, zero <recent> and zero <symbols>, and a
+// header still reading rank_by="churn-decay" — the map-diff branch precedes the churn branch in runDefaultMap,
+// so the block --in scopes was never built. The same hole held --expand/--outline/--pack-signatures/--mermaid
+// (they ride the map --in stubs: --expand even prints "add --top-k=0 for the bodies alone" while --top-k is
+// refused beside --in), --doctor, --batch, --mcp and the CLI edit bridge, none of which reach runDefaultMap at
+// all. A first fix keyed on "a report verb won dispatch" and closed only the slots scanReportVerbPrecedence
+// knows; these are all OUTSIDE that table.
+//
+// DERIVED, NOT ENUMERATED — the argument htmlPreemptedBy makes in full above, which applies here verbatim:
+// firstFlagOutside() walks the rows parseArgs itself matched, so the refusal is "anything that is not on the
+// compose list" and a flag added tomorrow refuses tomorrow with nobody editing this. The residual risk runs the
+// other way (a new map-shaping flag would refuse until it is added below) and that is the safe direction.
+//
+// The list itself: kMapShapingFlags minus --map-diff and --metrics (both are map SHAPES that replace or
+// decorate the very ranking --in reads — --map-diff takes the branch ahead of churn, --metrics decorates rows
+// the stub does not print), plus the crawl/ordering shapers a scoped answer genuinely composes with. --limit,
+// --offset, --top-k, --max-tokens and --token-budget are kIntFlags rows, which this walk does not visit at all,
+// so they compose or refuse by their own guards in cli.h — which is where that decision is documented.
+inline constexpr std::string_view kInRideAlong[] =
+{
+    "--in", "--json", "--ignore-tests", "--no-cache", "--no-ignore", "--no-stable", "--refetch", "--compress",
+    "--cache", "--since", "--pin-census", "--scip", "--legend",
+    "--most-important-last", "--no-auto-order", "--no-post-check", "--route", "--no-route", "--stable",
+};
+
+// the flag that answers instead of the scoped map, or empty when --in is honoured on this run
+std::string_view inPreemptedBy( const rw::Config& c )
+{
+    if( c.inDir.empty() )
+    {
+        return {};
+    }
+    // the hand-written parseArgs residue no table row can see — the same honest cost htmlPreemptedBy and
+    // jsonUnsupportedVerb both pay at their own tops. --pack-top-n is an INT row, which the walk skips, and it
+    // serves bodies beside the map exactly as --expand does.
+    if( c.exportCcJson )    { return "--export=cc.json"; }
+    if( c.packTopN > 0 )    { return "--pack-top-n"; }
+    if( !c.expand.empty() ) { return "--expand"; }    // a VECTOR member (comma-split), invisible to the walk
+    if( !c.outline.empty() ){ return "--outline"; }   // the same shape
+    return firstFlagOutside( c, {}, kInRideAlong );
+}
+
+// THE SEPARATING FACT IS TABLE MEMBERSHIP, NOT BEHAVIOUR, and it is derived here rather than listed.
+// inPreemptedBy answers "which set flag is not a ride-along"; the generic diagnostic below then says that
+// flag "answers instead", which is false for a flag that SHAPES the default map rather than replacing it.
+// kMapShapingFlags is exactly "shapes the bare map without selecting a verb", so kMapShapingFlags minus
+// kInRideAlong is the residue that cannot compose: { --no-redact, --metrics, --map-diff }. --map-diff is the
+// one that genuinely does answer instead — it takes its own ranking branch ahead of churn-decay, so no scoped
+// block was ever going to be built — and it is named below for that reason. The other two decorate or
+// un-redact a map this run replaces with the counted stub, so for them the sentence described a mechanism that
+// did not happen.
+//
+// The FIRST audit of this class (this lane, review 5195637558) sampled and generalised: it reported that every
+// other walked flag hits its own pairing refusal first and that --external-surface was the only one reaching
+// the generic line. Measured over the derived universe (test/flaguniverse.py) it is 119 of the 171 bool/view
+// rows, and the predicate that separates them is not "does it answer when run alone" either — --metrics
+// answers alone, and what it answers IS the default map, decorated. Membership is the fact, so a shaping flag
+// added tomorrow with no kInRideAlong row gets the right sentence tomorrow with nobody editing this function.
+// test/recentscopecheck.sh arm 6s2e re-derives the same set from these two tables and asserts it.
+inline constexpr std::string_view kInPreemptsWithOwnBranch[] = { "--map-diff" };
+
+// the map-shaping flag that is INERT beside --in (shapes a map this run does not print), or empty
+std::string_view inInertShaper( const rw::Config& c )
+{
+    const std::string_view outside = inPreemptedBy( c );      // empty when --in is absent or honoured
+    if( outside.empty()
+        || std::ranges::find( kMapShapingFlags, outside ) == std::ranges::end( kMapShapingFlags )
+        || std::ranges::find( kInPreemptsWithOwnBranch, outside ) != std::ranges::end( kInPreemptsWithOwnBranch ) )
+    {
+        return {};
+    }
+    return outside;
+}
+
+// the verb that answered instead of the default map, or empty when --html is honoured on this run
+std::string_view htmlPreemptedBy( const rw::Config& c )
+{
+    if( !c.html )
+    {
+        return {};
+    }
+    // The hand-written parseArgs residue the flag tables cannot see, named explicitly — the same honest cost
+    // jsonUnsupportedVerb pays at its own top, and the same member isBareMapRun already spells out. --export
+    // writes a compile_commands-style JSON and returns before the map; without this line it was the ONE flag
+    // the derived sweep still found silent after the walk closed the other 73.
+    if( c.exportCcJson )
+    {
+        return "--export=cc.json";
+    }
+    return firstFlagOutside( c, kMapShapingFlags, kHtmlRideAlong );
+}
+
+std::optional<int> refuseInertMainModifiers( const rw::Config& cfg )
+{
+    if( const std::string_view verb = htmlPreemptedBy( cfg ); !verb.empty() )
+    {
+        // The pointer is phrased so it reads correctly for a verb with no symbol (--lint, --export) as well as
+        // for one with (--around=SYM): it names the page's own route rather than assuming the argv had a name.
+        rw::emitTo( stderr, "codecortex: --html renders the DEFAULT map as a self-contained graph page, and {} answers instead — nothing was written. "
+                              "Pass --html on its own (e.g. codecortex <dir> --html=g.html); a single symbol's neighbourhood is a ROUTE INTO that page, "
+                              "g.html#node/SYM/2, not a second verb beside it\n", std::string_view( verb.data(), verb.size() ) );
+        return 1;
+    }
+    if( cfg.noRedact && isBareMapRun( cfg ) )
+    {
+        rw::emitRaw( stderr, "codecortex: --no-redact serves bodies VERBATIM and the default map carries no bodies (identifiers and signatures are never "
+                              "redacted) — pass a body-serving verb (e.g. codecortex <dir> --expand=SYM --no-redact, or --for=TASK --no-redact)\n" );
+        return 1;
+    }
+    if( cfg.refetch && std::ranges::none_of( cfg.roots, []( std::string_view r ) { return isGitUrl( r ); } ) )
+    {
+        rw::emitRaw( stderr, "codecortex: --refetch re-clones a git-URL root (https://, http://, git@, ssh://) and this root is a local path — "
+                              "pass a URL (e.g. codecortex https://github.com/OWNER/REPO --refetch)\n" );
+        return 1;
+    }
+    return std::nullopt;
+}
+
+std::string_view jsonUnsupportedVerb( const rw::Config& c )
+{
+    // ── the hand-written parseArgs residue: arms no table row can see, one line each ─────────────────────
+    // §B1.4: `--regex=PAT` sets BOTH c.grep and c.grepRegex; the spelling comes from what was actually parsed
+    // so a --regex caller is never told "--grep" is unsupported — a flag they never typed.
+    if( !c.grep.empty() || c.grepRegex )
+    {
+        return c.grepRegex ? "--regex" : "--grep";
+    }
+    if( !c.listen.empty() )
+    {
+        return "--listen";   // implies --mcp; the walk below would name the implied flag, not the typed one
+    }
+    if( c.abiFlag )
+    {
+        return "--abi";      // §B1.1: the sub-verb nested inside `--stray-content --abi`, named ahead of its parent row
+    }
+    if( c.qualityAck )
+    {
+        return "--quality-ack";   // the bare spelling is a hand-written arm and sets no table bool
+    }
+    if( !c.expand.empty() )
+    {
+        return "--expand";
+    }
+    if( !c.outline.empty() )
+    {
+        return "--outline";
+    }
+    if( c.packTopN > 0 )
+    {
+        return "--pack-top-n";
+    }
+    if( c.exportCcJson )
+    {
+        return "--export=cc.json";
+    }
+
+    // ── every table flag: outside the allow-list ⇒ refused, by default ───────────────────────────────────
+    if( const std::string_view outside = firstFlagOutside( c, kJsonVerbs, kJsonRideAlongFlags ); !outside.empty() )
+    {
+        return outside;
+    }
+
+    // ── output-shape modifiers not (yet) mirrored in JSON — refuse rather than silently drop them ───────
+    // §B1.4: kJsonShapeModifiers below names the same four so the refusal can word them as encodings rather
+    // than verbs. Checked LAST so a verb outside the set is named ahead of a shape it was composed with.
+    if( c.columnar )
+    {
+        return "--format=columnar";
+    }
+    if( c.candidates )
+    {
+        return "--format=candidates";
+    }
+    if( c.detail > 0 )
+    {
+        return "--detail";
+    }
+    if( !c.scipIndex.empty() )
+    {
+        return "--scip";
+    }
+    return {};
+}
+
+// §B1.4: the output-SHAPE members of the list above, as a table rather than a second if-chain. A flag in
+// here selects an ENCODING for rows some verb already produced, so "--json is not supported for X" is the
+// wrong sentence about it — the caller has picked two encodings, not an unsupported verb.
+inline constexpr std::string_view kJsonShapeModifiers[] = { "--format=columnar", "--format=candidates", "--detail", "--scip" };
+
+inline bool isJsonShapeModifier( std::string_view flag ) noexcept
+{
+    ASSUME( !flag.empty() );
+    return std::ranges::find( kJsonShapeModifiers, flag ) != std::end( kJsonShapeModifiers );
+}
+
+int runHelpTask( const rw::Config& cfg, const rw::IngestResult& ing, const std::string& root )
+{
+    const std::string stamp = rw::gitstamp::stampAt( root );
+    const bool        git   = !stamp.empty();
+    const bool        dirty = stamp.ends_with( "+dirty" );
+    // What this build can actually parse, read off the flag table itself (cli.h shipsViewFlag) rather than
+    // asserted here: the router composes the directory scope only on a binary that has the row for it.
+    rw::taskroute::RouterCaps caps;
+    caps.dirScope = rw::shipsViewFlag( rw::taskroute::kDirScopeFlag );
+    const rw::taskroute::TaskRouteResult route = rw::taskroute::classifyRoutes( cfg.helpTask, root, ing, git, dirty, caps );
+
+    std::vector<char> esc;
+    const auto ex = [&]( std::string_view s ) { return std::string( rw::escapeXml( s, esc ) ); };
+    // THE LEGEND. Until 2026-09-13 this document had none in the default dialect: every attribute a reader
+    // meets on its only screen was undefined, and the compact layer's present-only legend was the only
+    // place any of them was explained. One line, every attribute, no flag spelled (a literal double hyphen
+    // is ill-formed inside an XML comment — G4).
+    std::string out = "<!-- codecortex help-task: one task in, ONE safe command out, or an honest abstention. "
+                      "status=recommend|ambiguous|abstain and confidence=high|low|none track each other; "
+                      "score= is the winning card's evidence total and margin= its lead over the runner-up "
+                      "(100/100 on a structural route, one the shipped parser itself accepts). <facts> is the "
+                      "repository evidence the decision read: git= dirty= a git repo and an uncommitted diff, "
+                      "trace= a pasted stack/sanitizer shape, resolved_symbols= how many indexed names the task "
+                      "NAMES (a short bare word — a lone letter, a SCREAMING name, or an ordinary word that happens "
+                      "to match an indexed name — does not count on its own; backtick it or write it in call form, "
+                      "e.g. `F` or F(), to route on it by name). <choice> is the recommendation: intent= the route, "
+                      "skill= the skill that owns it, reason= the evidence in words, and <run> the command, "
+                      "pasteable as is. This tool recommends only: it never runs what it names. ";
+    out += rw::kNextLegendClause;
+    out += "-->";
+    out += "<task-route status=\"";
+    out += rw::taskroute::statusName( route.status );
+    out += "\" confidence=\"";
+    out += route.status == rw::taskroute::RouteStatus::Recommend ? "high" :
+           route.status == rw::taskroute::RouteStatus::Ambiguous ? "low" : "none";
+    out += "\" score=\"" + std::to_string( route.score ) + "\" margin=\"" + std::to_string( route.margin ) + "\">";
+    out += "<facts git=\"" + std::to_string( int( route.facts.git ) ) + "\" dirty=\"" + std::to_string( int( route.facts.dirty ) );
+    out += "\" trace=\"" + std::to_string( int( route.facts.trace ) ) + "\" resolved_symbols=\"";
+    out += std::to_string( route.facts.resolvedSymbols.size() ) + "\"/>";
+    for( const rw::taskroute::RouteChoice& choice : route.choices )
+    {
+        out += "<choice intent=\"" + ex( choice.id ) + "\" skill=\"" + ex( choice.skill ) + "\" reason=\"" + ex( choice.reason );
+        out += "\" score=\"" + std::to_string( choice.score ) + "\"";
+        // present-only: the WIDENING follow-up of a --for-shaped recommendation, nothing on any other.
+        // Keyed off the INTENT, and spelled by forpage.h's own forWidenNext — the same quoting and the same
+        // kNextAttrMaxBytes ceiling the answer's next= obeys, so a task too long to paste emits nothing
+        // rather than a hint that pastes wrong.
+        const bool widens = rw::taskroute::isOneOf( choice.id, std::begin( rw::taskroute::kForShapedIntents ),
+                                                   std::size( rw::taskroute::kForShapedIntents ) );
+        out += rw::nextAttrXml( widens ? rw::forWidenNext( cfg.helpTask ) : std::string() );
+        out += "><run>" + ex( choice.command ) + "</run></choice>";
+    }
+    out += "</task-route>\n";
+    std::fputs( out.c_str(), stdout );
+    return 0;
+}
+
+std::optional<int> runCliEditPlan( const rw::Config& cfg )
+{
+    const bool hasMode = cfg.editPlanDryRun || cfg.editPlanApply;
+    if( cfg.editPlan.empty() && !hasMode ) { return std::nullopt; }
+    if( cfg.editPlan.empty() && !cfg.editCheckSym.empty() )
+    {
+        return std::nullopt;   // card A1: --dry-run beside --edit-check is the PREVIEW's mode flag, not this verb's
+    }
+    if( cfg.editPlan.empty() )
+    {
+        rw::emitRaw( stderr, "codecortex: --dry-run/--apply requires --edit-plan=FILE\n" );
+        return 1;
+    }
+    if( cfg.editPlanDryRun == cfg.editPlanApply )
+    {
+        rw::emitRaw( stderr, "codecortex: --edit-plan requires exactly one of --dry-run or --apply\n" );
+        return 1;
+    }
+    if( cfg.roots.size() != 1 )
+    {
+        rw::emitRaw( stderr, "codecortex: --edit-plan is single-root only; pass one <dir>\n" );
+        return 1;
+    }
+    const rw::editplan::Outcome outcome = rw::editplan::run( std::string( cfg.rootPath ), std::string( cfg.editPlan ),
+                                                             cfg.editPlanApply, cfg.maxFileBytes );
+    if( !outcome.ok )
+    {
+        rw::emitTo( stderr, "codecortex edit-plan: {}\n", outcome.message.c_str() );
+        return 1;
+    }
+    std::puts( outcome.receipt.c_str() );
+    return 0;
+}
+
+// the spelling of the ONE CLI edit verb this invocation selected — for the refusals that must name it
+const char* cliEditVerbSpelling( const rw::Config& cfg ) noexcept
+{
+    if( !cfg.replaceSymbolBody.empty() )
+    {
+        return "--replace-symbol-body";
+    }
+    return !cfg.insertBeforeSymbol.empty() ? "--insert-before-symbol" : "--insert-after-symbol";
+}
+
+std::optional<int> runCliEdit( const rw::Config& cfg )
+{
+    const int editCount = int( !cfg.replaceSymbolBody.empty() ) + int( !cfg.insertBeforeSymbol.empty() )
+                        + int( !cfg.insertAfterSymbol.empty() );
+    const bool hasModifier = !cfg.editPayload.empty() || !cfg.editTargetFile.empty();
+    if( editCount == 0 && !hasModifier )
+    {
+        return std::nullopt;
+    }
+    if( editCount == 0 && !cfg.editCheckSym.empty() )
+    {
+        return std::nullopt;   // card A1: --edit-payload beside --edit-check is the PREVIEW's payload, not a write
+    }
+    if( editCount == 0 )
+    {
+        rw::emitRaw( stderr, "codecortex: --edit-payload/--edit-target-file requires one of --replace-symbol-body, "
+                              "--insert-before-symbol or --insert-after-symbol\n" );
+        return 1;
+    }
+    if( editCount != 1 )
+    {
+        rw::emitRaw( stderr, "codecortex: pass exactly one CLI edit verb per invocation\n" );
+        return 1;
+    }
+    if( cfg.roots.size() != 1 )
+    {
+        rw::emitRaw( stderr, "codecortex: CLI edit verbs are single-root only; pass one <dir>\n" );
+        return 1;
+    }
+    if( cfg.editPayload.empty() )
+    {
+        // capture-audit 2026-09-04 (L1, the modifier-pairing dialect): name the verb the caller TYPED, not "a CLI
+        // edit" — every sibling pairing refusal names both flags and shows the composed call.
+        const char* const editVerb = cliEditVerbSpelling( cfg );
+        rw::emitTo( stderr, "codecortex: {}=SYM is a CLI edit and needs --edit-payload=FILE (or --edit-payload=- for stdin) — pass both "
+                              "(e.g. codecortex <dir> {}=SYM --edit-payload=new_body.cpp); an absent payload never means delete\n", editVerb, editVerb );
+        return 1;
+    }
+
+    // card A1: the four payload refusals — unreadable, EMPTY (never a delete), oversize against
+    // --max-file-size, and NUL-bearing (rw::looksBinary itself, so the claim is exactly the condition that
+    // would drop the file from the index) — now live ONCE in editpreview.h and are shared with the pre-apply
+    // preview. Two copies of this ladder is two places for an agent to meet two vocabularies for one refusal.
+    std::string payload, payloadErr;
+    if( !rw::editpreview::readPayload( cfg.editPayload, cfg.maxFileBytes, payload, payloadErr ) )
+    {
+        rw::emitTo( stderr, "codecortex: {}\n", payloadErr.c_str() );
+        return 1;
+    }
+
+    const rw::mcpedit::Op op = !cfg.replaceSymbolBody.empty() ? rw::mcpedit::Op::ReplaceBody
+                                 : !cfg.insertBeforeSymbol.empty() ? rw::mcpedit::Op::InsertBefore
+                                                                  : rw::mcpedit::Op::InsertAfter;
+    const std::string_view sym = !cfg.replaceSymbolBody.empty() ? cfg.replaceSymbolBody
+                                 : !cfg.insertBeforeSymbol.empty() ? cfg.insertBeforeSymbol : cfg.insertAfterSymbol;
+    const rw::mcpedit::Outcome outcome = rw::runEditVerb( std::string( cfg.rootPath ), op, std::string( sym ),
+                                                          std::string( cfg.editTargetFile ), payload, !cfg.noPostCheck );
+    if( !outcome.ok )
+    {
+        // M9 / lens 6 F8: name the VERB, not the family. All three CLI edit verbs printed "codecortex edit:",
+        // so a refusal in a log could not be tied back to the command that produced it — the one thing
+        // every other refusal in this binary does.
+        const char* const editFlag = !cfg.replaceSymbolBody.empty() ? "--replace-symbol-body"
+                                       : !cfg.insertBeforeSymbol.empty() ? "--insert-before-symbol" : "--insert-after-symbol";
+        rw::emitTo( stderr, "codecortex: {}: {}\n", editFlag, outcome.message.c_str() );
+        return 1;
+    }
+
+    std::fputs( outcome.resultJson.c_str(), stdout );
+    std::fputc( '\n', stdout );
+    // A4: print the RESOLVED file:symbol, never the caller's own argument. `sym` may be a sym# handle, which
+    // --edit-check does not accept — so the printed command used to fail every time after a handle-addressed
+    // edit — and a bare name narrowed by --edit-target-file would point --edit-check at a different
+    // same-named definition. Both follow-ups are now spelled out concretely enough to paste.
+    // P9 (capture-audit 2026-09-04): the two commands this line names are IN the receipt now, so the line
+    // says which world the caller is in. Both pasteable spellings STAY either way — a re-ask after a
+    // further edit needs the qualified `file:symbol` form, and this is the one place the tool teaches it
+    // (test/rootrelemitcheck.sh ARM7 asserts the printed --edit-check actually runs).
+    // E2 (terminality round A): ONE next, the receipt's own (METHODOLOGY §9 #3). The receipt carries the post-edit
+    // region and blob_sha always, plus edit_check/tests_to_run unless --no-post-check — so this line names what is
+    // in hand and the single call that follows; never a second command. test/receiptpostcheck.sh (12) and
+    // test/edithandlehintcheck.sh assert the printed next is the receipt's and RUNS.
+    rw::emitTo( stderr, "codecortex edit: applied atomically; receipt carries region, blob_sha{}; next: {}\n",
+                  cfg.noPostCheck ? " (post-check skipped)" : ", edit_check, tests_to_run", outcome.next.c_str() );
+    return 0;
+}
+
+}   // namespace
+
+// ── P1 (capture-audit 2026-09-04, lane L7): the --legend=compact dialect on every XML verb ────────────────
+//
+// --for/--grep/--slice compact their own legend (each emitter branches on cfg.legend); every other XML verb
+// is compacted HERE, after the fact: the run's stdout is captured into an anonymous tmpfile, the finished
+// document is rewritten once by compactlegend.h (prose comments out, ONE compact legend + schema= in, every
+// payload byte untouched), and written to the real stdout. Exit codes pass through unchanged. A run that
+// produced no XML root (a refusal already happened, or a text verb slipped past validateLegendModifier's
+// list) is refused here naming the flag — never served as if the posture had applied.
+// 2026-09-06 stranger audit: a root that exists but cannot be opened (chmod 000, another user's checkout) came
+// back as an EMPTY map at exit 0 — indistinguishable from "no source here". Probe the directory the way the
+// crawl will; refuse with the reason instead of serving nothing. A non-directory root is left to the crawl.
+// C1-b (2026-09-12): --in=DIR names a directory UNDER the root, root-relative — not absolute, no '.' / '..' segment — and it
+// must exist as a directory. Checked here, before any crawl, because the alternative is a block scoped to nothing that says
+// so only by being empty: a typo would read as "nothing changed there". Trailing slashes are stripped (sarif::rootPrefixOf, the crawl root's own rule) so
+// `db/` and `db` are one answer; the syntactic refusal and the existence refusal are two messages because they have two
+// remedies.
+static bool inDirIsUnderRoot( std::string_view inDirArg, const std::string& resolvedRoot )
+{
+    namespace fs = std::filesystem;
+    const std::string dir = rw::sarif::rootPrefixOf( inDirArg );
+    bool isRelative = !dir.empty() && dir.front() != '/';
+    for( std::size_t at = 0; isRelative && at <= dir.size(); )
+    {
+        const std::size_t      slash = dir.find( '/', at );
+        const std::string_view seg   = std::string_view( dir ).substr( at, slash == std::string::npos ? std::string::npos : slash - at );
+        if( seg.empty() || seg == "." || seg == ".." )
+        {
+            isRelative = false;
+        }
+        at = slash == std::string::npos ? dir.size() + 1 : slash + 1;
+    }
+    if( !isRelative )
+    {
+        rw::emitTo( stderr, "codecortex: --in={} must be a root-relative directory (no leading '/', no '.' or '..' segment) — e.g. codecortex <dir> --rank-by=churn-decay --in=src\n",
+                    std::string_view( inDirArg.data(), inDirArg.size() ) );
+        return false;
+    }
+    std::error_code ec;
+    const fs::path  scoped = fs::path( resolvedRoot ) / fs::path( dir );
+    if( !fs::is_directory( scoped, ec ) || ec )
+    {
+        rw::emitTo( stderr, "codecortex: --in={}: {} is not a directory under the root {} — name an existing directory (e.g. codecortex <dir> --rank-by=churn-decay --in=src)\n",
+                    std::string_view( inDirArg.data(), inDirArg.size() ), std::string_view( dir ), resolvedRoot.c_str() );
+        return false;
+    }
+    return true;
+}
+
+static bool rootIsReadable( const std::string& resolvedRoot )
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if( !fs::is_directory( fs::path( resolvedRoot ), ec ) || ec )
+    {
+        return true;
+    }
+    fs::directory_iterator probe( fs::path( resolvedRoot ), ec );
+    if( !ec )
+    {
+        return true;
+    }
+    rw::emitTo( stderr, "codecortex: root path cannot be read: {} ({}) — fix its permissions, or point at a directory you can open\n",
+                  resolvedRoot.c_str(), ec.message().c_str() );
+    return false;
+}
+
+// 2026-09-06 stranger audit: --cache=<a directory> read as "corrupt", wrote nothing, and served a byte-identical
+// map at exit 0 — the fixed --cache=<nonexistent dir> bug's twin. The flag names a FILE; say so, with the form.
+static bool cachePathIsDirectory( const std::string& cachePath )
+{
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if( !fs::is_directory( fs::path( cachePath ), ec ) || ec )
+    {
+        return false;
+    }
+    rw::emitTo( stderr, "codecortex: --cache={}: that is a directory; --cache names the blob FILE to read and write, e.g. --cache={}/codecortex.bin\n",
+                  cachePath.c_str(), cachePath.c_str() );
+    return true;
+}
+
+// OWNER DECISION 2026-09-12 — the ways a --scip path the caller NAMED cannot be read as an index AT ALL, decided in one
+// place from ONE open: it does not open; it is a directory; it is any other kind of file that is not a regular file (a
+// FIFO, a device); it is an empty regular file. Returns the reason for dispatchMain's refusal sentence, or an empty view
+// when the path goes on to loadScipOverlay. A directory, a device and an empty file used to reach loadScipOverlay's
+// "cannot read index" and serve the name-based map at exit 0. A FIFO with no writer HUNG instead, inside a blocking open
+// that waits for a writer for ever, so the probe opens O_NONBLOCK: a read-only open of a FIFO then returns at once. fstat
+// answers on that descriptor — no second path resolution, so a rename between the checks cannot make them describe two
+// different files. Still a degrade, decided in scip.h: bytes that do not DECODE (corrupt/truncated), an index over its
+// size bound, a short read.
+static std::string_view scipIndexUnreadableReason( const std::string& scipPath )
+{
+    const int probeFd = rw::os::open( scipPath.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC );
+    if( probeFd < 0 )
+    {
+        return "cannot open the index";
+    }
+    rw::os::stat_t probeStat;
+    const bool  isStatted = rw::os::fstat( probeFd, &probeStat ) == 0;
+    rw::os::close( probeFd );
+    if( !isStatted )
+    {
+        DISCLOSE( Diagnostics::answerUnchanged, "loadScipOverlay reads the index either way: a good one loads unchanged, a bad one degrades with its own shipped notice",
+                  "--scip: fstat on the opened index failed — file kind and size undecided, loadScipOverlay's read decides" );
+        return {};
+    }
+    if( S_ISDIR( probeStat.st_mode ) )
+    {
+        return "is a directory, not an index file";
+    }
+    if( !S_ISREG( probeStat.st_mode ) )
+    {
+        return "is not a regular file (a FIFO or a device), not an index file";
+    }
+    if( probeStat.st_size == 0 )
+    {
+        return "is empty (0 bytes), not an index";
+    }
+    return {};
+}
+
+static int dispatchMain( const rw::Config& cfg, char** argv );
+
+// The key for a SHARED root (`r` = the map family, `ctx` = the bundle family) is read off the ANSWER, never off a flag order.
+// The ROOT picks the family: one flag order across both families cannot be right, because verb precedence interleaves them, and
+// a key from the other family took that root's FIRST spec, so --pack-task --metrics compacted as pack-signatures
+// (test/compactlegendcheck.sh (D36)). Nor can a flag order WITHIN a family: the bundle hint read --expand before --pack-task and
+// the map hint --around before --query, so --pack-task --expand compacted as expand and --query --around as around, over
+// documents byte-identical to --pack-task's and --query's alone ((D38), CodeRabbit on #203). So within the family a verb with a
+// mark of its own names its key only when the document carries that mark, and a flag whose verb lost dispatch cannot lend its
+// schema to the verb that answered. The row order is left as a TIE-BREAK between marks that share one answer: --metrics renders
+// into --map-diff's and --around's answers and keeps its old place between them, and a pack-task root carries from-trace's
+// task= beside its own budget_tokens=. A rule with no mark (--query, and the bundle modifiers only the default map renders, which
+// answers last) is read only after every marked verb was ruled out, which the static_asserts below hold.
+enum class CompactKeyMark : std::uint8_t
+{
+    None,            // no mark of its own: the flag alone names the key
+    RootAttr,        // the root's own open tag carries needle="
+    FirstChild,      // the root's first child element, past the legend comments before it, is <needle>
+    MapHeaderField,  // the map header comment carries the unquoted field needle=
+    CommentOpener,   // a comment outside CDATA opens with needle (the verb's own legend block)
+};
+
+struct CompactKeyRule
+{
+    std::string_view key;
+    bool ( *isAsked )( const rw::Config& ) noexcept;
+    CompactKeyMark   mark;
+    std::string_view needle;
+};
+
+// Each mark read against its one emitter: changed= is serialize.h's changedCount, which only runDefaultMap's map-diff arm passes
+// (a clean tree still prints changed=0, and the query arm ahead of it never does); the metrics block is serialize.h's
+// `if( metrics )` legend; of= is the SeedDisclosure only --around's annotation fills.
+static constexpr CompactKeyRule kMapKeyRules[] =
+{
+    { "map-diff", []( const rw::Config& c ) noexcept { return c.mapDiff; },         CompactKeyMark::MapHeaderField, "changed" },
+    { "metrics",  []( const rw::Config& c ) noexcept { return c.metrics; },         CompactKeyMark::CommentOpener,  "<!-- metrics: " },
+    { "around",   []( const rw::Config& c ) noexcept { return !c.around.empty(); }, CompactKeyMark::RootAttr,       "of" },
+    { "query",    []( const rw::Config& c ) noexcept { return !c.query.empty(); },  CompactKeyMark::None,           {} },
+};
+
+// <skipped>, <notes> and <lego> open runSkipped's, runNotes' and the --lego arm's <ctx>; budget_tokens= rides every pack-task root
+// (packtask.h rootAttrsFor); task= rides every --from-trace and --run-trace root (ctxRootOpen with the trace label), including
+// the command-succeeded record, which has no <trace> block.
+static constexpr CompactKeyRule kBundleKeyRules[] =
+{
+    { "skipped",         []( const rw::Config& c ) noexcept { return c.skippedList; },                               CompactKeyMark::FirstChild, "skipped" },
+    { "notes",           []( const rw::Config& c ) noexcept { return c.notesList; },                                 CompactKeyMark::FirstChild, "notes" },
+    { "lego",            []( const rw::Config& c ) noexcept { return !c.legoType.empty(); },                         CompactKeyMark::FirstChild, "lego" },
+    { "pack-task",       []( const rw::Config& c ) noexcept { return c.packTaskFlag || !c.packTask.empty(); },       CompactKeyMark::RootAttr,   "budget_tokens" },
+    { "from-trace",      []( const rw::Config& c ) noexcept { return !c.fromTrace.empty() || !c.runTrace.empty(); }, CompactKeyMark::RootAttr,   "task" },
+    { "expand",          []( const rw::Config& c ) noexcept { return !c.expand.empty(); },                           CompactKeyMark::None,       {} },
+    { "exemplar",        []( const rw::Config& c ) noexcept { return !c.exemplar.empty(); },                         CompactKeyMark::None,       {} },
+    { "pack-signatures", []( const rw::Config& c ) noexcept { return c.packSignatures; },                            CompactKeyMark::None,       {} },
+    { "pack-top-n",      []( const rw::Config& c ) noexcept { return c.packTopN > 0; },                              CompactKeyMark::None,       {} },
+};
+
+// A rule with no mark sits below every marked rule, so a bare flag is read only once the answer itself has ruled out every verb
+// that could have answered in its place.
+static constexpr bool unmarkedRulesTrail( std::span<const CompactKeyRule> rules ) noexcept
+{
+    bool hasUnmarkedAbove = false;
+    for( const CompactKeyRule& rule : rules )
+    {
+        if( rule.mark == CompactKeyMark::None )
+        {
+            hasUnmarkedAbove = true;
+        }
+        else if( hasUnmarkedAbove )
+        {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert( unmarkedRulesTrail( kMapKeyRules ), "kMapKeyRules: a rule with no mark sits above a marked rule" );
+static_assert( unmarkedRulesTrail( kBundleKeyRules ), "kBundleKeyRules: a rule with no mark sits above a marked rule" );
+
+static bool isCompactKeyMarkPresent( const CompactKeyRule& rule, std::string_view doc, const rw::CompactRootInfo& root )
+{
+    switch( rule.mark )
+    {
+        case CompactKeyMark::None:
+            return true;
+        case CompactKeyMark::RootAttr:
+            return rw::headHasAttr( doc.substr( root.openBegin, root.openEnd - root.openBegin ), rule.needle );
+        case CompactKeyMark::FirstChild:
+            return rw::isElementNamed( rw::compactFirstChildTag( doc, root ), rule.needle );
+        case CompactKeyMark::MapHeaderField:
+            return rw::spanHasAttr( rw::compactMapHeader( doc ), rule.needle, {} );
+        case CompactKeyMark::CommentOpener:
+            return !rw::compactCommentOpenedBy( doc, rule.needle ).empty();
+    }
+    return false;
+}
+
+static std::string_view compactLegendHint( const rw::Config& c, std::string_view doc )
+{
+    const rw::CompactRootInfo root = rw::findCompactRoot( doc );
+    if( root.tag.empty() )
+    {
+        return {};   // no root element: applyCompactDialect answers NotXml before any key is read
+    }
+    // The default map's --token-budget gate replaces an over-budget answer with <r withheld="1"/> (main.cpp's budget gate, its one
+    // emitter): no rows, no header, no legend, so no verb's mark. Nothing on it can rule a verb out, so there the flags keep their
+    // old order. That is the one residue no mark can reach: a withheld --query --map-diff still compacts as map-diff.
+    const bool isWithheld = root.tag == "r" && rw::spanHasAttr( doc.substr( root.openBegin, root.openEnd - root.openBegin ), "withheld", "\"1\"" );
+    const std::span<const CompactKeyRule> rules = root.tag == "r" ? std::span<const CompactKeyRule>( kMapKeyRules ) : std::span<const CompactKeyRule>( kBundleKeyRules );
+    for( const CompactKeyRule& rule : rules )
+    {
+        if( rule.isAsked( c ) && ( isWithheld || isCompactKeyMarkPresent( rule, doc, root ) ) )
+        {
+            return rule.key;
+        }
+    }
+    return {};
+}
+
+// --for's compact legend is its own (verbs_for.h): it splices est_tokens=/dropped_positive=/weak= and the
+// adaptive/relevance-floor counts INTO its comments (estchargecheck A10 pins the form), so the layer would strip
+// data there. It is the one verb the layer skips. --grep/--slice compact natively too, but their compact
+// legends are pure prose — the layer restates them as its own compact legend and keeps their schema id.
+static bool nativeCompactLegendVerb( const rw::Config& c ) noexcept
+{
+    // L1 fix round (rv-r1-L1 LOW-1): --batch outranks --for in dispatch, so `--for=X --batch=F` answers the batch envelope —
+    // an answer this layer shapes. Only a run --for actually answers is skipped.
+    const bool batchAnswers = !c.batchFile.empty();   // the batch envelope answers, and this layer shapes it
+    return !batchAnswers && !c.forTask.empty();
+}
+
+// L1 fix round (rv-r1-L1 LOW-3): a DEFAULTED posture captured every run through a tmpfile, a 1.28 MB `--lint --sarif`
+// included, so stdout stopped streaming for answers the layer then passed through untouched. Dispatch precedence decides
+// the answering verb (`--callers=X --lint --sarif` answers --callers, in XML), so the capture is skipped only where the
+// answer is CERTAINLY not XML: SARIF, with nothing on the command line but the flags that shape a lint run. Anything
+// else is captured, which is the safe direction — a capture of a non-XML answer passes it through unchanged.
+static bool certainlyNonXmlAnswer( const rw::Config& cfg, char** argv ) noexcept
+{
+    if( !cfg.legendDefaulted || !cfg.sarif || argv == nullptr || argv[ 0 ] == nullptr )
+    {
+        return false;
+    }
+    static constexpr std::string_view kLintShaping[] = { "--lint", "--sarif", "--lint-rules=", "--no-cache", "--exclude=", "--include=", "--no-redact" };
+    for( char** a = argv + 1; *a != nullptr; ++a )
+    {
+        const std::string_view arg( *a );
+        if( !arg.starts_with( "-" ) )
+        {
+            continue;   // a root operand
+        }
+        const bool shapesLint = std::ranges::any_of( kLintShaping, [ & ]( std::string_view f )
+                                                     { return f.ends_with( '=' ) ? arg.starts_with( f ) : arg == f; } );
+        if( !shapesLint )
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// L1 (2026-09-19): compact is the CLI DEFAULT (cli.h kDefaultLegendPosture, resolved in validateLegendModifier), so this
+// layer now runs on every XML run that does not ask for --legend=full. cfg.legendDefaulted separates the two callers:
+// an ASKED --legend=compact that meets an answer the dialect cannot shape refuses (exit 1, as before); the DEFAULT
+// posture passes that answer through unchanged at the run's own exit code — a default must never be the reason a run
+// fails. A capture that cannot be set up degrades to the full legend in both cases, disclosed on stderr.
+static_assert( rw::kCompactRepriceDensestBytesPerToken == rw::kMinBytesPerToken, "the compact reprice prices added markup at the densest rate the estimator knows" );
+
+// The captured run's answer, compacted and written — or, when the dialect cannot shape it, passed through (the DEFAULT
+// posture) or refused (an ASKED --legend=compact). `rc` is the run's own exit code, returned unchanged on every path that
+// emits the answer.
+static int finishCompactCapture( const rw::Config& cfg, std::string& doc, int rc )
+{
+    EXPECTS( cfg.legend == "compact", "only a compact-posture run is captured" );
+    if( doc.empty() )
+    {
+        return rc;   // a refusal (or an empty answer) — nothing to rewrite, the exit code says what happened
+    }
+    const auto emitCaptured = [&doc, rc]()
+    {
+        std::fwrite( doc.data(), 1, doc.size(), stdout );
+        std::fflush( stdout );
+        return rc;
+    };
+    // the DEFAULT posture shapes what it can and leaves the rest exactly as it was emitted (cfg.legendDefaulted);
+    // only an ASKED --legend=compact refuses an answer the dialect cannot shape
+    switch( rw::applyCompactDialect( doc, compactLegendHint( cfg, doc ) ) )
+    {
+        case rw::CompactOutcome::Rewritten:
+        case rw::CompactOutcome::AlreadyCompact:
+            return emitCaptured();
+        case rw::CompactOutcome::NotXml:
+            if( cfg.legendDefaulted )
+            {
+                return emitCaptured();
+            }
+            std::fputs( "codecortex: --legend=compact applies to the XML verbs only — this run's output carries no XML legend to compact "
+                        "(text/JSON/markdown); rerun with --legend=full (e.g. codecortex <dir> --callers=SYM --legend=compact)\n", stderr );
+            return 1;
+        case rw::CompactOutcome::UnknownRoot:
+            if( cfg.legendDefaulted )
+            {
+                return emitCaptured();
+            }
+            break;
+    }
+    const rw::CompactRootInfo root = rw::findCompactRoot( doc );
+    rw::emitTo( stderr, "codecortex: --legend=compact has no compact legend for this verb's root element <{}> yet — rerun with "
+                          "--legend=full (the full legend is the documented form; add the root to kCompactLegendSpecs to extend the dialect)\n", std::string_view( root.tag.data(), root.tag.size() ) );
+    return 1;
+}
+
+static int runWithCompactLegend( const rw::Config& cfg, char** argv )
+{
+    EXPECTS( !cfg.legendDefaulted || cfg.legend == rw::kDefaultLegendPosture, "a defaulted posture is the registered default" );
+    if( cfg.legend != "compact" || nativeCompactLegendVerb( cfg ) || certainlyNonXmlAnswer( cfg, argv ) )
+    {
+        return dispatchMain( cfg, argv );
+    }
+    std::fflush( stdout );
+    std::FILE* capture = std::tmpfile();
+    if( capture == nullptr )
+    {
+        DISCLOSE( Diagnostics::answerUnchanged, "the full legend is a correct superset of the compact one, and stderr says so: only the cost grows",
+                  "runWithCompactLegend: tmpfile() failed — the FULL legend is emitted where compact was asked for" );
+        std::fputs( "codecortex: compact legend: could not open a capture buffer — emitting the full legend instead\n", stderr );
+        return dispatchMain( cfg, argv );
+    }
+    const int savedStdout = rw::os::dup( STDOUT_FILENO );
+    if( savedStdout < 0 || rw::os::dup2( rw::os::fileno( capture ), STDOUT_FILENO ) < 0 )
+    {
+        DISCLOSE( Diagnostics::answerUnchanged, "the full legend is a correct superset of the compact one, and stderr says so: only the cost grows",
+                  "runWithCompactLegend: dup/dup2 failed — the FULL legend is emitted where compact was asked for" );
+        std::fputs( "codecortex: compact legend: could not redirect stdout — emitting the full legend instead\n", stderr );
+        if( savedStdout >= 0 ) { rw::os::close( savedStdout ); }
+        std::fclose( capture );
+        return dispatchMain( cfg, argv );
+    }
+    const int rc = dispatchMain( cfg, argv );
+    std::fflush( stdout );
+    rw::os::dup2( savedStdout, STDOUT_FILENO );
+    rw::os::close( savedStdout );
+
+    std::string doc;
+    std::rewind( capture );
+    char buf[ 65536 ];
+    for( std::size_t got; ( got = std::fread( buf, 1, sizeof( buf ), capture ) ) > 0; )
+    {
+        doc.append( buf, got );
+    }
+    std::fclose( capture );
+    return finishCompactCapture( cfg, doc, rc );
+}
+
+int main( int argc, char** argv )
+{
+    using namespace rw;
+
+    rw::os::init_process( argc, argv );   // POSIX: nothing. Windows: UTF-8 argv, binary stdio, path-valued environment in the program's spelling
+
+    if( argc >= 2 && std::string_view( argv[1] ) == "wrap" )
+    { // adoption recipe (subcommand, not a flag)
+        return runWrap( argc, argv, selfExecutablePath( argv[0] ) );
+    }
+
+    if( argc >= 2 && std::string_view( argv[1] ) == "dashboard" )
+    { // persistent local Developer Console, independent of any MCP host connection lifetime
+        rw::ui::ServerConfig uc;
+        uc.root = argc >= 3 && argv[2] && argv[2][0] != '-' ? std::string( argv[2] ) : std::string( "." );
+        uc.port = 7331;
+        for( int i = 2; i < argc; ++i )
+        {
+            if( !argv[i] ) continue;
+            std::string_view a( argv[i] );
+            if( a.starts_with( "--port=" ) )
+            {
+                try { uc.port = std::stoi( std::string( a.substr( 7 ) ) ); }
+                catch( ... ) { rw::emitRaw( stderr, "codecortex dashboard: --port must be an integer\n" ); return 2; }
+            }
+        }
+        uc.executable = selfExecutablePath( argv[0] );
+        uc.version = kCodeCortexVersion;
+        uc.telemetryPath = rw::codecortex_mcp::telemetryPathFor( uc.root );
+        return rw::ui::runServer( uc );
+    }
+
+    if( argc >= 2 && std::string_view( argv[1] ) == "install" )
+    { // simple host onboarding: detect supported coding CLIs, register MCP + observation hooks
+        return rw::installcmd::run( argc, argv, selfExecutablePath( argv[0] ) );
+    }
+
+    if( argc >= 2 && std::string_view( argv[1] ) == "observe" )
+    { // private host-hook entrypoint: stdin JSON -> bounded local telemetry; never prompt text/tool output
+        return rw::hostobserve::observe( argc, argv );
+    }
+
+    if( argc >= 2 && std::string_view( argv[1] ) == "configure-hooks" )
+    { // private installer helper: idempotently merge native observation hooks into supported host config
+        return rw::hostobserve::configureHooks( argc, argv, selfExecutablePath( argv[0] ) );
+    }
+
+
+    // r2-LO: the session legend dictionary for a human (or a harness that holds a session of its own) — the text
+    // codecortex://legend-dict/full serves, or `=roster`, the completeness attributes it defines (legenddict.h). Like
+    // --version, answered wherever it stands and nothing else runs.
+    // EVERY occurrence is read before anything is printed. Answering at the FIRST one made acceptance depend on
+    // ORDER: `--legend-dict=roster --legend-dict=bad` printed the roster and exited 0, while the same two flags the
+    // other way round exited 1 — one command line, two verdicts, and a typo silently honoured. argv is external
+    // input, so each occurrence is checked with VALIDATE.
+    bool wantFull = false, wantRoster = false;
+    for( int i = 1; i < argc; ++i )
+    {
+        const std::string_view a = argv[ i ];
+        if( a == "--legend-dict" ) { wantFull = true; continue; }
+        if( a.starts_with( "--legend-dict=" ) )
+        {
+            const std::string_view v = a.substr( 14 );
+            if( !VALIDATE( v == "roster", "--legend-dict= names the one form it takes" ) )
+            {
+                rw::emitTo( stderr, "codecortex: --legend-dict= takes roster — got '{}'; bare --legend-dict prints the dictionary\n", v );
+                return 1;
+            }
+            wantRoster = true;
+        }
+    }
+    // Both forms asked is a question with two answers, not a preference: refused rather than quietly served one.
+    if( wantFull && wantRoster )
+    {
+        rw::emitRaw( stderr, "codecortex: --legend-dict prints the dictionary and --legend-dict=roster the attributes it defines — pass one, not both\n" );
+        return 1;
+    }
+    if( wantFull || wantRoster )
+    {
+        rw::emitRaw( stdout, wantRoster ? legenddict::rosterText().c_str() : legenddict::fullDictionaryText().c_str() );
+        return 0;
+    }
+
+    const Config cfg = parseArgs( argc, argv );
+    if( !cfg.ok )
+    {
+        return 1;
+    }
+    const std::string telemetryPath = cfg.telemetryFile.empty()
+        ? rw::codecortex_mcp::telemetryPathFor( cfg.rootPath )
+        : std::string( cfg.telemetryFile );
+    rw::telemetry::RunSession telemetry( telemetryPath, argc, argv, cfg.rootPath );
+    // harvest 2026-09-09: a hook-form core.fsmonitor in a crawl root's own .git/config is a command git would run on
+    // every read-only call this process makes; neutralise it HERE — one site, before any thread or git child — and
+    // disclose it (stderr + --doctor). githarden.h holds the measurement and the reasoning.
+    githarden::hardenForRoots( cfg.roots );
+    const int rc = runWithCompactLegend( cfg, argv );
+    telemetry.finish( rc );
+    return rc;
+}
+
+// Everything main() did after parseArgs — the verb dispatch — behind one seam so --legend=compact can wrap the
+// run's stdout once (runWithCompactLegend above) instead of teaching ~60 emitters a second dialect.
+static int dispatchMain( const rw::Config& cfg, char** argv )
+{
+    using namespace rw;
+
+    // L2: --json refuses LOUDLY for any verb it doesn't (yet) support — see jsonUnsupportedVerb's ALLOW-list
+    // rationale. Checked before ANY dispatch — including the CLI edit bridge below, which used to run AHEAD of
+    // this check (capture-audit 2026-09-04: `--replace-symbol-body=X --edit-payload=F --json` performed the edit
+    // and never saw --json) — so an unsupported combination never reaches a handler that would silently
+    // ignore --json and emit XML.
+    // §B1.4: two sentences, because there are two failures here. An unsupported VERB is told the supported
+    // set plus ONE RUNNABLE EXAMPLE (the --format=columnar refusal has carried one since §A5b; this one did
+    // not). An output-SHAPE modifier is told it collided with another encoding — enumerating "supported
+    // verbs" at someone who typed --format=columnar names nothing they can act on.
+    if( cfg.json )
+    {
+        if( const std::string_view unsupported = jsonUnsupportedVerb( cfg ); !unsupported.empty() )
+        {
+            if( isJsonShapeModifier( unsupported ) )
+            {
+                rw::emitTo( stderr, "codecortex: --json and {} are two output SHAPES for the same rows — pass one, not both "
+                              "(e.g. codecortex <dir> --callers=SYM --json, or codecortex <dir> --callers=SYM {})\n", std::string_view( unsupported.data(), unsupported.size() ), std::string_view( unsupported.data(), unsupported.size() ) );
+            }
+            else
+            {
+                // §B1.2: the enumeration used to stop at --test-gate and never mention --metrics, which HAS
+                // had a full JSON twin (row keys amp/cbo/ccx/cx/in/loc/nest/out/params/role/tested) — so a
+                // caller obeying THIS refusal never learned the one flag it was actually looking for existed.
+                // The sentence is the allow-list (kJsonVerbs) spelled out; keep the two in step.
+                rw::emitTo( stderr, "codecortex: --json is not yet supported for {} — supported: the default map, "
+                              "--for, --pack-task, --callers/--callees, --impact, --quality-delta, --test-gate, "
+                              "--metrics, and --plan-lanes which is JSON-native (e.g. codecortex <dir> --callers=SYM --json)\n", std::string_view( unsupported.data(), unsupported.size() ) );
+            }
+            return 1;
+        }
+    }
+
+    // C1-b: --in=DIR is refused HERE — ahead of the CLI edit bridge, --doctor, --batch, --mcp and every report
+    // verb — because those dispatch before the default map and would leave the flag accepted and ignored. The
+    // answer is derived from the flag tables (inPreemptedBy), not from a list of verbs; cli.h already refused
+    // the cases it can see on its own (no host, multi-root, --top-k).
+    // INERT IS NOT COMPETING, and the generic sentence below cannot tell them apart (CodeRabbit, review of
+    // #212). firstFlagOutside answers "which set flag is not a ride-along", which for --no-redact was reported
+    // as "--no-redact answers instead" — false, because --no-redact selects no operation at all: it only stops
+    // body redaction, and a scoped run serves no bodies (the symbol map is the counted stub). --no-redact is
+    // deliberately NOT added to kInRideAlong: that would accept an inert modifier silently, which is the defect
+    // this refusal exists to prevent. It is named HERE instead, ahead of the generic line, in the shape
+    // refuseInertMainModifiers already uses for the same flag on the bare map.
+    //
+    // AUDITED for siblings, since one wrong reason suggests the class was never enumerated: of the 164 flags
+    // firstFlagOutside walks, 149 are not ride-alongs, and every one tested reaches its OWN pairing refusal
+    // before this line (--signatures-only/--auto-bodies/--adaptive/--no-mention-boost/--no-doc-mention/
+    // --with-graph name --for, --handles/--no-prefilter name --grep, --sarif names --lint, --anchor and
+    // --cochange-boost demand CODECORTEX_DEV). Exactly one other flag reaches this diagnostic, --external-surface,
+    // and for it the wording is CORRECT: it emits its own <external-surface> answer, so it really does compete.
+    // The --in GUARD is load-bearing here and was missing on first write: this block runs for EVERY invocation
+    // (inPreemptedBy below self-guards on inDir, this branch did not), so an unconditional cfg.noRedact
+    // refused a plain `--no-redact --top-k=1` while talking about --in=DIR — a wrong statement in output, the
+    // very defect being fixed, inverted. Eight gates caught it (shapingflag, modifierguard, editroundtrip,
+    // showcasecapture and all four redact gates); every arm added for the fix had passed --in and so could not.
+    if( !cfg.inDir.empty() && cfg.noRedact )
+    {
+        rw::emitRaw( stderr, "codecortex: --in=DIR scopes the recent-changes block and collapses the symbol map to a counted stub, so this run "
+                              "serves no bodies and --no-redact has nothing to un-redact — it is inert here, not overridden. Drop it for the "
+                              "scoped block (codecortex <dir> --rank-by=churn-decay --in=src), or pass it to a body-serving verb "
+                              "(codecortex <dir> --expand=SYM --no-redact)\n" );
+        return 1;
+    }
+    // Every OTHER shaping flag that cannot ride along (derived: see inInertShaper). --no-redact keeps its own
+    // message above because its mechanism is bodies, not row decoration, and a reader needs the body-serving
+    // verb named. This branch covers the rest of the residue by table membership.
+    if( const std::string_view inert = inInertShaper( cfg ); !inert.empty() )
+    {
+        rw::emitTo( stderr, "codecortex: --in=DIR scopes the recent-changes block and collapses the symbol map to a counted stub, so {} shapes a map "
+                              "this run does not print — it is inert here, not overridden. Drop it for the scoped block "
+                              "(codecortex <dir> --rank-by=churn-decay --in=src), or drop --in to get the map it shapes "
+                              "(codecortex <dir> --rank-by=churn-decay {})\n",
+                    std::string_view( inert.data(), inert.size() ), std::string_view( inert.data(), inert.size() ) );
+        return 1;
+    }
+    if( const std::string_view answered = inPreemptedBy( cfg ); !answered.empty() )
+    {
+        rw::emitTo( stderr, "codecortex: --in=DIR scopes the recent-changes block of the DEFAULT churn-decay map, and {} answers instead — "
+                              "nothing was scoped. Drop {} to get the scoped block (e.g. codecortex <dir> --rank-by=churn-decay --in=src)\n",
+                    std::string_view( answered.data(), answered.size() ), std::string_view( answered.data(), answered.size() ) );
+        return 1;
+    }
+
+    // CLI-first edit verbs reuse the MCP transaction engine and therefore own their own indexed pass.
+    // Dispatch before the ordinary ingest pipeline so the preferred CLI path never parses the tree twice.
+    if( std::optional<int> guarded = runEditPreviewGuard( cfg ) )
+    {
+        return *guarded;   // card A1: a half-typed preview, refused where the missing flag is still nameable
+    }
+    if( std::optional<int> planned = runCliEditPlan( cfg ) )
+    {
+        return *planned;
+    }
+    if( std::optional<int> edited = runCliEdit( cfg ) )
+    {
+        return *edited;
+    }
+
+    // §B11.4's table is SCANNED here and printed further down, because X9(c) below needs the winner too. The
+    // scan is pure; nothing is emitted by this line.
+    const VerbPrecedence verbPrec = scanReportVerbPrecedence( cfg );
+
+    // X9(c): mode flags have a hidden precedence when more than one is given at once — the earlier-checked
+    // one silently wins and the rest are ignored outright, with no signal to the caller that anything was
+    // dropped. Warn once, on stderr, one line per conflict; behavior is UNCHANGED (the same flag still wins).
+    // §F1: gated on the query family actually WINNING. Until --index-out became a row, a run containing a
+    // family flag always had one answer, so the guard was free; --index-out dispatches before ingest and
+    // beats all three, and X9(c) announcing "--for takes precedence" in a run --for never answered would be
+    // a confident lie of exactly the kind this whole section exists to delete.
+    if( verbPrec.winnerIsQueryFamily && !cfg.forTask.empty() && ( !cfg.query.empty() || cfg.packTaskFlag ) )
+    {
+        rw::emitRaw( stderr, "codecortex: --for takes precedence over --query/--pack-task when both are given (the others are ignored)\n" );
+    }
+    else if( verbPrec.winnerIsQueryFamily && cfg.packTaskFlag && !cfg.query.empty() )
+    {
+        rw::emitRaw( stderr, "codecortex: --pack-task takes precedence over --query when both are given (--query is ignored)\n" );
+    }
+    if( cfg.stable && cfg.mostImportantLast )
+    {
+        rw::emitRaw( stderr, "codecortex: --stable takes precedence over --most-important-last when both are given (emit order stays path/id order)\n" );
+    }
+
+    // §B11.4 (CA4) — the SAME hazard X9(c) discloses for three flags, on the ~50 report verbs it never
+    // reached. `--hotspots --clones` emits hotspots only, exit 0, stderr EMPTY; `--owners --clones` emits
+    // CLONES — because the winner is fixed by codecortex's internal DISPATCH ORDER, not by the order the flags
+    // were typed, which is the part no caller can guess. Behaviour is unchanged: the same verb still wins,
+    // and this only says so. Warns ONCE per run, listing every verb that was dropped.
+    // §M1: the three flags X9(c) speaks for are rows here too now, so a CROSS-family pair (`--pack-task
+    // --skipped`, `--for --hotspots`) discloses like every other pair instead of dropping one in silence.
+    // X9(c) keeps the intra-family pair; the row table skips it rather than repeat it.
+    // §A2: those three rows are now contiguous at the TOP of the table — the family dispatches first, so in
+    // every cross-family pair the query-family flag is the WINNER and the report verb is the one disclosed.
+    // §F1: the eleven verb-shaped flags that owned no row are rows now, so a pair like `--quality-panel
+    // --lint` discloses instead of dropping one in silence.
+    warnReportVerbPrecedence( verbPrec );
+
+    // §F1: and the third class — a map-modifier voided because a report verb answered first says so, while
+    // one that COMPOSED (--query --expand) stays quiet, because nothing was dropped.
+    warnMapModifierDiscarded( cfg, verbPrec );
+
+    // capture-audit 2026-09-04 (M16): the two modifiers whose "alone" test needs main's knowledge (the flag
+    // universe walk, the root list) — refused here, before any dispatch, the way validateModifierGuards
+    // refuses the ones cli.h can judge on its own.
+    if( const std::optional<int> refused = refuseInertMainModifiers( cfg ) )
+    {
+        return *refused;
+    }
+
+    // §B1.5 (capture-audit-4, wave 3) — --plan-lanes is the INERT case, and it wants a different answer from
+    // the five eval verbs above. Those emit a dialect --json asked them to change and silently did not; this
+    // one emits JSON natively, byte-identical with and without the flag, because JSON is the only thing it
+    // has ever spoken. Refusing it would be the worst of the three options: the caller who asked for JSON
+    // would be turned away by the one verb that produces nothing else. Implementing it is a no-op. So it is
+    // ACCEPTED and DISCLOSED — the §P15.3 "accepted and silently ignored" class is about a caller who cannot
+    // tell a no-op from a typo, and one line on stderr closes exactly that gap while changing no output byte.
+    // Deliberately not a refusal, and deliberately not silence.
+    if( cfg.json && cfg.planLanesFlag )
+    {
+        rw::emitRaw( stderr, "codecortex: --plan-lanes always emits JSON — --json is redundant here and changes nothing\n" );
+    }
+
+    // The --lsp navigation server: a third front door onto the SAME warm index the MCP twins use
+    // (getIndex()), answering the five navigation methods over stdio. --mcp/--listen beside it are
+    // refused in validateConfig, so this block's position relative to the --mcp branch below is inert.
+    if( cfg.lsp )
+    {
+        return lsp::runLsp( std::string( cfg.rootPath ) );
+    }
+
+    const auto makeUiConfig = [ & ]()
+    {
+        rw::ui::ServerConfig uc;
+        uc.root = std::string( cfg.rootPath.empty() ? "." : cfg.rootPath );
+        uc.port = cfg.uiPort;
+        uc.executable = argv[0] ? std::string( argv[0] ) : std::string();
+        uc.version = kCodeCortexVersion;
+        uc.telemetryPath = cfg.telemetryFile.empty()
+                         ? rw::codecortex_mcp::telemetryPathFor( uc.root )
+                         : std::string( cfg.telemetryFile );
+        return uc;
+    };
+
+    if( cfg.ui )
+    {
+        return rw::ui::runServer( makeUiConfig() );
+    }
+
+    if( cfg.mcp )
+    {
+        if( cfg.mcpUi )
+        {
+            rw::ui::ServerConfig uc = makeUiConfig();
+            uc.mcpActive = true;
+            uc.mcpTransport = cfg.listen.empty() ? "stdio" : "streamable_http";
+            if( cfg.listen.empty() ) uc.mcpLocalOnly = true;
+            else
+            {
+                const std::string listenSpec( cfg.listen );
+                uc.mcpLocalOnly = listenSpec.find( "127.0.0.1" ) != std::string::npos
+                               || listenSpec.find( "localhost" ) != std::string::npos
+                               || listenSpec.find( ':' ) == std::string::npos;
+            }
+            std::thread( [ uc ]() { (void)rw::ui::runServer( uc ); } ).detach();
+            rw::emitTo( stderr, "codecortex: MCP Developer Console enabled at http://127.0.0.1:{}\n", cfg.uiPort );
+        }
+        // --listen picks the remote Streamable-HTTP transport; otherwise stdio. Both
+        // route every request through the SAME shared handler (mcp.h dispatchMcpLine) — byte-identical payloads.
+        if( !cfg.listen.empty() )
+        {
+            McpHttpConfig hc;
+            hc.listenSpec = std::string( cfg.listen );
+            hc.token      = std::string( cfg.mcpToken );
+            if( hc.token.empty() )
+            {
+                if( const char* envTok = std::getenv( "CODECORTEX_MCP_TOKEN" ); envTok && *envTok )
+                {
+                    hc.token = envTok; // env fallback (avoids the secret in argv/ps)
+                }
+            }
+            hc.root             = std::string( cfg.rootPath );
+            for( std::string_view r : cfg.roots )
+            {
+                hc.roots.emplace_back( r );
+            }
+            hc.topK             = cfg.topK;
+            hc.stable           = cfg.stable;
+            hc.noRedact         = cfg.noRedact;
+            hc.allowRemoteEdits = cfg.allowRemoteEdits;
+            hc.telemetryPath    = makeUiConfig().telemetryPath;
+            return runMcpHttp( hc );
+        }
+        // X7 (D3/D4): thread the SAME positional-root plumbing the HTTP branch above uses into the stdio
+        // loop too — a bare `codecortex --mcp` (no root) keeps the pre-X7 "every request names its own path"
+        // behavior (roots empty ⇒ runMcp's defaultRoot stays ""); `codecortex <root> --mcp` now actually uses it.
+        std::vector<std::string> mcpRoots;
+        for( std::string_view r : cfg.roots )
+        {
+            mcpRoots.emplace_back( r );
+        }
+        return rw::codecortex_mcp::runCodeCortexMcp( cfg.topK, cfg.stable, cfg.noRedact, std::string( cfg.rootPath ), mcpRoots,
+                                                    makeUiConfig().telemetryPath );   // P2-C: --mcp turns --stable on by default (set in parseArgs); A3-F3: the server redacts by default like the CLI
+    }
+
+    // ── multi-root workspace refusals: each cut verb refuses with ONE clear stderr
+    //    line + exit 1 (a refusal, not a regression verdict — never exit 2/3/4). All quarantined behind
+    //    roots.size() >= 2 so every single-root invocation is byte-identical to today.
+    if( cfg.roots.size() >= 2 )
+    {
+        const auto refuse = [ & ]( const char* what, const char* why ) -> int
+        {
+            rw::emitTo( stderr, "codecortex: {} is single-root only in a multi-root workspace — {}\n", what, why );
+            return 1;
+        };
+        if( cfg.qualityDelta || cfg.qualityBaseline )
+        {
+            return refuse( "--quality-delta/--quality-baseline", "its baseline is keyed to ONE repo's HEAD; run it per root" );
+        }
+        if( !cfg.helpTask.empty() )
+        {
+            return refuse( "--help-task", "its repository applicability and exact-symbol facts are single-root; run it per root" );
+        }
+        if( cfg.dmm )
+        {
+            return refuse( "--dmm", "it diffs ONE repo's committed trees, and pooling two histories into one ratio would be meaningless; run it per root" );
+        }
+        if( !cfg.editCheckSym.empty() )
+        {
+            return refuse( "--edit-check", "its git-HEAD baseline (computeHeadSnapshot) is keyed to ONE repo; run it per root" );
+        }
+        if( cfg.testGate )
+        {
+            return refuse( "--test-gate", "its HEAD-keyed contract is per-repo; run it per root" );
+        }
+        if( cfg.handoff )
+        {
+            return refuse( "--handoff", "its branch/sha/diff provenance is keyed to ONE repo's HEAD; run it per root" );
+        }
+        if( cfg.eval || cfg.evalRetrieval || !cfg.evalMined.empty() || !cfg.evalSkills.empty() )
+        {
+            return refuse( "--eval/--eval-retrieval/--eval-mined/--eval-skills", "corpora, goldens and scoreboards are single-root artifacts; run it per root" );
+        }
+        if( !cfg.archRules.empty() && ( cfg.baseline || cfg.baselineUpdate ) )
+        {
+            return refuse( "--arch --baseline/--baseline-update", "a committed baseline sidecar lives in ONE repo; run it per root" );
+        }
+        if( !cfg.indexOut.empty() )
+        {
+            return refuse( "--index-out", "the committable index artifact is per-repo; generate one per root" );
+        }
+        if( !cfg.cacheFile.empty() )
+        {
+            return refuse( "--cache=PATH", "a workspace uses one auto cache blob PER root (drop --cache, or use --no-cache)" );
+        }
+        if( !cfg.scipIndex.empty() )
+        {
+            return refuse( "--scip", "a SCIP index describes ONE repo; overlays across roots are deferred" );
+        }
+        // §B6 (capture-audit-4, wave 3) — the ONE deliberate CLI/MCP divergence on this list, DECIDED and
+        // RECORDED rather than left silent. The wave-2 MCP lane left `batch` diverging and argued the CLI
+        // restriction is the questionable side; verified before deciding — the MCP verb with
+        // `paths:["svc","web"]` really does answer a MERGED two-root batch (a grep sub-query returns
+        // files=2 across both roots), so "run against ONE root in v1" was false about the TOOL, not merely
+        // restrictive about this surface.
+        //
+        // The restriction STAYS and the sentence changes. Why the restriction: the CLI batch path resolves
+        // each sub-query's index from a single root STRING (runBatchSub( root, … ) with cfg.rootPath), while
+        // the MCP surface resolves it from a registered workspace KEY that stands for N roots. Lifting it is
+        // not a message change, it is teaching the CLI path to register into that workspace registry —
+        // a feature, in a file this lane does not own, at the end of a disclosure wave. Why the sentence
+        // changes anyway: a refusal that implies a capability does not exist, when it does and the caller may
+        // already be using it on the other surface, is the §B1-class defect this whole round is about.
+        if( !cfg.batchFile.empty() )
+        {
+            return refuse( "--batch", "each CLI sub-query resolves its index from ONE root path — run it per root, "
+                                      "or use the MCP `batch` verb with a `paths` array, which DOES answer a merged "
+                                      "multi-root batch (the two surfaces deliberately differ here)" );
+        }
+        if( cfg.doctor )
+        {
+            return refuse( "--doctor", "its cache-dir/git checks are per-repo; run it per root" );
+        }
+        if( cfg.mergeScoutFlag )
+        {
+            return refuse( "--merge-scout", "its git history/branches are per-repo; run it per root" );
+        }
+        if( cfg.planLanesFlag )
+        {
+            return refuse( "--plan-lanes", "the carve, the at= stamp and the churn/hotspot lens are all per-repo; run it per root" );
+        }
+        if( cfg.noteAddFlag || cfg.notesList )
+        {
+            return refuse( "--note-add/--notes", "the .codecortex_notes file lives at ONE repo root (its targets are that root's canonical ids); run it per root" );
+        }
+    }
+
+    // ── --doctor: self-diagnosis, before the heavy ingest pipeline (like --scan-skill above) ─────
+    if( cfg.doctor )
+    {
+        return runDoctor( cfg, argv[0] );
+    }
+
+    // ── P1-C security scan — purely additive, exits before the heavy ingest pipeline ─────────────
+    // --scan-skill=FILE: scan one skill file; emit a `<skillscan>` artifact; exit with skillScanExitCode.
+    // --scan-skills[=DIR]: scan DIR, or the repo-local, Claude, and Codex skill homes.
+    // Output: §P6.9 — a single deterministic `<skillscan files=".." findings=".." verdict="..">` XML
+    // artifact to stdout (one `<f p="path:line" rule=".." sev=".."/>` per finding, capped) + the existing
+    // tally line to stderr. Exit 0/1/2 = a scan VERDICT (clean/WARN/CRITICAL). exit 3 = REFUSAL — the path
+    // could not be scanned at all (missing, permission-denied, or a file arg that is a directory) — kept
+    // off 0/1/2 on purpose (§P0.5a): those three are already all spoken for
+    // as verdicts, so a "never scanned it" refusal needs a code a caller cannot mistake for "scanned it and
+    // it was clean" (matches this codebase's existing convention of reserving a code beyond a verb's own
+    // 0..N verdict range for a distinct non-verdict signal — see --token-budget's exit 3 "not 2, so a
+    // script can tell 'too big' apart from 'new debt'"). The refusal `return 3`s below happen strictly
+    // BEFORE the `<skillscan>` artifact is ever built, so a refused scan's stdout stays byte-empty
+    // (test/skillscanreadcheck.sh pins this — no clean-scan-shaped output on a refusal).
+    if( !cfg.scanSkillFile.empty() )
+    {
+        const std::string path( cfg.scanSkillFile );
+        const SkillFileReadResult result = scanSkillFileChecked( path );
+        if( !result.readable )
+        {
+            rw::emitTo( stderr, "codecortex: --scan-skill: cannot read '{}' — no scan performed\n", path.c_str() );
+            return 3;
+        }
+        std::vector<SkillScanRow> rows;
+        rows.reserve( result.findings.size() );
+        for( const SkillFinding& f : result.findings )
+        {
+            rows.push_back( { path, f } );
+        }
+        printSkillScanArtifact( stdout, rows, /*filesScanned=*/1, /*filesSkipped=*/0, cfg.legend == "full" );
+        rw::emitTo( stderr, "codecortex scan: {} finding(s) in {}\n", int( result.findings.size() ), path.c_str() );
+        return skillScanExitCode( result.findings );
+    }
+
+    if( cfg.scanSkills )
+    {
+        // An EXPLICIT --scan-skills=DIR that cannot be read is a typo, not "no default skill homes
+        // configured" — refuse instead of silently walking zero dirs and reporting a clean "0 finding(s)
+        // total" (the same false-safe as the single-file case above). The unconfigured DEFAULT dirs
+        // below stay optional-by-design: e.g. no ~/.codex/skills is normal, not an error.
+        if( !cfg.scanSkillsDir.empty() )
+        {
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            const bool exists = fs::exists( cfg.scanSkillsDir, ec ) && !ec;
+            ec.clear();
+            const bool isDir = exists && fs::is_directory( cfg.scanSkillsDir, ec ) && !ec;
+            if( !exists || !isDir )
+            {
+                rw::emitTo( stderr, "codecortex: --scan-skills: cannot read '{}' — no scan performed\n", std::string_view( cfg.scanSkillsDir.data(), cfg.scanSkillsDir.size() ) );
+                return 3;
+            }
+        }
+
+        // Determine directories to scan: explicit dir, or defaults. De-duplicate because CODEX_HOME may
+        // intentionally name one of the other roots in an isolated/managed environment.
+        std::vector<std::string> dirs;
+        const auto addDir = [&]( std::string dir )
+        {
+            if( std::find( dirs.begin(), dirs.end(), dir ) == dirs.end() )
+            {
+                dirs.push_back( std::move( dir ) );
+            }
+        };
+        if( !cfg.scanSkillsDir.empty() )
+        {
+            addDir( std::string( cfg.scanSkillsDir ) );
+        }
+        else
+        {
+            addDir( ".agents/skills" );
+            const char* homeEnv        = std::getenv( "HOME" );
+            const char* claudeConfigEnv = std::getenv( "CLAUDE_CONFIG_DIR" );
+            if( claudeConfigEnv && *claudeConfigEnv )
+            {
+                addDir( std::string( claudeConfigEnv ) + "/skills" );
+            }
+            else if( homeEnv && *homeEnv )
+            {
+                addDir( std::string( homeEnv ) + "/.claude/skills" );
+            }
+
+            const char* codexHomeEnv = std::getenv( "CODEX_HOME" );
+            if( codexHomeEnv && *codexHomeEnv )
+            {
+                addDir( std::string( codexHomeEnv ) + "/skills" );
+            }
+            else if( homeEnv && *homeEnv )
+            {
+                addDir( std::string( homeEnv ) + "/.codex/skills" );
+            }
+        }
+
+        // Scan each dir; accumulate findings per-file (deterministic dir/file order), then emit ONE
+        // combined `<skillscan>` artifact across every file, instead of streaming a print per file.
+        //
+        // §B13.3 — WHAT COUNTS AS A SKILL FILE, and why this walk no longer says ".md".
+        // It used to collect `.md` only. `files="22"` was honest about what it scanned and silent about what
+        // it did not: this repo's skills/ holds 24 files, and the two it never opened are `skills/install.sh`
+        // and `hooks/codecortex-nudge.sh` — under `verdict="clean"`, with no counter and no legend clause.
+        // An injection scanner's directory verdict silently excluded that directory's two EXECUTABLES, which
+        // are the files most worth scanning. The single-file form has no such filter (`--scan-skill=<any
+        // file>` scans it), so the two entry points disagreed about their own subject.
+        // They now agree: every regular file is a candidate. A NUL byte does not change that — the scanner reads
+        // bytes, --scan-skill scans a PNG or an executable without complaint (zero findings on every real one
+        // measured), and the git buffer_is_binary rule this walk once borrowed dropped a text file from the
+        // verdict's subject for one stray NUL in its first 8 KB. What remains outside the scan is never silent —
+        //   • a file that cannot be READ at all (mode 000, an I/O error, a descriptor limit). It is still there
+        //     to be copied, so under owner ruling 3 it is COUNTED as skipped AND scored CRITICAL on a row that
+        //     names it (kScanIncompleteRuleUnreadable) — never scanned-with-zero-findings, and never a skip
+        //     that leaves `verdict="clean"`. scanSkillFileChecked is the seam that tells it apart;
+        //   • a denylisted DIRECTORY subtree (.git, node_modules, build, …) is not descended, through the ONE
+        //     shared table both crawlers already use (rw::isSkippedCrawlDir). Without it, pointing the verb
+        //     at a cloned skill repo means opening every packed object. The number of pruned subtrees is
+        //     named on the stderr tally, so the walk's shape is stated rather than assumed.
+        std::sort( dirs.begin(), dirs.end() );
+        std::vector<SkillScanRow> allRows;
+        int      totalFindings = 0;
+        int      filesScanned  = 0;
+        int      filesSkipped  = 0;          // seen but not scannable: binary, or unreadable
+        int      prunedDirs    = 0;          // denylisted subtrees not descended
+        int      maxSev        = 0;          // 0=clean, 1=warn, 2=critical
+
+        for( const std::string& dir : dirs )
+        {
+            // Walk dir manually so file order stays deterministic across the whole directory tree.
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            if( !fs::exists( dir, ec ) || ec )
+            {
+                continue;
+            }
+
+            // follow_directory_symlink, because a skills HOME is normally built out of symlinks: on this
+            // machine every entry of ~/.claude/skills is a link to the skill's source directory, and
+            // .agents/skills is itself a link to ~/.claude/skills. Without following them the verb walked
+            // ZERO files and still said so as `files="0" findings="0" verdict="clean"` at exit 0 — measured
+            // on a two-line fixture whose one symlinked skill carries a CRITICAL injection phrase. That is the
+            // §P0.5a false-safe the single-file form refuses (exit 3), reappearing through the layout instead
+            // of through the path.
+            // Following symlinks means CYCLES, so canonical directory identity is tracked and a directory
+            // already entered is pruned rather than re-entered — `a -> ..` is a real thing to find in a
+            // hand-built skills home, and an unbounded walk there never terminates.
+            std::vector<std::string>     skillPaths;
+            std::vector<std::string>     visitedDirs;                  // canonical paths already descended
+            const auto isFirstVisit = [ &visitedDirs ]( const fs::path& d )
+            {
+                std::error_code cec;
+                const fs::path  canon = fs::canonical( d, cec );
+                const std::string key = cec ? d.string() : canon.string();   // unresolvable ⇒ its own identity
+                if( std::find( visitedDirs.begin(), visitedDirs.end(), key ) != visitedDirs.end() )
+                {
+                    return false;
+                }
+                visitedDirs.push_back( key );
+                return true;
+            };
+            isFirstVisit( fs::path( dir ) );                            // the root itself, so a link back to it is a cycle
+
+            // F-B3 (owner ruling 3): the walk's own increment() can fail for a reason skip_permission_denied does
+            // NOT swallow (a descriptor limit, ENAMETOOLONG, an I/O error — codexwrapcheck.sh's wrap-side arm
+            // reaches this with ulimit -n) — content past that point may still be COPIED and installed, just
+            // never scanned, so it fails closed below rather than reading as an honest "clean". The loop
+            // condition checks `!ec` so a failed increment is seen on the NEXT condition test, not thrown away
+            // by an unconditional clear in the same expression that set it (the previous shape cleared `ec`
+            // right after increment(), in the same for-loop update-expression, so the body's own `if( ec )`
+            // could never see it fire — an arm that cannot fail, CONTRIBUTING.md §2).
+            fs::recursive_directory_iterator it( dir, fs::directory_options::skip_permission_denied
+                                                    | fs::directory_options::follow_directory_symlink, ec );
+            for( ; !ec && it != fs::recursive_directory_iterator(); it.increment( ec ) )
+            {
+                const fs::path& p = it->path();
+                if( it->is_directory( ec ) && !ec )
+                {
+                    if( rw::isSkippedCrawlDir( p.filename().string() ) || !isFirstVisit( p ) )
+                    { ++prunedDirs;  it.disable_recursion_pending(); }
+                    ec.clear();
+                    continue;
+                }
+                ec.clear();
+                if( !it->is_regular_file( ec ) || ec ) { ec.clear(); continue; }
+                skillPaths.push_back( p.string() );
+            }
+            static const bool isWalkStopFaultOn = rw::faultSwitchOn( "CODECORTEX_FAULT_SKILL_WALK_STOP" );
+            if( !ec && isWalkStopFaultOn )
+            {
+                ec = std::make_error_code( std::errc::too_many_files_open );   // any non-permission error the fault stands in for
+            }
+            if( ec )
+            {
+                allRows.push_back( { dir, rw::SkillFinding{ rw::SkillSeverity::Critical, 0, rw::kScanIncompleteRuleWalk,
+                                                             "the walk of " + dir + " stopped early: " + ec.message() } } );
+                ++totalFindings;
+                maxSev = 2;
+                rw::emitTo( stderr, "codecortex scan: CRITICAL — the skill walk of {} stopped early ({}); files past that point may still be installed but were not scanned\n",
+                            dir, ec.message() );
+            }
+            std::sort( skillPaths.begin(), skillPaths.end() );
+
+            for( const std::string& p : skillPaths )
+            {
+                const SkillFileReadResult res = scanSkillFileChecked( p );
+                if( !res.readable )   // found, still copyable, never read: CRITICAL by name (owner ruling 3), not a "clean" skip
+                {
+                    ++filesSkipped;
+                    allRows.push_back( { p, rw::SkillFinding{ rw::SkillSeverity::Critical, 0, rw::kScanIncompleteRuleUnreadable, "cannot read " + p } } );
+                    ++totalFindings;
+                    maxSev = 2;
+                    rw::emitTo( stderr, "codecortex scan: CRITICAL — cannot read skill file {}; it was not scanned and may still be installed\n", p );
+                    continue;
+                }
+
+                ++filesScanned;
+                for( const SkillFinding& f : res.findings )
+                {
+                    allRows.push_back( { p, f } );
+                }
+                totalFindings += int( res.findings.size() );
+                const int code = skillScanExitCode( res.findings );
+                if( code > maxSev )
+                {
+                    maxSev = code;
+                }
+            }
+        }
+
+        printSkillScanArtifact( stdout, allRows, filesScanned, filesSkipped, cfg.legend == "full" );
+
+        // Honest zero: "0 finding(s)" alone doesn't say whether that's because nothing was WARN/CRITICAL
+        // or because there was nothing readable to scan. Naming the file count keeps a genuine "scanned
+        // 0 skill files" (an empty/unpopulated dir — a real measurement) legible on its own, distinct from
+        // this same verb's exit-3 refusal above (which never gets here). §B13.3 adds the other half of the
+        // population to the same line: what the walk saw and could not scan, and what it did not descend.
+        rw::emitTo( stderr, "codecortex scan: {} finding(s) total ({} skill file(s) scanned, {} unscannable file(s) skipped, {} denylisted subtree(s) not descended)\n",
+                      totalFindings, filesScanned, filesSkipped, prunedDirs );
+        return maxSev;
+    }
+
+    // ── A4-R3 CLI batch: one-turn context sweep from a `verb:arg` file (or stdin) ─────────────────
+    // The shell-pipeline counterpart of the MCP `batch` verb. Reuses the EXACT shared machinery
+    // (runBatchSub + batchText from mcp.h) — each `verb:arg` line becomes the same JSON sub-query the
+    // MCP verb parses, so a CLI batch answer is byte-identical to the MCP one (and to the standalone
+    // verbs). Blank lines and `#`-comment lines are ignored; over kBatchCap lines are counted but not
+    // processed (capped="1", honest n<requested), never silently dropped.
+    if( !cfg.batchFile.empty() )
+    {
+        const std::string root( cfg.rootPath );
+
+        std::string content;
+        if( cfg.batchFile == "-" )
+        {
+            // R4: byte-safe reader (stdinline.h). --batch=- lines carry arbitrary verb arguments — a
+            // non-ASCII --grep pattern is ordinary input — and std::getline( std::cin, ... ) aborted the
+            // sanitizer build on the first high byte. Parity is exact, so batch answers are unchanged.
+            std::string l;
+            while( rw::readByteSafeLine( stdin, l ) ) { content += l; content += '\n'; }
+        }
+        else
+        {
+            const std::string bf( cfg.batchFile );
+            std::FILE* f = std::fopen( bf.c_str(), "rb" );
+            if( !f ) { rw::emitTo( stderr, "codecortex: --batch: cannot open '{}'\n", bf.c_str() ); return 1; }
+            char buf[ 4096 ]; std::size_t n;
+            while( ( n = std::fread( buf, 1, sizeof buf, f ) ) > 0 )
+            {
+                content.append( buf, n );
+            }
+            std::fclose( f );
+        }
+
+        // M5 (capture-audit 2026-09-04): the `verb:arg` -> sub-query conversion this arm used to own as a
+        // local lambda now lives in mcpverbs.h beside the served-verb registry, so the MCP `batch` verb can
+        // accept the SAME line and produce the byte-identical object. One grammar, two front doors.
+
+        RedactCounts        rc;
+        RedactCounts* const rp = cfg.noRedact ? nullptr : &rc;
+
+        std::vector<BatchSub> subs;
+        std::size_t           requested = 0;
+        std::size_t           pos       = 0;
+        while( pos < content.size() )
+        {
+            const std::size_t nl   = content.find( '\n', pos );
+            std::string       line = content.substr( pos, nl == std::string::npos ? std::string::npos : nl - pos );
+            pos = ( nl == std::string::npos ) ? content.size() : nl + 1;
+
+            // trim surrounding whitespace (incl. a trailing '\r' from CRLF)
+            const std::size_t b = line.find_first_not_of( " \t\r" );
+            if( b == std::string::npos )
+            {
+                continue; // blank line
+            }
+            const std::size_t e = line.find_last_not_of( " \t\r" );
+            line = line.substr( b, e - b + 1 );
+            if( line.empty() || line[0] == '#' )
+            {
+                continue; // comment
+            }
+
+            ++requested;
+            if( subs.size() >= kBatchCap )
+            {
+                continue; // count, don't process past the cap
+            }
+
+            subs.push_back( runBatchSub( root, rw::batchObjectFromCliSpec( line ), cfg.topK, cfg.stable, rp,
+                                         cfg.legend == "compact" ) );
+        }
+
+        // M1 (terminality round A): --batch --legend=compact reached the batch envelope's own legend and
+        // stopped at the CDATA boundary, so a compacted batch still shipped every sub-answer's FULL legend
+        // (measured on the fixture, uses+slice: 8,840 B full, 8,645 B outer-only, 4,478 B with the subs). The
+        // whole-stdout layer cannot do it — it must not rewrite inside CDATA — so the batch assembler does,
+        // through the SAME helper the MCP twin calls. Gate: batchcheck (a)/(h) and compactlegendcheck.
+        if( cfg.legend == "compact" )
+        {
+            rw::applyCompactToBatchSubs( subs );
+        }
+        std::fputs( batchText( subs, requested, kBatchCap ).c_str(), stdout );
+        std::fputc( '\n', stdout );
+        reportRedactions( stderr, rc );
+        return 0;
+    }
+
+    // Wave-4 remote ergonomics: a git-URL positional (https:// or git@) is shallow-cloned to a per-URL
+    // cache dir and mapped from there. A plain path passes through unchanged (no clone attempted).
+    // S3: --refetch forces a fresh clone instead of silently reusing an arbitrarily-old cached one (bare on a
+    // local path it is refused up front — refuseInertMainModifiers).
+    // Multi-root: EVERY positional resolves the same way; roots are then deduped (realpath, stderr note),
+    // nested roots hard-error, labels assigned, and the set canonically ordered (workspace.h — §2/§2.1).
+    std::vector<std::string> resolvedRoots;
+    for( const std::string_view rootArg : cfg.roots )
+    {
+        const auto [ resolvedRoot, cloneOk ] = resolveRemoteRoot( std::string( rootArg ), cfg.refetch );
+        if( !cloneOk )
+        {
+            return 1;
+        }
+
+        // a root that does not EXIST is caller error (a typo'd path), not a degradable runtime condition —
+        // exit 1 with empty stdout so agent pipelines can detect it. A readable-but-empty directory still
+        // maps to a valid empty result (exit 0): "nothing there" and "no such place" are different answers.
+        {
+            namespace fs = std::filesystem;
+            std::error_code rootEc;
+            if( !fs::exists( fs::path( resolvedRoot ), rootEc ) || rootEc )
+            {
+                // If the path looks like a flag (contains '='), suggest the flag spelling
+                if( resolvedRoot.find( '=' ) != std::string::npos )
+                {
+                    const auto eqPos = resolvedRoot.find( '=' );
+                    const std::string flagName = resolvedRoot.substr( 0, eqPos );
+                    rw::emitTo( stderr, "codecortex: root path does not exist: {}\n", resolvedRoot.c_str() );
+                    rw::emitTo( stderr, "codecortex: did you mean --{}={} ?\n", flagName.c_str(), resolvedRoot.substr( eqPos + 1 ).c_str() );
+                }
+                else
+                {
+                    rw::emitTo( stderr, "codecortex: root path does not exist: {}\n", resolvedRoot.c_str() );
+                }
+                return 1;
+            }
+            if( !rootIsReadable( resolvedRoot ) )
+            {
+                return 1;   // the refusal is on stderr (rootIsReadable)
+            }
+            if( !cfg.inDir.empty() && !inDirIsUnderRoot( cfg.inDir, resolvedRoot ) )
+            {
+                return 1;   // the refusal is on stderr (inDirIsUnderRoot)
+            }
+        }
+        resolvedRoots.push_back( resolvedRoot );
+    }
+
+    // workspace hygiene: dedupe can collapse a repeated root back to N=1 (proceed single-root, byte-identical);
+    // nested roots are a hard error. `ws` holds ≥2 entries ONLY for a real multi-root run.
+    std::vector<WorkspaceRoot> ws;
+    if( resolvedRoots.size() >= 2 )
+    {
+        if( !buildWorkspaceRoots( resolvedRoots, ws ) )
+        {
+            return 1;
+        }
+        if( ws.size() == 1 ) { resolvedRoots.assign( 1, ws[0].arg );  ws.clear(); }
+    }
+    const bool        multiRoot = ws.size() >= 2;
+    const std::string root( multiRoot ? ws[0].arg : resolvedRoots[0] );   // single-root alias; multi-root sites branch on `ws`
+
+    // M7 (capture-audit 2026-09-04, lens 6 F6/F21) — a file the USER NAMED that cannot be opened is a
+    // REFUSAL, and it is decided HERE, before the crawl, so it costs nothing and cannot be mistaken for a
+    // result. --scip and --cache were the family's two degraders:
+    //   --scip=nosuch.scip  served the NAME-BASED map at exit 0 under a stderr note — i.e. the answer the
+    //                       caller named a precision index to improve on, silently.
+    //   --cache=/nope/x.bin served the map at exit 0 and never wrote the path, so every later run paid a
+    //                       cold parse while the caller believed a cache existed.
+    // Eight siblings (--from-trace --batch --arch --plan-lint --lint-rules --with-profile --edit-plan
+    // --scan-skill) already refused. OWNER DECISION 2026-09-12: for --scip the refusal covers every path that cannot
+    // be read as an index AT ALL — one that does not open, a directory, any other file that is not a regular file (a
+    // FIFO, a device), an empty file — all decided by scipIndexUnreadableReason from one non-blocking open.
+    // Degrade-and-continue stays the contract for inputs the tool DISCOVERED (the default cache path, the default skill
+    // homes) and for a --scip index that has bytes but does not DECODE — that file exists, and scipcheck.sh's
+    // corrupt/fuzz arms depend on the byte-identical degrade.
+    // Gate: namedfileinputcheck.sh (arms A-D, F).
+    if( !cfg.scipIndex.empty() )
+    {
+        const std::string      scipPath( cfg.scipIndex );
+        const std::string_view unreadableReason = scipIndexUnreadableReason( scipPath );
+        if( !unreadableReason.empty() )
+        {
+            rw::emitTo( stderr, "codecortex: --scip={}: {} — refusing rather than serving the name-based map "
+                                  "you named a precision index to improve on (generate one with scip-clang/scip-python, or drop --scip)\n",
+                          scipPath.c_str(), unreadableReason );
+            return 1;
+        }
+    }
+    // M8 (capture-audit 2026-09-04, lens 6 F7/F7b, lens 7 F-SINCE-1) — --since is a GLOBAL flag with four
+    // consumers (--hotspots, --slice, --cochange, --rank-by=churn[-decay]), and the §P0.5c ruling that "a
+    // window nobody chose is not a measurement" had landed on --hotspots only: --cochange and
+    // --rank-by=churn emitted at exit 0 under window="18mo" with a stderr note, which is precisely the
+    // false window that fix exists to prevent. Validated ONCE here, where the flag is global, rather than
+    // in four verb handlers that would drift the way these two already had. Multi-root: a value that
+    // resolves in ANY root is a real revision, so the refusal needs every root to reject it.
+    if( !cfg.since.empty() )
+    {
+        bool sinceResolvesSomewhere = false;
+        bool sinceHasBaseline       = false;   // N4: some root's history reaches the value (SinceScope::baselineSha)
+        bool sinceBaselineRefused   = false;   // some root's git answered that baseline with a non-object-name (SinceScope's sink)
+        if( multiRoot )
+        {
+            for( const WorkspaceRoot& r : ws )
+            {
+                const SinceScope scope = resolveSinceScope( r.arg, cfg.since );
+                sinceResolvesSomewhere = sinceResolvesSomewhere || scope.active;
+                sinceHasBaseline       = sinceHasBaseline || !scope.baselineSha.empty();
+                sinceBaselineRefused   = sinceBaselineRefused || scope.baselineRefused;
+            }
+        }
+        else
+        {
+            const SinceScope scope = resolveSinceScope( root, cfg.since );
+            sinceResolvesSomewhere = scope.active;
+            sinceHasBaseline       = !scope.baselineSha.empty();
+            sinceBaselineRefused   = scope.baselineRefused;
+        }
+        if( !sinceResolvesSomewhere )
+        {
+            rw::emitTo( stderr, "{}\n", sinceUnresolvedRefusal( cfg.since ).c_str() );
+            return 1;
+        }
+        // N4 (capture-audit verify-wave1 2026-09-04): the SECOND half of the one policy. A value that resolves as a
+        // window (a real date the history never reaches: 1999-01-01) is an honest window for the three window hosts
+        // and NO baseline for the host that compares against a commit. Which hosts need a baseline is decided HERE,
+        // beside the shape/range validation, from the shared resolution — never re-derived in a verb handler. The
+        // no-history root is left to --slice's own, more specific refusal (nothing to compare against at all).
+        // N4 (verify-wave2): read off cli.h's kSinceHosts table — the ONE declaration of each host's class —
+        // instead of re-spelling the host list here. That second copy was what let "one policy" mean "one
+        // resolver" rather than "one rule": a sixth consumer could join --since and inherit the window class
+        // by omission, silently, from a condition that never mentioned it.
+        const bool sinceHostNeedsBaseline = activeSinceHostNeedsBaseline( cfg );
+        if( sinceHostNeedsBaseline && !sinceHasBaseline && gitRepoHasHistory( multiRoot ? ws[0].arg : root ) )
+        {
+            rw::emitTo( stderr, "{}\n", sinceNoBaselineRefusal( cfg.since, multiRoot ? ws[0].arg : root, sinceBaselineRefused ).c_str() );
+            return 1;
+        }
+    }
+    if( !cfg.cacheFile.empty() )
+    {
+        namespace fs = std::filesystem;
+        const std::string cachePath( cfg.cacheFile );
+        std::error_code   cacheEc;
+        // The file need not EXIST — a cold first run is the normal case — but the directory that would hold
+        // it must, or the write at the end of the run silently does nothing.
+        const fs::path    cacheDir = fs::path( cachePath ).parent_path();
+        if( cachePathIsDirectory( cachePath ) )
+        {
+            return 1;   // the refusal is on stderr (cachePathIsDirectory)
+        }
+        if( !cacheDir.empty() && !fs::is_directory( cacheDir, cacheEc ) )
+        {
+            rw::emitTo( stderr, "codecortex: --cache={}: the directory '{}' does not exist, so nothing could ever be written there "
+                                  "(the map would be served and the cache silently lost); create it, or pass a path under an existing directory\n",
+                          cachePath.c_str(), cacheDir.string().c_str() );
+            return 1;
+        }
+    }
+
+    // --index-out=BASE (both-families amendment): the CI generate-and-exit path.
+    // Cold-parse the tree TWICE — once lean, once rich — writing BASE.lean.codecortexcache and
+    // BASE.rich.codecortexcache, then exit 0 WITHOUT emitting a map. Both families ship because the flagship
+    // orientation verbs (--for/--exemplar/--metrics/--uses) ingest RICH and a lean-only artifact leaves
+    // them cold (measured: lean 1.46 MB, rich 2.80 MB on this repo). This is sugar over --cache, not a
+    // second write path — it reuses ingest()'s existing saveCache machinery, one ingest per explicit cache
+    // path. force-rebuild: an existing target is removed first so a stale warm file cannot shadow a fresh
+    // generate. --exclude shapes the crawl (fewer files → fewer symbols → smaller blob). The blobs are NOT
+    // byte-identical run-to-run — the v8 header stamps the blob write wall-time (the statgate racy rule) —
+    // so the gated contract is RESTORE-EQUIVALENCE (a --cache restore == a cold parse), not blob-byte-identity.
+    if( !cfg.indexOut.empty() )
+    {
+        const std::string       base( cfg.indexOut );
+        struct Family { const char* suffix; bool rich; };
+        const Family families[2] = { { ".lean.codecortexcache", false }, { ".rich.codecortexcache", true } };
+
+        int rc = 0;
+        for( const Family& fam : families )
+        {
+            const std::string path = base + fam.suffix;
+            rw::os::remove( path.c_str() );                     // force-rebuild: a stale warm file must not shadow the generate
+
+            IngestResult r = ingest( root.c_str(), cfg.excludes, path, cfg.maxFileBytes, fam.rich, {}, !cfg.noIgnore );
+            (void)r;
+
+            std::error_code       ec;
+            const std::uintmax_t  sz = std::filesystem::file_size( std::filesystem::path( path ), ec );
+            if( ec || sz == 0 )
+            {
+                rw::emitTo( stderr, "codecortex: --index-out: failed to write {}\n", path.c_str() );
+                rc = 1;
+            }
+            else
+            {
+                rw::emitTo( stderr, "codecortex: --index-out wrote {} ({} bytes, {} family)\n",
+                              path.c_str(), static_cast<unsigned long long>( sz ), fam.rich ? "rich" : "lean" );
+            }
+        }
+        return rc;
+    }
+
+    // Warm by default: with no explicit --cache and without --no-cache, use a per-root TMPDIR cache so a
+    // repeated invocation (e.g. successive --grep / --around / --for on the same tree) re-parses only what
+    // changed. Verified output-identical to a cold parse (regression: cache transparency).
+    // A4-P4: the verb class (rich=captureValueUses vs lean) is needed BEFORE choosing the auto-cache path
+    // so each class keys its own warm cache file (no cross-class thrash). Rich = --for/--metrics/--uses/--exemplar
+    // /--context-ratio/--nonlocal-state/--quality-panel — the local-reasoning lens counts read/write sites, and
+    // nonlocal-state's attribution is read/write USE SITES by definition, so a lean ingest would hand either a
+    // confident, wrong zero; --quality-panel builds two of its six families out of exactly those two lenses.
+    const bool needsValueUses = rw::needsValueUses( cfg );   // cli.h — ONE definition, and --doctor's
+                                                            // rich_verbs= roster is derived from it
+    IngestResult ing;
+    if( multiRoot )
+    {
+        // Multi-root ingest: ONE existing per-root cache blob per root (the exact
+        // defaultCachePath keying, label-free content), each root crawled + parsed independently in canonical
+        // order, then merged by one id-offset pass. Incrementality is structural: an edit in root2 dirties
+        // ONLY root2's blob — root1's load is a pure warm hit (CODECORTEX_CACHE_STATS proves it per root).
+        std::vector<IngestResult> parts;
+        parts.reserve( ws.size() );
+        for( const WorkspaceRoot& r : ws )
+        {
+            std::string cachePath;
+            if( !cfg.noCache )
+            {
+                cachePath = defaultCachePath( r.arg, needsValueUses );
+            }
+            parts.push_back( ingest( r.arg.c_str(), cfg.excludes, cachePath, cfg.maxFileBytes, needsValueUses,
+                                     /*excludeLabel=*/r.label, /*respectGitignore=*/!cfg.noIgnore ) );
+        }
+        ing = mergeWorkspaceIngests( ws, parts );
+    }
+    else
+    {
+        std::string      autoCache;
+        std::string_view cacheArg = cfg.cacheFile;
+        if( cacheArg.empty() && !cfg.noCache )
+        {
+            autoCache = defaultCachePath( root, needsValueUses );
+            cacheArg  = autoCache;
+        }
+        ing = ingest( root.c_str(), cfg.excludes, cacheArg, cfg.maxFileBytes, needsValueUses,
+                      /*excludeLabel=*/{}, /*respectGitignore=*/!cfg.noIgnore );
+    }
+    if( cfg.ignoreTests )
+    {
+        applyIgnoreTests( ing );
+    }
+
+    // Enhanced help needs only the parsed symbol inventory plus cheap Git facts. Answer before graph/QMetrics/
+    // history mining so a hook or agent asking where to start pays the least repository-aware cost available.
+    if( !cfg.helpTask.empty() )
+    {
+        return runHelpTask( cfg, ing, root );
+    }
+
+    if( std::getenv( "CODECORTEX_STATS" ) )   // how many std::strings the stored model holds (+ their bytes)
+    {
+        std::size_t pathB = 0, nameB = 0, calleeB = 0, incB = 0;
+        for( const auto& f : ing.files )
+        {
+            pathB += f.size();
+        }
+        for( const auto& s : ing.symbols )
+        {
+            nameB += s.name.size();
+        }
+        for( const auto& r : ing.references )
+        {
+            calleeB += r.calleeName.size();
+        }
+        for( const auto& i : ing.includes )
+        {
+            incB += i.target.size();
+        }
+        const std::size_t total  = ing.files.size() + ing.symbols.size() + ing.references.size() + ing.includes.size();
+        const std::size_t bytes  = pathB + nameB + calleeB + incB;
+        rw::emitTo( stderr,
+            "[stats] stored std::strings = {}  ({} bytes of char data)\n"
+            "        files/paths       = {} ({} B)\n"
+            "        symbols/names      = {} ({} B)\n"
+            "        references/callees = {} ({} B)\n"
+            "        includes/targets   = {} ({} B)\n",
+            total, bytes, ing.files.size(), pathB, ing.symbols.size(), nameB, ing.references.size(), calleeB, ing.includes.size(), incB );
+    }
+    // SCIP precision overlay: parse the index (if --scip given) → map to codecortex ids → hand to buildGraph as an optional
+    // parameter. An unreadable/corrupt/mismatched index yields an EMPTY overlay (one DISCLOSE + stderr note) and
+    // the build proceeds name-based, byte-identical to no --scip. A path that cannot be opened, is not a regular file or is
+    // empty never gets here: it was refused above, exit 1. The probe closed its descriptor, though, so scipReadFile opens the
+    // path again itself — O_NONBLOCK, reading a regular file only — and a path replaced since by a FIFO degrades, never hangs.
+    ScipOverlay scipOverlay;
+    if( !cfg.scipIndex.empty() )
+    {
+        scipOverlay = loadScipOverlay( cfg.scipIndex, ing );
+    }
+    // An EMPTY overlay (no --scip, OR an unreadable/corrupt/mismatched index that already alerted) is treated as
+    // no overlay at all: scipPtr stays nullptr so buildGraph/serialize produce output BYTE-IDENTICAL to a
+    // run with no --scip (the degrade contract — a bad index must never change the map, only stderr).
+    const ScipOverlay* scipPtr = scipOverlay.empty() ? nullptr : &scipOverlay;
+
+    // §P4.1 — the grep scan runs ALONGSIDE the graph build; verbs_grep.h's startGrepScanPrefetch owns every
+    // condition and the degrade path, and is handed §B11.4's own dispatch winner rather than a guess.
+    GrepScanPhases    grepPhases;
+    std::thread       grepPhaseWorker = startGrepScanPrefetch( cfg, ing, verbPrec.winner, grepPhases );
+    const Graph       g               = buildGraph( ing, scipPtr, !cfg.pinCensus.empty() );
+    joinGrepScanPrefetch( grepPhaseWorker );
+
+    // --pin-census (src/pincensus.h): written straight after the graph build, BEFORE verb dispatch, so it
+    // reflects the resolver and is produced whichever verb the run serves. The root condition is the map's
+    // own (mapRootArg's), so census ids join to `id=` by string equality. An unopenable path is a LOUD
+    // note, never a silent no-op — an eval that believes it measured something it did not is the worst case.
+    if( !cfg.pinCensus.empty() )
+    {
+        const std::string censusPath( cfg.pinCensus );
+        const bool        oneRoot = ing.realPaths.empty() && cfg.roots.size() == 1;
+        if( !writePinCensus( censusPath.c_str(), g.pinCensus, ing, oneRoot ? cfg.roots[0] : std::string_view() ) )
+        {
+            rw::emitTo( stderr, "codecortex: --pin-census could not write '{}'\n", censusPath.c_str() );
+        }
+    }
+
+    // --metrics: fan-in per symbol from the in-edge CSR (free graph query) — the descriptive
+    // "this is reused N×, prefer reusing it" signal. fan-out + cx come from serialize/Symbol.
+    std::vector<std::uint32_t> fanIn;
+    if( cfg.metrics || !cfg.forTask.empty() || !cfg.exemplar.empty() )
+    {
+        fanIn.assign( ing.symbols.size(), 0 );
+        const auto* ro = g.inEdges.rowOffsets();
+        for( std::size_t i = 0; i < ing.symbols.size(); ++i )
+        {
+            fanIn[i] = ro[i + 1] - ro[i];
+        }
+    }
+    const std::vector<std::uint32_t>* fanInPtr = fanIn.empty() ? nullptr : &fanIn;
+
+    // Q-compute metrics (Q2/Q4/Q5): cbo / tested= / lcom4 / change-amplification — descriptive facts surfaced
+    // on --metrics ONLY (never gates — steering thesis). Computed once here so all serialize call-sites share
+    // it. amp = |direct callers| (symbol-level, in-edge CSR) + |co-change partners of the symbol's FILE|
+    // (file-level, gitmine) — a GRANULARITY MIX documented in the serialize emit comment. amp DEGRADES to
+    // callers-only when git/history is unavailable (co-change term = 0), so a git-less repo still gets amp.
+    QMetrics                          qmetrics;
+    std::vector<std::uint32_t>        amp;
+    const std::vector<std::uint32_t>* cboPtr    = nullptr;
+    const std::vector<std::uint8_t>*  testedPtr = nullptr;
+    const std::vector<std::uint32_t>* lcom4Ptr  = nullptr;
+    const std::vector<std::uint32_t>* ampPtr    = nullptr;
+    // Also computed for --for (Q3) and --exemplar (Q7): the quality lens folds tested=/amp= onto the read-time
+    // bundle, and --exemplar selects best-in-class by tested/fan-in/ccx. cbo/lcom4 are consumed only by
+    // serialize() (the map path, which both verbs return before reaching) — harmless to set.
+    // A4-P6: the --for path used to spawn TWO git popens — an 18-month `gitCommitFileSets` here (for amp) and a
+    // 12-month `gitChurnCounts` in the --for block below (for the quality lens' churn=). Both are now derived
+    // from ONE 18-month `git log --name-only` walk (gitCoChangeAndChurn), bucketed by commit epoch so each
+    // number keeps its own window. forChurn is hoisted here so the --for block can read it without re-mining.
+    std::vector<std::uint32_t> forChurn;
+    if( cfg.metrics || !cfg.forTask.empty() || !cfg.exemplar.empty() )
+    {
+        PROFILE_SCOPE_DESCRIBE( "main: computeQMetrics + change-amplification" );
+        qmetrics = computeQMetrics( ing, g );
+        cboPtr    = &qmetrics.cbo;
+        testedPtr = &qmetrics.tested;
+        lcom4Ptr  = &qmetrics.lcom4;
+
+        // change-amplification: per-FILE co-change partner count (git; one popen over `git log --name-only`),
+        // shared by every symbol in that file, ADDED to that symbol's direct-caller count. No git / no history
+        // → coPartnersPerFile stays 0 (clean degrade to callers-only). The single popen is measured (§ gate f).
+        std::vector<std::uint32_t> coPartnersPerFile( ing.files.size(), 0u );
+        {
+            // ONE popen: 18-month co-change file-sets (for amp) + — only when --for needs it — the 12-month
+            // per-file churn (folded into the same walk, A4-P6). --metrics/--exemplar pass churnMonths=0 → no
+            // churn work, sets byte-identical to the old gitCommitFileSets("18 months ago", 30).
+            // Multi-root (§5): one popen PER root, each resolved only against its own files; the per-commit
+            // sets concatenate (commits are disjoint across repos) and churn accumulates per file.
+            std::vector<std::vector<std::uint32_t>> commits;
+            if( multiRoot )
+            {
+                std::vector<std::uint32_t> rootChurn;
+                for( std::uint32_t r = 0; r < ws.size(); ++r )
+                {
+                    // Y2: the memoized form — skips the 431 ms `git log --name-only` walk on a
+                    // warm (repo, HEAD sha, window, boundary-sha) hit; see quality.h's qchurn family.
+                    std::vector<std::vector<std::uint32_t>> part =
+                        quality::gitCoChangeAndChurnCached( ws[r].arg, ing, "18 months ago", 30,
+                                             cfg.forTask.empty() ? 0u : 12u,
+                                             cfg.forTask.empty() ? nullptr : &rootChurn, r );
+                    for( std::vector<std::uint32_t>& c : part )
+                    {
+                        commits.push_back( std::move( c ) );
+                    }
+                    if( !cfg.forTask.empty() )
+                    {
+                        if( forChurn.size() != ing.files.size() )
+                        {
+                            forChurn.assign( ing.files.size(), 0u );
+                        }
+                        for( std::size_t f = 0; f < forChurn.size() && f < rootChurn.size(); ++f )
+                        {
+                            forChurn[f] += rootChurn[f];
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // Y2: memoized — see the multi-root branch above.
+                commits = quality::gitCoChangeAndChurnCached( root, ing, "18 months ago", 30,
+                                               cfg.forTask.empty() ? 0u : 12u,
+                                               cfg.forTask.empty() ? nullptr : &forChurn );
+            }
+            if( !commits.empty() )
+            {
+                // co-change degree per file = # of OTHER files that share ≥1 commit with it (file-level).
+                std::vector<HashMap<std::uint32_t, char>> partners( ing.files.size() );
+                for( const std::vector<std::uint32_t>& c : commits )
+                {
+                    for( std::size_t i = 0; i < c.size(); ++i )
+                    {
+                        for( std::size_t j = i + 1; j < c.size(); ++j )
+                        {
+                            const std::uint32_t a = c[i], b = c[j];
+                            if( a < ing.files.size() && b < ing.files.size() ) { partners[a][b] = 1; partners[b][a] = 1; }
+                        }
+                    }
+                }
+                for( std::size_t f = 0; f < ing.files.size(); ++f )
+                {
+                    coPartnersPerFile[f] = std::uint32_t( partners[f].size() );
+                }
+            }
+        }
+        amp.assign( ing.symbols.size(), 0u );
+        for( std::size_t i = 0; i < ing.symbols.size(); ++i )
+        {
+            amp[i] = qmetrics.callerCount[i] + coPartnersPerFile[ ing.symbols[i].fileId ];
+        }
+        ampPtr = &amp;
+    }
+
+    // purity fixpoint (only when emitting signatures): impure[] demotes a const method's pure= flag
+    // if it transitively does I/O — so pure="1" means "const AND no transitive side-effects".
+    //
+    // §B6 M3 [BROKEN — and the CLI was the wrong arm]: this gate listed only the two ORIGINAL signature
+    // emitters, but --from-trace and --pack-task grew their own packSignatures call sites (FromTraceInputs
+    // ::impure / PackTaskInputs::impure, both fed from this pointer) without joining it. With impurePtr null
+    // the fixpoint never runs, so those two bundles emitted pure="1" on symbols the fixpoint demotes —
+    // `runMcp`, the stdio loop, being the demonstration: --for correctly omits pure= on it while
+    // --from-trace and --pack-task both claimed it. The MCP twins of both verbs compute computeImpure
+    // themselves and were already right. The gate now names every signature-emitting verb; the condition is
+    // "will something below ask for impurePtr", and a verb that reads d.impurePtr must appear here.
+    std::vector<char>        impure;
+    const std::vector<char>* impurePtr = nullptr;
+    if( !cfg.forTask.empty() || cfg.packSignatures || !cfg.fromTrace.empty() || !cfg.runTrace.empty() || cfg.packTaskFlag )
+    {
+        impure    = computeImpure( ing, g );
+        impurePtr = &impure;
+    }
+
+    // RedactCounts: one per-run secret-redaction tally, shared across every body-emission seam so a single stderr
+    // summary aggregates them. `redactPtr` is null under --no-redact (redaction disabled at every seam) —
+    // then no seam touches the bytes and the output is verbatim. Bodies (CDATA / recalled docs) go through
+    // it; symbol names / signatures in the default map never do (identifiers are not secrets, and the
+    // default map must stay byte-stable — a repo with no secrets produces byte-identical output either way).
+    RedactCounts        redactCounts;
+    RedactCounts* const redactPtr = cfg.noRedact ? nullptr : &redactCounts;
+
+    // L3 field notes: load root/.codecortex_notes ONCE (a small file) into the surfacing index. Single-root only
+    // (a workspace has no single repo root — notes are a per-repo artifact), and nullptr when EMPTY so every
+    // surfacing seam (--for/--expand/MCP) stays byte-identical when there is nothing to show — the inertness
+    // contract. Retrieval handlers below read notesPtr; --note-add/--notes have their own handler.
+    const rw::notes::NoteIndex noteIndex = multiRoot ? rw::notes::NoteIndex{} : rw::notes::loadNoteIndex( root );
+    const rw::notes::NoteIndex* const notesPtr = ( !multiRoot && !noteIndex.empty() ) ? &noteIndex : nullptr;
+    // L3 follow-up (CodeRabbit 4053600616): read BEFORE notesPtr's emptiness nulling, so a sidecar that left
+    // EVERY line unparsed (notes empty, but the read was not clean) still reaches the map/--expand roots —
+    // the exact gap notesPtr's own nullptr would otherwise hide (see MainDispatch::notesDegraded).
+    const bool                        notesDegraded = noteIndex.degraded;
+
+    // Phase B7.2: bundle the shared post-graph state; each verb handler below reads what it needs.
+    const MainDispatch dsp{ cfg, ing, g, root, multiRoot, ws, fanIn, fanInPtr, qmetrics,
+                           ampPtr, cboPtr, testedPtr, lcom4Ptr, impurePtr, forChurn, redactCounts, redactPtr, notesPtr,
+                           notesDegraded, grepPhases.valid ? &grepPhases : nullptr, needsValueUses };
+
+    if( std::optional<int> handled = runForLens( dsp ) )
+    {
+        return *handled;
+    }
+
+    // §A2 (audit 2026-08-08) — the query family dispatches FIRST, as one contiguous block. A typed task
+    // (--for/--pack-task/--query) is the caller's PRIMARY intent; a report verb handed in alongside it is the
+    // incidental one, so the task answers and the report verb is disclosed as ignored by §B11.4's table.
+    // Before this, the family had three different answers to that one question — --for won everything,
+    // --pack-task lost to --skipped/--hotspots but beat --lint, and --query lost to all ~50 — an order nobody
+    // designed and no caller could infer. Intra-family order is X9(c)'s and UNCHANGED: --for (above) >
+    // --pack-task > --query. Deliberate behaviour change; test/dispatchordercheck.sh pins every pair.
+    if( std::optional<int> handled = runPackTask( dsp ) )
+    {
+        return *handled;
+    }
+
+    // --query owns no handler of its own: runDefaultMap serves it (the lexical-rank branch at its top) and is
+    // also this chain's fallback, so hoisting the CALL is what moves --query's precedence. Reaching
+    // runDefaultMap from here is byte-identical to falling through to it — every handler in between takes
+    // `const MainDispatch&` and none mutate it, so skipping them changes which verb answers and nothing else.
+    // Guarded on --query, so a run without it still falls through the whole table exactly as before.
+    if( !cfg.query.empty() )
+    {
+        return runDefaultMap( dsp );
+    }
+
+    if( std::optional<int> handled = runTargetedViews( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runArchViews( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runMaintenanceViews( dsp ) )
+    {
+        return *handled;
+    }
+
+    // §6.3: --quality-baseline/--quality-delta, then --dead-code — the two branches of the old
+    // runQualityViews, in the order that chain evaluated them.
+    if( std::optional<int> handled = runQualityDelta( dsp ) )
+    {
+        return *handled;
+    }
+
+    // --dmm sits immediately after --quality-delta, which is also its precedence: a run that passes both
+    // gets the per-kind report, because that one can gate and this one deliberately cannot.
+    if( std::optional<int> handled = runDmm( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runQualityViews( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runEditCheck( dsp ) )
+    {
+        return *handled;
+    }
+
+    // lane/safe-delete: dispatches right after --edit-check — the same "one already-resolved SYM, one
+    // composed answer" family, outside the pinned nine navigate verbs (test/dispatchordercheck.sh).
+    if( std::optional<int> handled = runSafeDelete( dsp ) )
+    {
+        return *handled;
+    }
+
+    // lane/paper-slice: same family, right after --safe-delete — the row order in scanReportVerbPrecedence
+    // mirrors this seam (test/dispatchordercheck.sh pins pairs by that table).
+    if( std::optional<int> handled = runSlice( dsp ) )
+    {
+        return *handled;
+    }
+
+    // lane/at-seed: the FILE:LINE enclosing-chain report, right after --slice (same location-seeded family).
+    if( std::optional<int> handled = runAt( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runEvalViews( dsp ) )
+    {
+        return *handled;
+    }
+
+    // The nine navigate verbs, in the SAME order the old runNavigateVerbs if-chain evaluated them. The order
+    // is behaviour, not layout: a run passing two of these flags gets exactly one answer, and which one is
+    // decided here. test/dispatchordercheck.sh pins every seam below.
+    if( std::optional<int> handled = runCallHierarchy( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runGraphQuery( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runUses( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runVerify( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runExternalSurface( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runPath( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runConnect( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runImpact( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runMentions( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runAffected( dsp ) )
+    {
+        return *handled;
+    }
+
+    // §P11.2b: the inverse direction of the same map, immediately after it — the two are read together and
+    // neither can shadow the other (one takes --affected=, the other --exercises=).
+    if( std::optional<int> handled = runExercises( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runChangeViews( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runMergeScout( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runPlanLanes( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runCrossRef( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runLayout( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runFieldAffinity( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runDocDrift( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runPlanLint( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runFromTrace( dsp ) )
+    {
+        return *handled;
+    }
+
+    // VT-1: the exec-mode sibling, immediately after --from-trace (the two are read together; a command line
+    // passing both is answered by the file/stdin form, and the X9 slots table discloses the collision).
+    if( std::optional<int> handled = runRunTrace( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runNotes( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runSkipped( dsp ) )
+    {
+        return *handled;
+    }
+
+    // §A2: runPackTask used to sit HERE, between --skipped and --communities. It now dispatches with the rest
+    // of the query family, immediately after runForLens.
+
+    if( std::optional<int> handled = runCommunities( dsp ) )
+    {
+        return *handled;
+    }
+
+    // §P11.6: the drill-down for the ids runCommunities/runZoom print, immediately after its parent.
+    if( std::optional<int> handled = runCommunityDrill( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runZoom( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runStructureText( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runGrep( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runLint( dsp ) )
+    {
+        return *handled;
+    }
+
+    if( std::optional<int> handled = runAround( dsp ) )
+    {
+        return *handled;
+    }
+
+    return runDefaultMap( dsp );
+}
