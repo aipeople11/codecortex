@@ -4,8 +4,8 @@ name: Release
 # PGO training, determinism diff and smoke test under Rosetta 2, and it left the matrix after 0.6.1.
 # scripts/install.sh tells an Intel Mac so, and test/releaseinstallcheck.sh (H7) refuses a macOS x64 leg here.
 #
-# Builds codecortex for macOS arm64 + Linux x64/arm64 on every `vX.Y.Z` tag push and attaches the three
-# binaries to a GitHub Release. UNTESTED UNTIL THE FIRST REAL TAG PUSH:
+# Builds codecortex for macOS arm64 + Linux x64/arm64 (tarballs) and Windows x64 (zip, job build-windows) on every
+# `vX.Y.Z` tag push and attaches the four assets to a GitHub Release. UNTESTED UNTIL THE FIRST REAL TAG PUSH:
 # this file is statically valid (see test/portablebuildcheck.sh's sibling validation note and the workflow
 # README pointer below) but has never actually run — GitHub Actions itself cannot be executed from this
 # dev environment. Review the FIRST run's logs closely before trusting `scripts/install.sh` against it.
@@ -141,7 +141,7 @@ jobs:
       - name: Build (profile-guided — instrument, train, merge, optimize)
         if: ${{ matrix.pgo }}
         run: |
-          scripts/pgobuild.sh --cmake-extra -DCMAKE_BUILD_TYPE=Release
+          bash scripts/pgobuild.sh --cmake-extra -DCMAKE_BUILD_TYPE=Release
           mkdir -p build
           cp build_pgo/codecortex build/codecortex
 
@@ -206,6 +206,10 @@ jobs:
           # ../hooks. Package both the shared nudge and the Codex output adapter; omitting this subtree
           # leaves every prebuilt user's advertised --hook command pointing at a nonexistent file.
           cp -R hooks "dist/${asset}/hooks"
+          # The dashboard. Before this line no release asset carried ui/, so every prebuilt install served
+          # "UI asset unavailable" (src/ui/server.cpp looks for <prefix>/share/codecortex/ui); scripts/install.sh
+          # stages this subtree there.
+          cp -R ui "dist/${asset}/ui"
           mkdir -p "dist/${asset}/scripts"
           cp scripts/onboard-codex.sh "dist/${asset}/scripts/onboard-codex.sh"
           chmod +x "dist/${asset}/scripts/onboard-codex.sh"
@@ -221,12 +225,131 @@ jobs:
           fi
           echo "asset=${asset}" >> "$GITHUB_OUTPUT"
 
+      # One-click Claude Desktop extension for Mac (Claude desktop ships for macOS and Windows only, so the Linux
+      # legs build none). Same builder as the Windows job.
+      - name: Claude Desktop extension (.mcpb, macOS)
+        if: runner.os == 'macOS'
+        run: |
+          python3 -m pip install --quiet --break-system-packages jsonschema 2>/dev/null || python3 -m pip install --quiet jsonschema
+          asset="${{ steps.package.outputs.asset }}"
+          version="$( ./build/codecortex --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 )"
+          python3 scripts/build_mcpb.py --binary build/codecortex --ui ui --skills skills --hooks hooks \
+            --version "$version" --platform darwin --out "dist/${asset}.mcpb"
+          ( cd dist && shasum -a 256 "${asset}.mcpb" > "${asset}.mcpb.sha256" )
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.asset }}
           path: |
             dist/${{ steps.package.outputs.asset }}.tar.gz
             dist/${{ steps.package.outputs.asset }}.tar.gz.sha256
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'macOS'
+        with:
+          name: ${{ steps.package.outputs.asset }}-mcpb
+          path: |
+            dist/${{ steps.package.outputs.asset }}.mcpb
+            dist/${{ steps.package.outputs.asset }}.mcpb.sha256
+          if-no-files-found: error
+
+  # ─── windows-x64: the first prebuilt Windows download ──────────────────────────────────────────────────
+  # Non-technical users cannot compile C++23, and before this job no Windows asset existed at all, so "install
+  # CodeCortex" on Windows meant WSL + cmake. Mirrors ci.yml's `windows` job (clang-cl, Ninja, vcvars64 in ONE cmd
+  # step) — the same toolchain CI already proves builds — but in the Release flavour for the shipped binary.
+  # CODECORTEX_LTO=OFF on purpose: Release turns LTO on by default, and clang-cl + lld-link LTO has never been
+  # exercised by any CI leg; the first Windows release ships the configuration CI has actually built. Turning LTO
+  # on here is a follow-up once a CI leg proves it.
+  #
+  # The zip is laid out as an installed PREFIX (bin/ + share/codecortex/), not a flat folder: src/ui/server.cpp
+  # resolves the dashboard at <exe>/../share/codecortex/ui, so a user can unzip anywhere and the dashboard works
+  # with no install step and no CODECORTEX_UI_ASSETS variable.
+  build-windows:
+    name: build (windows-x64)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configure and build (clang-cl, Ninja, Release, LTO off)
+        shell: cmd
+        run: |
+          @echo on
+          for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSINSTALL=%%i"
+          if not defined VSINSTALL ( echo release: no Visual Studio install with the x64 C++ tools & exit /b 1 )
+          call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          set "RW_LLVM=%VSINSTALL%\VC\Tools\Llvm\x64\bin"
+          if exist "C:\Program Files\LLVM\bin\clang-cl.exe" set "RW_LLVM=C:\Program Files\LLVM\bin"
+          set "PATH=%RW_LLVM%;%PATH%"
+          cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Release -DCODECORTEX_LTO=OFF || exit /b 1
+          cmake --build build -j --target codecortex || exit /b 1
+
+      # Same shape checks ci.yml's windows job uses: real version string, real crawl, deterministic, well-formed,
+      # and NOT an empty crawl (the failure class a Windows path bug produces).
+      - name: Smoke-test the freshly built binary
+        run: |
+          ./build/codecortex.exe --version | tee version.txt
+          grep -qE '^codecortex [0-9]+\.[0-9]+\.[0-9]+ \(' version.txt
+          ./build/codecortex.exe test/fixture --no-cache > a.xml
+          ./build/codecortex.exe test/fixture --no-cache > b.xml
+          cmp a.xml b.xml
+          python -c "import xml.etree.ElementTree as E,sys; E.parse(sys.argv[1])" a.xml
+          files="$( grep -o '<f ' a.xml | wc -l )"
+          test "$files" -ge 7 || { echo "release: windows fixture crawl indexed $files file(s), expected >= 7" >&2; exit 1; }
+
+      - name: Package (zip, installed-prefix layout)
+        id: package
+        run: |
+          releaseTag="${{ inputs.tag || github.ref_name }}"
+          version="$( ./build/codecortex.exe --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 )"
+          if [ "v${version}" != "$releaseTag" ]; then
+            echo "release: binary version v${version} does not match release tag ${releaseTag}" >&2
+            exit 1
+          fi
+          asset="codecortex-${version}-windows-x64"
+          root="dist/${asset}"
+          mkdir -p "$root/bin" "$root/share/codecortex/skills"
+          cp build/codecortex.exe "$root/bin/codecortex.exe"
+          cp README.md "$root/"; cp LICENSE "$root/" 2>/dev/null || true
+          cp -R ui "$root/share/codecortex/ui"
+          cp -R skills/codecortex-* "$root/share/codecortex/skills/"
+          cp -R hooks "$root/share/codecortex/hooks"
+          # The dashboard must resolve from the unzipped layout exactly as server.cpp looks for it.
+          test -f "$root/share/codecortex/ui/index.html"
+          ( cd dist && 7z a -tzip "${asset}.zip" "${asset}" >/dev/null )
+          ( cd dist && sha256sum "${asset}.zip" > "${asset}.zip.sha256" )
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      # One-click Claude Desktop extension: the file a non-technical user double-clicks. Claude's install dialog
+      # asks for their project folder; no PATH, no JSON. See scripts/build_mcpb.py and packaging/mcpb/.
+      - name: Claude Desktop extension (.mcpb)
+        run: |
+          python -m pip install --quiet jsonschema
+          asset="${{ steps.package.outputs.asset }}"; root="dist/${asset}"
+          version="${asset#codecortex-}"; version="${version%-windows-x64}"
+          python scripts/build_mcpb.py --binary "$root/bin/codecortex.exe" --ui "$root/share/codecortex/ui" \
+            --skills "$root/share/codecortex/skills" --hooks "$root/share/codecortex/hooks" \
+            --version "$version" --platform win32 --out "dist/${asset}.mcpb" --manifest-out "$root"
+          ( cd dist && sha256sum "${asset}.mcpb" > "${asset}.mcpb.sha256" )
+          # The unzipped release folder is now ALSO an unpacked extension (manifest.json at its root, same
+          # bin/ + share/ layout as the .mcpb): Claude → Settings → Extensions → Install unpacked extension.
+          rm -f "dist/${asset}.zip" "dist/${asset}.zip.sha256"
+          ( cd dist && 7z a -tzip "${asset}.zip" "${asset}" >/dev/null )
+          ( cd dist && sha256sum "${asset}.zip" > "${asset}.zip.sha256" )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.asset }}
+          path: |
+            dist/${{ steps.package.outputs.asset }}.zip
+            dist/${{ steps.package.outputs.asset }}.zip.sha256
+            dist/${{ steps.package.outputs.asset }}.mcpb
+            dist/${{ steps.package.outputs.asset }}.mcpb.sha256
           if-no-files-found: error
 
   smoke-rhel:
@@ -265,7 +388,7 @@ jobs:
 
   publish:
     name: publish GitHub Release
-    needs: [build, smoke-rhel]
+    needs: [build, build-windows, smoke-rhel]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -305,4 +428,8 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
+            dist/*.zip
+            dist/*.zip.sha256
+            dist/*.mcpb
+            dist/*.mcpb.sha256
           generate_release_notes: true

@@ -13,8 +13,10 @@
     <div class="context-bar"><label>Project <select id="projectContext" class="context-select"></select></label><span id="repoContext" class="context-meta">repository —</span><span id="sessionContext" class="context-meta">session —</span><div id="health" class="pill">checking…</div></div>
   </header>
   <nav id="nav">
+    <button data-view="start">Get started</button>
     <button data-view="overview" class="active">Overview</button>
     <button data-view="how-it-works">How it works</button>
+    <button data-view="usage">Tokens &amp; cost</button>
     <button data-view="graph">Graph</button>
     <button data-view="sessions">Sessions</button>
     <button data-view="memories">Memories</button>
@@ -29,6 +31,14 @@
     <button data-view="health">Health</button>
   </nav>
   <main>
+    <section id="start" class="view">
+      <div class="section-head"><div><div class="eyebrow">GET STARTED</div><h2>Is CodeCortex set up? Check the list below.</h2></div><span class="truth-label">Updates live</span></div>
+      <div class="split">
+        <article class="panel"><h2>Setup checklist</h2><div id="startChecklist"></div></article>
+        <article class="panel"><h2>Try asking your AI</h2><p class="muted">CodeCortex works in the background. Ask normally; these prompts make your AI use it.</p><div id="startTry"></div></article>
+      </div>
+    </section>
+
     <section id="overview" class="view active">
       <div class="hero"><div><div class="eyebrow">CURRENT RUN</div><h1 id="runId">No run telemetry yet</h1></div><button id="refresh">Refresh</button></div>
       <div class="grid metrics">
@@ -144,6 +154,17 @@
       </article>
     </section>
 
+    <section id="usage" class="view">
+      <div class="section-head"><div><div class="eyebrow">TOKENS &amp; COST</div><h2>What each prompt cost, and what CodeCortex saved</h2></div><span class="truth-label">Host-reported counts · list-price estimates · CodeCortex figures are estimates</span></div>
+      <div id="usageCards" class="grid metrics"></div>
+      <div id="usageNote"></div>
+      <article class="panel"><div class="section-head"><div><div class="eyebrow">PER PROMPT</div><h2>Token usage by prompt</h2></div></div><div id="usagePrompts" class="usage-scroll"></div></article>
+      <div class="split">
+        <article class="panel"><div class="section-head"><div><div class="eyebrow">CODECORTEX</div><h2>Answers sent to the agent</h2></div></div><div id="usageAnswers" class="usage-scroll"></div></article>
+        <article class="panel"><div class="section-head"><div><div class="eyebrow">REDUCE USAGE</div><h2>Waste alerts</h2></div></div><div id="usageAlerts"></div></article>
+      </div>
+    </section>
+
     <section id="graph" class="view graph-view">
       <div class="graph-header"><div><div class="eyebrow">DEVELOPER KNOWLEDGE GRAPH</div><h2>See what the agent did, what the code means, and what changed</h2><small id="graphContext" class="muted">project context loading…</small></div><div class="graph-legend-inline"><span><i class="legend-run"></i>run</span><span><i class="legend-symbol"></i>symbol</span><span><i class="legend-file"></i>file</span><span><i class="legend-test"></i>test</span><span><i class="legend-memory"></i>memory</span><span><i class="legend-error"></i>error</span></div></div>
       <div class="graph-shell"><div class="graph-canvas-wrap" id="graph-canvas-wrap"><canvas id="graph-canvas"></canvas><div class="graph-tooltip" id="graph-tooltip"></div><div class="graph-controls"><button onclick="CodeCortexGraph.zoom(1)" title="Zoom in">+</button><button onclick="CodeCortexGraph.zoom(-1)" title="Zoom out">−</button><button onclick="CodeCortexGraph.recenter()" title="Recenter">⌖</button></div></div><aside class="graph-sidebar" id="graph-sidebar"><div class="empty">Waiting for graph data…</div></aside></div>
@@ -162,6 +183,8 @@
     <section id="health" class="view"><div class="health-grid"><article class="panel"><div class="section-head"><div><div class="eyebrow">SERVICE STATUS</div><h2>CodeCortex health</h2></div></div><div id="healthCards" class="status-grid"></div></article><article class="panel"><div class="section-head"><div><div class="eyebrow">END-TO-END</div><h2>Runtime wiring</h2></div></div><div id="wiringFlow" class="wiring-flow"></div></article><article class="panel health-raw"><h2>Raw health</h2><pre id="healthJson"></pre></article></div></section>
   </main>
   <script src="/graph.js"></script>
+  <script src="/tokens.js"></script>
+  <script src="/start.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

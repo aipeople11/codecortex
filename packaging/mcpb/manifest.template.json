@@ -1,0 +1,71 @@
+{
+  "manifest_version": "0.3",
+  "name": "codecortex",
+  "display_name": "CodeCortex",
+  "version": "0.0.0",
+  "description": "Helps Claude understand your whole codebase: find the right code, see what a change affects, pick the tests to run, and show what it did.",
+  "long_description": "CodeCortex runs locally on your computer and gives Claude a map of your code project.\n\n- **Find the right code fast** instead of reading hundreds of files\n- **See the blast radius** of a change before it is made\n- **Know which tests to run** for a change\n- **See what Claude did** in a local dashboard at http://127.0.0.1:7331\n\nNothing leaves your machine. After installing, ask Claude: *Show CodeCortex status*.\n\nCreated by Saurabh Verma. Windows build, Claude extension, token & cost tracking and multi-project support contributed by Hafeez Izaz.",
+  "author": {
+    "name": "Saurabh Verma"
+  },
+  "icon": "icon.png",
+  "license": "MIT",
+  "keywords": [
+    "code",
+    "repository",
+    "impact analysis",
+    "tests",
+    "developer tools"
+  ],
+  "server": {
+    "type": "binary",
+    "entry_point": "bin/codecortex",
+    "mcp_config": {
+      "command": "${__dirname}/bin/codecortex",
+      "args": [
+        "${user_config.project_folder}",
+        "--mcp",
+        "--mcp-ui"
+      ],
+      "env": {}
+    }
+  },
+  "user_config": {
+    "project_folder": {
+      "type": "directory",
+      "title": "Your code project folder(s)",
+      "description": "The folder(s) holding the code you want Claude to work on. Add up to 16; CodeCortex combines them into one workspace, so Claude can search and follow calls across all of them. Folders must not be inside each other. You can change this later in Claude's extension settings.",
+      "required": true,
+      "multiple": true
+    }
+  },
+  "tools": [
+    {
+      "name": "codecortex_status",
+      "description": "Shows which project CodeCortex is looking at and where the dashboard is"
+    },
+    {
+      "name": "explore",
+      "description": "Finds the files and functions relevant to a task"
+    },
+    {
+      "name": "find_symbol",
+      "description": "Locates a function, class or variable in the project"
+    },
+    {
+      "name": "impact",
+      "description": "Shows what else in the project a change would affect"
+    },
+    {
+      "name": "tests_required",
+      "description": "Lists the tests that should run for a change"
+    }
+  ],
+  "tools_generated": true,
+  "compatibility": {
+    "platforms": [
+      "win32",
+      "darwin"
+    ]
+  }
+}

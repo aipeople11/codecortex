@@ -4192,6 +4192,7 @@ static int dispatchMain( const rw::Config& cfg, char** argv )
         uc.port = cfg.uiPort;
         uc.executable = argv[0] ? std::string( argv[0] ) : std::string();
         uc.version = kCodeCortexVersion;
+        if( cfg.roots.size() >= 2 ) for( std::string_view r : cfg.roots ) uc.workspaceRoots.emplace_back( r );
         uc.telemetryPath = cfg.telemetryFile.empty()
                          ? rw::codecortex_mcp::telemetryPathFor( uc.root )
                          : std::string( cfg.telemetryFile );

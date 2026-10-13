@@ -29,7 +29,7 @@
     CALLS:'#64748B', IMPORTS:'#94A3B8', REFERENCES:'#94A3B8', CONTAINS:'#7C3AED', CYCLE:'#CC0000', CHANGED_BY:'#C2410C',
     TESTED_BY:'#B8860B', FAILED_AT:'#CC0000', INSPECTED_BY:'#2563EB', ATTEMPTED_BY:'#6B3FA0',
     REJECTED_BECAUSE:'#CC0000', FIXED_BY:'#2D6A4F', VERIFIED_BY:'#2D6A4F', REMEMBERED_AS:'#0E7490',
-    RECALLED:'#0891B2', CALLED:'#2563EB', RUNS_MODEL:'#4F46E5', RETRIED:'#B45309'
+    RECALLED:'#0891B2', CALLED:'#2563EB', RUNS_MODEL:'#4F46E5', RETRIED:'#B45309', RETRIED_AS:'#B45309'
   };
 
   const sim = {
@@ -67,6 +67,10 @@
       if(e.type==='tool_call')toolCounts.set(key,(toolCounts.get(key)||0)+1);
     });
     const modelSeen=new Set();
+    // Retry chain: tool_call events carry tool_call_id, and a retry also carries retry_of_tool_call_id +
+    // attempt_number. Node ids are per-event (idx-based), so look the earlier attempt up by its call id —
+    // never by idx — and link its failure node to the retry.
+    const attemptNodes=new Map();
     latest.forEach((e,idx)=>{
       const runId=e.run_id || 'unknown';
       const source=e.source||'observed';
@@ -79,9 +83,16 @@
       if(e.type==='tool_call'){
         const tid='tool:'+runId+':'+idx;
         const repeat=(toolCounts.get(String(e.target||'').trim())||0)>1?' · repeated tool':'', detail=(e.detail||'')+repeat;
-        const t=node(tid,'tool_call',e.target||'tool call',detail,source);
+        const attempt=Number(e.attempt_number)||0;
+        const t=node(tid,'tool_call',(e.target||'tool call')+(attempt>1?' (attempt '+attempt+')':''),detail,source);
         edge(run.id,t.id,'CALLED',e.duration_ms!=null?String(e.duration_ms)+' ms':'',source);
-        if(e.success===false){const fid='failure:'+runId+':'+idx;const f=node(fid,'runtime_error','Failed: '+short(e.target||'tool',30),e.detail||'host-reported failure',source);edge(t.id,f.id,'REJECTED_BECAUSE','tool failed',source);}
+        let fid='';
+        if(e.success===false){fid='failure:'+runId+':'+idx;const f=node(fid,'runtime_error',(attempt>1?'Failed (attempt '+attempt+'): ':'Failed: ')+short(e.target||'tool',attempt>1?24:30),e.detail||'host-reported failure',source);edge(t.id,f.id,'REJECTED_BECAUSE','tool failed',source);}
+        if(e.retry_of_tool_call_id){
+          const prior=attemptNodes.get(runId+'|'+e.retry_of_tool_call_id);
+          if(prior)edge(prior.failure||prior.tool,t.id,'RETRIED_AS','attempt '+(attempt||'?'),source);
+        }
+        if(e.tool_call_id)attemptNodes.set(runId+'|'+e.tool_call_id,{tool:t.id,failure:fid});
         return;
       }
       if(e.type==='file_read'){
@@ -319,6 +330,7 @@
     if(n.meta?.author)detail+='<dt>Author</dt><dd>'+esc(n.meta.author)+'</dd>';
     if(n.meta?.subject)detail+='<dt>Commit</dt><dd>'+esc(n.meta.subject)+'</dd>';
     if(n.meta?.run)detail+='<dt>Run</dt><dd>'+esc(n.meta.run)+'</dd>';
+    if(n.meta?.truncated)detail+='<dt>⚠ Partial</dt><dd>'+esc(n.meta.truncated)+'</dd>';
     detail+='</dl>';
     return '<div class="selected-node"><h3>Selected node</h3><strong>'+esc(n.label)+'</strong><span class="node-badge" style="border-color:'+colorFor(n.type)+';color:'+colorFor(n.type)+'">'+esc(n.type.replaceAll('_',' '))+'</span>'+detail+expand+'</div>';
   }
@@ -331,7 +343,14 @@
   function mergeStaticGraph(payload,symbol){
     if(!payload||payload.ok!==true)return;
     const rootId='symbol:root:'+symbol;
-    sim.staticNodes.set(rootId,{id:rootId,type:'symbol',label:symbol,evidence:'CodeCortex static graph + tests + git',meta:{file:payload.file||''},source:'structural',x:0,y:0,vx:0,vy:0,r:13});
+    // callers_truncation/callees_truncation (when present) tell us the backend's underlying
+    // --callers=/--callees= page was capped — i.e. this node's edges below are a PAGE, not
+    // necessarily every caller/callee that exists. Carried on the root node's meta so the
+    // detail panel (selectedHtml) can disclose it instead of the graph silently looking complete.
+    const truncParts=[];
+    if(payload.callers_truncation?.capped)truncParts.push('callers: '+(payload.callers_truncation.shown??'?')+' of '+(payload.callers_truncation.total??'?')+' shown');
+    if(payload.callees_truncation?.capped)truncParts.push('callees: '+(payload.callees_truncation.shown??'?')+' of '+(payload.callees_truncation.total??'?')+' shown');
+    sim.staticNodes.set(rootId,{id:rootId,type:'symbol',label:symbol,evidence:'CodeCortex static graph + tests + git',meta:{file:payload.file||'',truncated:truncParts.join(' · ')},source:'structural',x:0,y:0,vx:0,vy:0,r:13});
     const addRows=(obj,key,direction)=>{
       const rows=(obj&&Array.isArray(obj[key]))?obj[key]:[];
       rows.forEach(row=>{

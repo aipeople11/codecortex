@@ -130,6 +130,16 @@ std::string serialize( const Event& event )
     if( event.inputTokens >= 0 ) out += ",\"input_tokens\":" + std::to_string( event.inputTokens );
     if( event.outputTokens >= 0 ) out += ",\"output_tokens\":" + std::to_string( event.outputTokens );
     if( event.numericValue >= 0 ) out += ",\"value\":" + std::to_string( event.numericValue );
+    if( event.cacheReadTokens >= 0 ) out += ",\"cache_read_tokens\":" + std::to_string( event.cacheReadTokens );
+    if( event.cacheWrite5mTokens >= 0 ) out += ",\"cache_write_5m_tokens\":" + std::to_string( event.cacheWrite5mTokens );
+    if( event.cacheWrite1hTokens >= 0 ) out += ",\"cache_write_1h_tokens\":" + std::to_string( event.cacheWrite1hTokens );
+    if( event.requestCount >= 0 ) out += ",\"requests\":" + std::to_string( event.requestCount );
+    if( event.responseBytes >= 0 ) out += ",\"response_bytes\":" + std::to_string( event.responseBytes );
+    if( event.estTokens >= 0 ) out += ",\"est_tokens\":" + std::to_string( event.estTokens );
+    if( event.avoidedTokensEst >= 0 ) out += ",\"avoided_tokens_est\":" + std::to_string( event.avoidedTokensEst );
+    if( event.coveredFiles >= 0 ) out += ",\"covered_files\":" + std::to_string( event.coveredFiles );
+    if( event.attemptNumber > 0 ) out += ",\"attempt_number\":" + std::to_string( event.attemptNumber );
+    if( !event.retryOfToolCallId.empty() ) { out += ",\"retry_of_tool_call_id\":"; out += jsonString( event.retryOfToolCallId ); }
     out += "}\n";
     return out;
 }

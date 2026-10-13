@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.0] — 2026-10-13
+
+- **Windows:** first prebuilt Windows download (zip) and Windows build fixes (Winsock include order, dashboard
+  server and safe commands on the os:: layer).
+- **One-click Claude Desktop extension** (`.mcpb`) for Windows and macOS — double-click, choose your project folder.
+- **Tokens & cost:** exact per-prompt token usage from Claude Code (input, output, cache), estimated cost at
+  Anthropic list prices (`ui/pricing.json`, overridable), and CodeCortex's own share of every conversation.
+- **Less token waste:** identical repeated answers are not resent, smaller default answer budgets, savings
+  estimates and waste alerts (re-reads, repeated searches, retry loops).
+- **Dashboard:** new "Get started" checklist and "Tokens & cost" pages; retry chains drawn in the graph.
+- **Fixes:** dashboard files now ship in every download; callers/callees truncation is disclosed.
+
 ## Local-First Release Candidate — 2026-09-26
 
 - Froze the default deployment as single-user, local-workspace CodeCortex with stdio MCP.

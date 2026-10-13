@@ -341,6 +341,14 @@ shareDir="$prefix/share/codecortex"
 skillsShareDir="$shareDir/skills"
 hooksShareDir="$shareDir/hooks"
 scriptsShareDir="$shareDir/scripts"
+# The dashboard (src/ui/server.cpp resolves <prefix>/share/codecortex/ui beside the binary). Older release
+# tarballs did not carry ui/, which left the dashboard serving "UI asset unavailable"; stage it when present.
+if [ -d "$extractedDir/ui" ]; then
+    rm -rf "$shareDir/ui"
+    mkdir -p "$shareDir"
+    cp -R "$extractedDir/ui" "$shareDir/ui"
+    echo "install.sh: staged the dashboard at $shareDir/ui"
+fi
 if [ -d "$extractedDir/skills" ]; then
     rm -rf "$skillsShareDir"
     mkdir -p "$( dirname "$skillsShareDir" )"

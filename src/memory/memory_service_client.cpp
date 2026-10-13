@@ -1,5 +1,24 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Saurabh Verma
+
+// Windows: <winsock2.h> MUST come before any project header. memory_service_client.h reaches src/infra/os.h,
+// whose Winsock shims (#define IPPROTO_TCP 6, #define htons(x) ...) are written for TUs that never include the
+// SDK and are guarded to defer to it ONLY when the SDK was included first (os.h's own contract: "os_win32.cpp
+// includes it BEFORE this header"). Included after, those shims rewrite the SDK's enum and function
+// declarations and the TU fails to compile (first Windows release build, 2026-10-12). NOMINMAX keeps
+// <minwindef.h>'s max() macro from breaking std::max below; WIN32_LEAN_AND_MEAN keeps <windows.h> from
+// dragging in the old <winsock.h>.
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
+
 #include "memory_service_client.h"
 
 #include "infra/jsonesc.h"
@@ -13,10 +32,7 @@
 #include <string>
 #include <string_view>
 
-#if defined(_WIN32)
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#else
+#if !defined(_WIN32)
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>

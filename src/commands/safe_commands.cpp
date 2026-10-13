@@ -8,11 +8,19 @@
 #include <cctype>
 #include <csignal>
 #include <cstring>
+#if defined(_WIN32)
+// Windows has no fork/exec/poll.h. The Windows execute() below runs on the project's os:: process layer
+// (src/infra/os.h: spawn_sh = Git for Windows bash in a Job Object, pipe/poll/read/waitpid/kill), the same
+// primitives verbs_change.h's runCommandCapture uses on every platform.
+#include "infra/os.h"
+#include <cerrno>
+#else
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 namespace rw::commands
 {
@@ -31,6 +39,7 @@ void appendTargetFlag( std::vector<std::string>& argv, std::string_view flag, st
     argv.push_back( std::move( arg ) );
 }
 
+#if !defined(_WIN32)
 void drain( int fd, std::string& out, std::size_t cap )
 {
     std::array<char, 8192> buf{};
@@ -46,6 +55,7 @@ void drain( int fd, std::string& out, std::size_t cap )
         break;
     }
 }
+#endif
 }
 
 Plan buildSafePlan( std::string_view executable, std::string_view root,
@@ -118,6 +128,83 @@ Plan buildGitHistoryPlan( std::string_view root, std::string_view file, int limi
     return plan;
 }
 
+#if defined(_WIN32)
+namespace
+{
+// POSIX-shell single-quote quoting: the Windows spawn layer runs `bash -c <command>`.
+std::string shellQuote( std::string_view arg )
+{
+    std::string out = "'";
+    for( const char c : arg ) { if( c == '\'' ) out += "'\\''"; else out.push_back( c ); }
+    out.push_back( '\'' );
+    return out;
+}
+}
+
+Execution execute( const Plan& plan, int timeoutMs, std::size_t outputCap )
+{
+    Execution result;
+    if( !plan.ok || plan.argv.empty() ) { result.error = plan.error.empty() ? "invalid command plan" : plan.error; return result; }
+    std::string cmd;
+    for( const auto& a : plan.argv ) { if( !cmd.empty() ) cmd.push_back( ' ' ); cmd += shellQuote( a ); }
+
+    int fds[2];
+    if( rw::os::pipe( fds ) != 0 ) { result.error = "pipe() failed"; return result; }
+    const rw::os::pid_t pid = rw::os::spawn_sh( cmd, fds );
+    if( pid < 0 )
+    {
+        rw::os::close( fds[0] ); rw::os::close( fds[1] );
+        result.error = "could not start the command (Git for Windows bash is required)";
+        return result;
+    }
+    rw::os::close( fds[1] );
+
+    // stdout and stderr arrive interleaved on one pipe on Windows; both land in stdoutText.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds( std::max( 1, timeoutMs ) );
+    char buf[8192];
+    for( ;; )
+    {
+        if( std::chrono::steady_clock::now() >= deadline )
+        {
+            result.timedOut = true;
+            rw::os::kill( -pid, SIGKILL );
+            rw::os::kill( pid, SIGKILL );
+            break;
+        }
+        rw::os::pollfd pfd{ fds[0], POLLIN, 0 };
+        const int ready = rw::os::poll( &pfd, 1, 25 );
+        if( ready > 0 )
+        {
+            const rw::os::ssize_t n = rw::os::read( fds[0], buf, sizeof buf );
+            if( n <= 0 ) break;   // EOF: the command closed its output
+            if( result.stdoutText.size() < outputCap )
+                result.stdoutText.append( buf, std::min<std::size_t>( std::size_t( n ), outputCap - result.stdoutText.size() ) );
+        }
+        else if( ready < 0 && errno != EINTR ) break;
+    }
+    rw::os::close( fds[0] );
+
+    int status = 0;
+    for( ;; )
+    {
+        const rw::os::pid_t done = rw::os::waitpid( pid, &status, result.timedOut ? 0 : WNOHANG );
+        if( done == pid || done < 0 ) break;
+        if( std::chrono::steady_clock::now() >= deadline )
+        {
+            result.timedOut = true;
+            rw::os::kill( -pid, SIGKILL );
+            rw::os::kill( pid, SIGKILL );
+            continue;
+        }
+        rw::os::poll( nullptr, 0, 20 );
+    }
+    if( WIFEXITED( status ) ) result.exitCode = WEXITSTATUS( status );
+    else if( WIFSIGNALED( status ) ) result.exitCode = 128 + WTERMSIG( status );
+    result.ok = !result.timedOut && result.exitCode == 0;
+    if( result.timedOut ) result.error = "safe command timed out";
+    return result;
+}
+#else
 Execution execute( const Plan& plan, int timeoutMs, std::size_t outputCap )
 {
     Execution result;
@@ -184,5 +271,6 @@ Execution execute( const Plan& plan, int timeoutMs, std::size_t outputCap )
     if( result.timedOut ) result.error = "safe command timed out";
     return result;
 }
+#endif
 
 } // namespace rw::commands

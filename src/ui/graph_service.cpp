@@ -147,6 +147,58 @@ std::string commandPayload( std::string_view raw )
 {
     return jsonString( raw );
 }
+
+// Reads a bare top-level JSON scalar field, e.g. "shown":40 or "capped":true, out of the
+// already-trimmed { ... } object `--callers=`/`--callees= --json` emit. Not a general JSON
+// parser: it only needs to pull four known, always-top-level, always-scalar fields
+// (capped/shown/total/has_more) back out of runJsonCommand's untouched passthrough so the
+// dashboard can disclose a paginated/truncated caller or callee list instead of silently
+// showing fewer rows than the CLI itself reports exist. Returns "" when the field is absent,
+// matching attr()'s own not-found convention.
+std::string jsonScalar( std::string_view obj, std::string_view name )
+{
+    const std::string needle = std::string( "\"" ) + std::string( name ) + "\":";
+    const auto p = obj.find( needle );
+    if( p == std::string_view::npos ) return {};
+    auto start = p + needle.size();
+    auto end = start;
+    while( end < obj.size() && obj[end] != ',' && obj[end] != '}' ) ++end;
+    // Trim any stray whitespace defensively; the emitter doesn't pad, but nothing guarantees
+    // that forever, and a bare substring copy costs nothing extra here.
+    while( start < end && ( obj[start] == ' ' || obj[start] == '\t' ) ) ++start;
+    while( end > start && ( obj[end - 1] == ' ' || obj[end - 1] == '\t' ) ) --end;
+    return std::string( obj.substr( start, end - start ) );
+}
+
+// Builds the disclosure object the dashboard reads to show "N of M shown" instead of
+// silently rendering a truncated page as if it were the complete caller/callee list.
+// Absent (not merely false/zero) when the underlying verb reported no pagination fields at
+// all, so a caller/callee list from a CLI version that never capped keeps costing 0 bytes —
+// the same "absence is meaningful" convention the CLI's own JSON already follows for its
+// bodyless_defs/hop_tested-style fields (see verbs_navigate.h).
+std::string truncationJson( std::string_view rowsObj )
+{
+    const std::string capped   = jsonScalar( rowsObj, "capped" );
+    const std::string shown    = jsonScalar( rowsObj, "shown" );
+    const std::string total    = jsonScalar( rowsObj, "total" );
+    const std::string hasMore  = jsonScalar( rowsObj, "has_more" );
+    if( capped.empty() && shown.empty() && total.empty() && hasMore.empty() ) return {};
+    std::string out = "{";
+    bool first = true;
+    const auto add = [ & ]( std::string_view key, const std::string& value )
+    {
+        if( value.empty() ) return;
+        if( !first ) out += ",";
+        out += "\"" + std::string( key ) + "\":" + value;
+        first = false;
+    };
+    add( "capped", capped );
+    add( "shown", shown );
+    add( "total", total );
+    add( "has_more", hasMore );
+    out += "}";
+    return out;
+}
 }
 
 std::string GraphService::symbol( std::string_view target ) const
@@ -160,10 +212,22 @@ std::string GraphService::symbol( std::string_view target ) const
     const std::string tests = file.empty() ? std::string() : runJsonCommand( cfg_, "tests_for_file", file );
     const std::string commits = commitsJson( cfg_, file );
 
+    // The underlying CLI verbs page/cap their rows and SAY SO (capped=/shown=/total=/has_more=
+    // on the same object callers/callees already are) — but until now nothing between that
+    // verb and the browser read those fields, so a symbol with more callers/callees than one
+    // page holds rendered as if the page were the whole answer, with no sign anything was cut.
+    // Surfacing it here, once, keeps the fix at the one seam that already sees both the raw
+    // verb output and the shaped API response, rather than asking the frontend to reach back
+    // into callers/callees' own internals to find it.
+    const std::string callersTruncation = truncationJson( callers );
+    const std::string calleesTruncation = truncationJson( callees );
+
     std::string out = "{\"ok\":true,\"target\":" + jsonString( target );
     out += ",\"file\":" + ( file.empty() ? std::string( "null" ) : jsonString( file ) );
     out += ",\"callers\":" + ( callers.empty() ? std::string( "null" ) : callers );
     out += ",\"callees\":" + ( callees.empty() ? std::string( "null" ) : callees );
+    if( !callersTruncation.empty() ) out += ",\"callers_truncation\":" + callersTruncation;
+    if( !calleesTruncation.empty() ) out += ",\"callees_truncation\":" + calleesTruncation;
     out += ",\"tests\":" + ( tests.empty() ? std::string( "null" ) : tests );
     out += ",\"commits\":" + commits + "}";
     return out;

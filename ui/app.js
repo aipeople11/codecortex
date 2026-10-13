@@ -58,7 +58,17 @@ function projectContexts(){
   state.events.forEach(e=>{if(!e.project_id)return;const prev=m.get(e.project_id)||{};m.set(e.project_id,{id:e.project_id,name:e.project_name||prev.name||e.project_id,root:e.workspace_root||prev.root||'',repo:e.repo_id||prev.repo||''});});
   return [...m.values()];
 }
+function workspaceRoots(){ return Array.isArray(state.health?.workspace_roots)?state.health.workspace_roots:[]; }
+function normRoot(p){ return String(p||'').replace(/\\/g,'/').replace(/\/+$/,'').toLowerCase(); }
+function rootName(p){ return String(p||'').split(/[\\/]/).filter(Boolean).pop()||String(p||''); }
 function contextEvents(){
+  if(workspaceRoots().length>1){
+    // Multi-project workspace: "All projects" shows everything; a single project shows the events filed under
+    // that folder (CodeCortex answers are filed under the project most of their files belong to).
+    if(!state.activeProject||state.activeProject==='__all__')return state.events;
+    const want=normRoot(state.activeProject);
+    return state.events.filter(e=>normRoot(e.workspace_root)===want);
+  }
   const project=state.activeProject||state.health?.project_id||'';
   return state.events.filter(e=>!project||!e.project_id||e.project_id===project);
 }
@@ -69,11 +79,23 @@ function scopedMemory(items){
   return items.filter(x=>keys.has(String(x?.project||x?.project_id||x?.repo_id||x?.workspace_root||'')));
 }
 function renderContext(){
+  const ws=workspaceRoots();
+  if(ws.length>1){
+    if(!state.activeProject||(state.activeProject!=='__all__'&&!ws.some(r=>normRoot(r)===normRoot(state.activeProject))))state.activeProject='__all__';
+    state.activeRoot=state.activeProject==='__all__'?(state.health?.root||ws[0]):state.activeProject;
+    const sel=$('projectContext');
+    if(sel){sel.innerHTML=`<option value="__all__">All projects (${ws.length})</option>`+ws.map(r=>`<option value="${esc(r)}">${esc(rootName(r))}</option>`).join('');sel.value=state.activeProject;}
+    const el=$('repoContext'); if(el){el.textContent=`workspace: ${ws.length} projects (${ws.map(rootName).join(', ')})`;el.title=ws.join('\n');}
+    const ev=contextEvents(), session=ev.slice().reverse().find(e=>e.session_id)?.session_id||state.health?.session_id||'';
+    if($('sessionContext'))$('sessionContext').textContent=session?`session ${session}`:'session —';
+    if($('graphContext'))$('graphContext').textContent=state.activeProject==='__all__'?`Workspace: ${ws.map(rootName).join(', ')}`:`Project: ${rootName(state.activeProject)}`;
+    return;
+  }
   const contexts=projectContexts(); if(!state.activeProject)state.activeProject=state.health?.project_id||contexts[0]?.id||'';
   const active=contexts.find(x=>x.id===state.activeProject)||contexts[0]||{id:'',name:'Current workspace',root:state.health?.root||'',repo:state.health?.repo_id||''};
   state.activeRoot=active.root||state.health?.root||'';
   const sel=$('projectContext'); if(sel){sel.innerHTML=contexts.map(x=>`<option value="${esc(x.id)}" ${x.id===state.activeProject?'selected':''}>${esc(x.name)}</option>`).join('')||'<option value="">Current workspace</option>';sel.value=state.activeProject;}
-  if($('repoContext'))$('repoContext').textContent=active.repo||active.root||'repository —';
+  if($('repoContext')){const ws=Array.isArray(state.health?.workspace_roots)?state.health.workspace_roots:[];const el=$('repoContext');el.textContent=ws.length>1?`workspace: ${ws.length} projects (${ws.map(r=>String(r).split(/[\\/]/).filter(Boolean).pop()).join(', ')})`:(active.repo||active.root||'repository —');el.title=ws.length>1?ws.join('\n'):'';}
   const ev=contextEvents(), session=ev.slice().reverse().find(e=>e.session_id)?.session_id||state.health?.session_id||'';
   if($('sessionContext'))$('sessionContext').textContent=session?`session ${session}`:'session —';
   if($('graphContext'))$('graphContext').textContent=`Project: ${active.name||'Current workspace'}${active.root?' · Repository: '+active.root:''}`;
@@ -319,6 +341,8 @@ async function renderAll(){
   renderOverview(); renderSessions(); renderMemories(); renderLessons(); renderActions(); renderCrystals(); await renderTimeline(); renderAudit(); renderActivity(); renderReplay(); renderHealth();
   if(state.activeView==='profile')await loadProfile();
   renderContext();
+  if(window.CodeCortexTokens)window.CodeCortexTokens.render();
+  if(window.CodeCortexStart)window.CodeCortexStart.render();
   if(window.CodeCortexGraph)window.CodeCortexGraph.update(contextEvents(),{projectId:state.activeProject,root:state.activeRoot});
 }
 async function load(forceMemory=false){
@@ -333,7 +357,7 @@ document.querySelectorAll('#nav button').forEach(b=>b.onclick=async()=>{
   if(b.dataset.view==='graph'&&window.CodeCortexGraph){window.CodeCortexGraph.update(contextEvents(),{projectId:state.activeProject,root:state.activeRoot});requestAnimationFrame(()=>window.CodeCortexGraph.activate());}
   if(b.dataset.view==='profile')await loadProfile();
 });
-$('projectContext').onchange=()=>{state.activeProject=$('projectContext').value; const c=projectContexts().find(x=>x.id===state.activeProject); state.activeRoot=c?.root||state.health.root||''; state.selectedSession=''; renderAll();};
+$('projectContext').onchange=()=>{state.activeProject=$('projectContext').value; if(workspaceRoots().length>1){state.activeRoot=state.activeProject==='__all__'?(state.health.root||''):state.activeProject;} else {const c=projectContexts().find(x=>x.id===state.activeProject); state.activeRoot=c?.root||state.health.root||'';} state.selectedSession=''; renderAll();};
 $('refresh').onclick=()=>load(true);
 $('timelineRun').onchange=()=>renderTimeline();
 $('profileProject').onchange=loadProfile;

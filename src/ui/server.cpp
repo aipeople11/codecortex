@@ -21,10 +21,9 @@
 #include <string_view>
 #include <vector>
 
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
+// Sockets go through the project's os:: layer (src/infra/os.h), as src/mcpserver.h's HTTP server does, so the
+// dashboard server builds on Windows (Winsock) as well as POSIX. os.h brings the POSIX socket headers itself.
+#include "infra/os.h"
 
 namespace rw::ui
 {
@@ -119,11 +118,7 @@ bool sendAll( int fd, std::string_view data ) noexcept
     std::size_t sent = 0;
     while( sent < data.size() )
     {
-#ifdef MSG_NOSIGNAL
-        const ssize_t n = ::send( fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL );
-#else
-        const ssize_t n = ::send( fd, data.data() + sent, data.size() - sent, 0 );
-#endif
+        const rw::os::ssize_t n = rw::os::send( fd, data.data() + sent, data.size() - sent, MSG_NOSIGNAL );
         if( n <= 0 ) return false;
         sent += static_cast<std::size_t>( n );
     }
@@ -210,7 +205,8 @@ std::string healthJson( const ServerConfig& cfg )
                     + ",\"deployment\":{\"local_first\":true,\"mcp_active\":" + std::string( cfg.mcpActive ? "true" : "false" )
                     + ",\"mcp_transport\":" + jsonString( cfg.mcpTransport )
                     + ",\"mcp_local_only\":" + std::string( cfg.mcpLocalOnly ? "true" : "false" )
-                    + ",\"dashboard_bind\":\"127.0.0.1\",\"dashboard_port\":" + std::to_string( cfg.port ) + "}"
+                    + ",\"dashboard_bind\":\"127.0.0.1\",\"dashboard_port\":" + std::to_string( activePort().load() > 0 ? activePort().load() : cfg.port ) + "}"
+                    + ",\"workspace_roots\":" + [&]{ std::string a = "["; for( const auto& r : cfg.workspaceRoots ) { if( a.size() > 1 ) a += ","; a += jsonString( r ); } return a + "]"; }()
                     + ",\"capabilities\":{\"code_intelligence\":true,\"graph\":true,\"impact\":true,\"test_selection\":true,\"proof_checks\":true,\"host_observation_conditional\":true,\"token_usage_conditional\":true}"
                     + ",\"edition\":" + jsonString( profile.edition )
                     + ",\"organization\":" + jsonString( profile.organization )
@@ -392,39 +388,51 @@ int runServer( const ServerConfig& cfg )
         return 1;
     }
 
-    const int listenFd = ::socket( AF_INET, SOCK_STREAM, 0 );
-    if( listenFd < 0 ) { std::fprintf( stderr, "codecortex: UI socket failed: %s\n", std::strerror( errno ) ); return 1; }
-    int one = 1;
-    ::setsockopt( listenFd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof( one ) );
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons( static_cast<std::uint16_t>( cfg.port ) );
-    addr.sin_addr.s_addr = htonl( INADDR_LOOPBACK );
-    if( ::bind( listenFd, reinterpret_cast<sockaddr*>( &addr ), sizeof( addr ) ) != 0 )
+    int listenFd = -1;
+    int port = cfg.port;
+    for( int attempt = 0; attempt < 10 && port <= 65535; ++attempt, ++port )
     {
-        std::fprintf( stderr, "codecortex: UI bind 127.0.0.1:%d failed: %s\n", cfg.port, std::strerror( errno ) );
-        ::close( listenFd ); return 1;
+        listenFd = rw::os::socket( AF_INET, SOCK_STREAM, 0 );
+        if( listenFd < 0 ) { std::fprintf( stderr, "codecortex: UI socket failed: %s\n", std::strerror( errno ) ); return 1; }
+        int one = 1;
+        // POSIX SO_REUSEADDR only skips TIME_WAIT, never a live listener; os:: maps it to SO_EXCLUSIVEADDRUSE on
+        // Windows. Either way a port another running dashboard holds still fails to bind, which is what the
+        // fallback below relies on.
+        rw::os::setsockopt( listenFd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof( one ) );
+        rw::os::sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons( static_cast<std::uint16_t>( port ) );
+        if( rw::os::inet_pton( AF_INET, "127.0.0.1", &addr.sin_addr ) == 1
+            && rw::os::bind( listenFd, reinterpret_cast<rw::os::sockaddr*>( &addr ), sizeof( addr ) ) == 0 )
+            break;
+        std::fprintf( stderr, "codecortex: UI port %d is busy (%s)%s\n", port, std::strerror( errno ),
+                      attempt < 9 ? ", trying the next one" : "" );
+        rw::os::close( listenFd ); listenFd = -1;
     }
-    if( ::listen( listenFd, 16 ) != 0 )
+    if( listenFd < 0 ) { std::fprintf( stderr, "codecortex: no free UI port in %d..%d\n", cfg.port, cfg.port + 9 ); return 1; }
+    int one = 1;
+    if( rw::os::listen( listenFd, 16 ) != 0 )
     {
         std::fprintf( stderr, "codecortex: UI listen failed: %s\n", std::strerror( errno ) );
-        ::close( listenFd ); return 1;
+        rw::os::close( listenFd ); return 1;
     }
 
     const auto assets = assetsDir( cfg );
     rw::evidence::EvidenceService evidence( cfg.telemetryPath );
     evidence.refresh();
-    std::fprintf( stderr, "codecortex: Developer Console on http://127.0.0.1:%d (loopback only)\n", cfg.port );
+    activePort().store( port );
+    std::fprintf( stderr, "codecortex: Developer Console on http://127.0.0.1:%d (loopback only)\n", port );
 
     for( ;; )
     {
-        const int fd = ::accept( listenFd, nullptr, nullptr );
+        const int fd = rw::os::accept( listenFd, nullptr, nullptr );
         if( fd < 0 ) { if( errno == EINTR ) continue; break; }
+        rw::os::setsockopt_nosigpipe( fd, &one, sizeof( one ) );   // a browser closing early must not kill the process
         std::string req;
         std::array<char, 8192> buf{};
         while( req.find( "\r\n\r\n" ) == std::string::npos && req.size() < kMaxRequestBytes )
         {
-            const ssize_t n = ::recv( fd, buf.data(), buf.size(), 0 );
+            const rw::os::ssize_t n = rw::os::recv( fd, buf.data(), buf.size(), 0 );
             if( n <= 0 ) break;
             req.append( buf.data(), static_cast<std::size_t>( n ) );
         }
@@ -538,6 +546,15 @@ int runServer( const ServerConfig& cfg )
             else if( target == "/app.js" ) { file = assets / "app.js"; type = "application/javascript; charset=utf-8"; }
             else if( target == "/graph.js" ) { file = assets / "graph.js"; type = "application/javascript; charset=utf-8"; }
             else if( target == "/styles.css" ) { file = assets / "styles.css"; type = "text/css; charset=utf-8"; }
+            else if( target == "/tokens.js" ) { file = assets / "tokens.js"; type = "application/javascript; charset=utf-8"; }
+            else if( target == "/start.js" ) { file = assets / "start.js"; type = "application/javascript; charset=utf-8"; }
+            else if( target == "/pricing.json" )
+            {
+                // List prices ship with the UI; a team with negotiated rates points CODECORTEX_PRICING_FILE at its
+                // own copy (same format) instead of editing the shipped one.
+                file = assets / "pricing.json"; type = "application/json; charset=utf-8";
+                if( const char* own = std::getenv( "CODECORTEX_PRICING_FILE" ); own && *own ) file = own;
+            }
             else if( target == "/codecortex-logo-header.png" ) { file = assets / "codecortex-logo-header.png"; type = "image/png"; }
             else if( target == "/codecortex-logo.png" ) { file = assets / "codecortex-logo.png"; type = "image/png"; }
             if( file.empty() ) respond( fd, "404 Not Found", "text/plain; charset=utf-8", "not found\n" );
@@ -548,9 +565,9 @@ int runServer( const ServerConfig& cfg )
                 else respond( fd, "200 OK", type, body );
             }
         }
-        ::close( fd );
+        rw::os::close( fd );
     }
-    ::close( listenFd );
+    rw::os::close( listenFd );
     return 1;
 }
 

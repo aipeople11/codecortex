@@ -8,6 +8,7 @@
 
 #include "mcpjson.h"
 #include "telemetry/collector.h"
+#include "telemetry/transcript_usage.h"
 
 #include <algorithm>
 #include <chrono>
@@ -240,6 +241,74 @@ inline rw::telemetry::Event baseEvent( const std::string& payload, std::string_v
     return ev;
 }
 
+// Claude Code hands every hook its session transcript path. At the end of each turn (Stop) read the lines
+// appended since the last read and record the API's own token counts as TokenUsage events
+// (source=host_reported): one event per (model, prompt-size tier), so per-prompt totals are the sum over the
+// turn's run_id. State per transcript = resume offset + recently counted message ids (one API response spans
+// several lines, possibly across two reads). Observation must never block the host: every failure is silent.
+inline void recordTranscriptUsage( const std::string& payload, std::string_view host, std::string_view runId,
+                                   std::string_view cwd, rw::telemetry::Collector& collector )
+{
+    namespace tu = rw::telemetry::transcript;
+    const std::string transcript = firstString( payload, {"transcript_path","transcriptPath"} );
+    if( transcript.empty() ) return;
+    std::error_code ec;
+    const auto size = fs::file_size( fs::path( transcript ), ec );
+    if( ec ) return;
+
+    const fs::path statePath = stateDir( cwd ) / ( "transcript-" + stableKey( transcript ) + ".txt" );
+    std::uint64_t offset = 0;
+    std::vector<std::string> seen;
+    {
+        std::istringstream st( readFile( statePath ) );
+        std::string line;
+        if( std::getline( st, line ) ) { try { offset = std::stoull( line ); } catch( ... ) { offset = 0; } }
+        while( std::getline( st, line ) ) if( !line.empty() ) seen.push_back( line );
+    }
+    if( offset > size ) { offset = 0; seen.clear(); }   // transcript was replaced or truncated: start over
+    constexpr std::uint64_t kMaxRead = 64ull * 1024 * 1024;
+    const std::uint64_t want = std::min<std::uint64_t>( size - offset, kMaxRead );
+    if( want == 0 ) return;
+
+    std::string chunk( static_cast<std::size_t>( want ), '\0' );
+    {
+        std::ifstream in( fs::path( transcript ), std::ios::binary );
+        if( !in ) return;
+        in.seekg( static_cast<std::streamoff>( offset ) );
+        in.read( chunk.data(), static_cast<std::streamsize>( want ) );
+        chunk.resize( static_cast<std::size_t>( in.gcount() ) );
+    }
+    const std::size_t complete = tu::completeLinesEnd( chunk );
+    if( complete == 0 ) return;
+
+    // Anthropic prices some models' prompts above 100k tokens at a higher tier; the bucket split lets the
+    // dashboard apply it. Overridable because the threshold is a published price-table fact, not ours.
+    std::int64_t threshold = 100000;
+    if( const std::string t = envOr( "CODECORTEX_LONG_PROMPT_TOKENS" ); !t.empty() ) { try { threshold = std::stoll( t ); } catch( ... ) {} }
+
+    const tu::Summary sum = tu::summarize( std::string_view( chunk ).substr( 0, complete ), seen, threshold );
+    for( const auto& b : sum.buckets )
+    {
+        auto ev = baseEvent( payload, host, runId, rw::telemetry::EventType::TokenUsage );
+        ev.toolCallId.clear();
+        ev.model = b.model;
+        ev.target = b.model.empty() ? std::string( "model not reported" ) : b.model;
+        ev.detail = std::string( "claude_code_transcript tier=" ) + ( b.longPrompt ? "long_prompt" : "standard" );
+        ev.inputTokens = b.input; ev.outputTokens = b.output;
+        ev.cacheReadTokens = b.cacheRead; ev.cacheWrite5mTokens = b.cacheWrite5m; ev.cacheWrite1hTokens = b.cacheWrite1h;
+        ev.requestCount = b.requests;
+        collector.record( ev );
+    }
+
+    for( const auto& id : sum.countedIds ) seen.push_back( id );
+    constexpr std::size_t kKeepIds = 256;
+    if( seen.size() > kKeepIds ) seen.erase( seen.begin(), seen.end() - static_cast<std::ptrdiff_t>( kKeepIds ) );
+    std::string state = std::to_string( offset + complete ) + "\n";
+    for( const auto& id : seen ) { state += id; state += '\n'; }
+    fs::create_directories( stateDir( cwd ), ec );
+    (void)writeFileAtomic( statePath, state );
+}
+
 inline int observe( int argc, char** argv )
 {
     std::string host = "unknown";
@@ -298,6 +367,7 @@ inline int observe( int argc, char** argv )
     }
     if( evt == "Stop" || evt == "Interrupt" || evt == "SessionEnd" )
     {
+        recordTranscriptUsage( payload, host, run, cwd, collector );
         auto ev = baseEvent( payload, host, run, rw::telemetry::EventType::RunFinished );
         ev.target = cwd; ev.detail = evt == "Interrupt" ? "host_interrupted" : "host_turn_finished"; ev.success = evt != "Interrupt"; collector.record( ev );
         return 0;
