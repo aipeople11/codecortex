@@ -145,7 +145,7 @@ async function loadMemoryBundle(force=false){
 
 function renderOverview(){
   const run=latestRun(contextEvents());
-  $('health').textContent=state.health.ok?'● service online':'● service attention';
+  $('healthPill').textContent=state.health.ok?'● service online':'● service attention';
   ['tokensSource','toolCallsSource','repeatSource','durationSource','currentToolSource','toolFailuresSource'].forEach(id=>setMetricSource(id,'NOT AVAILABLE'));
   if(!run){
     $('runId').textContent='No run telemetry yet';
