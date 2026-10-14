@@ -38,11 +38,16 @@ python3 scripts/build_mcpb.py --binary build/codecortex --ui ui --skills skills 
 
 ## Test checklist (do this on the first real release)
 
-1. Double-click the `.mcpb` → Claude desktop shows the CodeCortex install dialog with icon and description.
-2. Pick a project folder → Install.
-3. New chat: **"Show CodeCortex status"** → names that folder and the dashboard address.
-4. Open <http://127.0.0.1:7331> → the dashboard loads (not "UI asset unavailable").
-5. Claude → Settings → Extensions → CodeCortex → change the folder → status now names the new folder.
+1. Claude → Settings → Extensions → drag the `.mcpb` onto the page → the CodeCortex install screen appears.
+   If its Install button stays grey (a Claude Desktop bug in some builds), extract the Windows zip and use
+   **Advanced settings → Install unpacked extension** on the folder that has `manifest.json` inside.
+2. **Configure** → add one or more project folders (up to 16, not nested) → **Save**; set Read-only tools to
+   **Always allow**.
+3. Fully quit Claude and reopen it. New chat: **"Show CodeCortex status"** → lists the folder(s) and the
+   dashboard address (7331, or the next free port if an older CodeCortex still holds it).
+4. Open the dashboard → it loads (not "UI asset unavailable"); with several folders the Project menu shows
+   **All projects** plus each folder.
+5. Ask Claude **"Save to CodeCortex memory that …"** → the entry appears under **Memories**.
 
 ## Known limits
 
