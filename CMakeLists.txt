@@ -800,6 +800,11 @@ if(CODECORTEX_TESTS)
   target_link_libraries(codecortex_test_session_meter PRIVATE doctest::doctest)
   add_test(NAME codecortex.session_meter COMMAND codecortex_test_session_meter)
 
+  add_executable(codecortex_test_local_memory test/verify_local_memory.cpp)
+  target_include_directories(codecortex_test_local_memory PRIVATE src/infra third_party src)
+  target_link_libraries(codecortex_test_local_memory PRIVATE doctest::doctest)
+  add_test(NAME codecortex.local_memory COMMAND codecortex_test_local_memory)
+
   add_executable(codecortex_test_memory test/verify_memory.cpp src/memory/memory_service_client.cpp src/infra/diagnostics.cpp)
   target_include_directories(codecortex_test_memory PRIVATE src/infra third_party src)
   target_link_libraries(codecortex_test_memory PRIVATE doctest::doctest)

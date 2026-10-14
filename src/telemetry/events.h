@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace rw::telemetry
 {
@@ -84,6 +85,8 @@ struct Event
     std::int64_t estTokens = -1;
     std::int64_t avoidedTokensEst = -1;
     std::int64_t coveredFiles = -1;
+    std::string queryText;                  // ContextReturned: what the agent asked (task/symbol/query), for Profile
+    std::vector<std::string> paths;         // ContextReturned: up to 10 files the answer covered, for Profile
     // Retry chain: 0 = not tracked; 1 = first attempt; N = the (N-1)th retry of retryOfToolCallId's call.
     std::string retryOfToolCallId;
     std::int64_t attemptNumber = 0;

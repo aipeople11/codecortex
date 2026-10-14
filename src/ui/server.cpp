@@ -4,6 +4,7 @@
 #include "graph_service.h"
 
 #include "memory/memory_service_client.h"
+#include "memory/local_memory.h"
 #include "project_identity.h"
 #include "commands/safe_commands.h"
 #include "enterprise/edition.h"
@@ -495,6 +496,25 @@ int runServer( const ServerConfig& cfg )
                 respond( fd, body.find( "\"ok\":true" ) != std::string::npos ? "200 OK" : "404 Not Found", "application/json; charset=utf-8", body );
             }
         }
+        else if( target == "/api/local-memory" )
+        {
+            // The project's built-in memory (what memory_checkpoint saves when no memory service is configured),
+            // from every workspace folder. Read-only; newest last, as written.
+            std::vector<std::string> roots = cfg.workspaceRoots;
+            if( roots.empty() ) roots.push_back( cfg.root );
+            std::string body = "{\"ok\":true,\"entries\":[";
+            bool first = true;
+            for( const auto& r : roots )
+                for( const auto& e : rw::memory::local::load( r, 2000 ) )
+                {
+                    std::string row = rw::memory::local::toJson( e );
+                    row.insert( row.size() - 1, ",\"project_root\":" + jsonString( r ) );
+                    if( !first ) body.push_back( ',' );
+                    body += row; first = false;
+                }
+            body += "]}";
+            respond( fd, "200 OK", "application/json; charset=utf-8", body );
+        }
         else if( target.starts_with( "/api/memory/" ) )
         {
             const std::string resource = target.substr( std::string( "/api/memory/" ).size() );
@@ -548,6 +568,7 @@ int runServer( const ServerConfig& cfg )
             else if( target == "/styles.css" ) { file = assets / "styles.css"; type = "text/css; charset=utf-8"; }
             else if( target == "/tokens.js" ) { file = assets / "tokens.js"; type = "application/javascript; charset=utf-8"; }
             else if( target == "/start.js" ) { file = assets / "start.js"; type = "application/javascript; charset=utf-8"; }
+            else if( target == "/local.js" ) { file = assets / "local.js"; type = "application/javascript; charset=utf-8"; }
             else if( target == "/pricing.json" )
             {
                 // List prices ship with the UI; a team with negotiated rates points CODECORTEX_PRICING_FILE at its

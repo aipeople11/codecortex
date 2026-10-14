@@ -37,8 +37,10 @@
              :'Needs <b>Claude Code</b>. In a terminal, run <code>codecortex install --host claude</code> once, then restart Claude Code. (The Claude Desktop app does not share token counts with tools — there you will only see CodeCortex\'s own share.)'),
       item(pricingOk===true,'Price table','List prices are loaded, so costs can be estimated.',
         'Price table not found. Reinstall CodeCortex, or set CODECORTEX_PRICING_FILE to your own pricing.json.'),
-      item(typeof memAvailable==='function'&&memAvailable(),'Long-term memory (optional)','Connected: lessons and past findings carry across sessions.',
-        'Optional. Works without it. Your team can connect a memory service later.',true)
+      item(true,'Project memory',
+        (typeof memAvailable==='function'&&memAvailable())?'Memory service connected: lessons and past findings carry across sessions.'
+          :`Built-in: ${(window.CodeCortexLocal?.entries||[]).length} saved in this project. Ask Claude to <b>"save to CodeCortex memory"</b> and it is recalled in later chats.`,
+        '')
     ].join('');
     $('startTry').innerHTML=[
       'Use CodeCortex to find where login errors are handled.',

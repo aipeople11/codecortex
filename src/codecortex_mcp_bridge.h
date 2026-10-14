@@ -4,6 +4,7 @@
 
 #include "mcp.h"
 #include "memory/memory_service_client.h"
+#include "memory/local_memory.h"
 #include "project_identity.h"
 #include "telemetry/collector.h"
 #include "telemetry/session_meter.h"
@@ -404,7 +405,7 @@ inline McpDispatchResult dispatchCodeCortexMcpLineCore( const std::string& line,
             "{\"name\":\"change_impact\",\"description\":\"CodeCortex pre-edit shortcut over CodeCortex impact. Use before changing important symbols to inspect blast radius.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"symbol\":{\"type\":\"string\"}},\"required\":[\"symbol\"]}}",
             "{\"name\":\"tests_required\",\"description\":\"CodeCortex test-selection shortcut over CodeCortex situational_awareness. Use after edits or before completion.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"files\":{\"type\":\"string\"},\"diff\":{\"type\":\"string\"}}}}",
             "{\"name\":\"codecortex_memory_recall\",\"description\":\"Recall bounded durable coding memory from CodeCortex Memory using stable project/repository identity.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"task\":{\"type\":\"string\"},\"top_k\":{\"type\":\"integer\"}},\"required\":[\"task\"]}}",
-            "{\"name\":\"memory_checkpoint\",\"description\":\"Persist a durable project-scoped coding fact/bug/workflow/architecture lesson to CodeCortex Memory.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"checkpoint_name\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"},\"type\":{\"type\":\"string\",\"enum\":[\"pattern\",\"preference\",\"architecture\",\"bug\",\"workflow\",\"fact\"]}},\"required\":[\"checkpoint_name\"]}}",
+            "{\"name\":\"memory_checkpoint\",\"description\":\"Persist a durable project-scoped coding fact/bug/workflow/architecture lesson, or a follow-up action, to CodeCortex Memory (saved in the project's .codecortex folder when no memory service is configured).\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"checkpoint_name\":{\"type\":\"string\"},\"description\":{\"type\":\"string\"},\"type\":{\"type\":\"string\",\"enum\":[\"pattern\",\"preference\",\"architecture\",\"bug\",\"workflow\",\"fact\",\"lesson\",\"action\"]}},\"required\":[\"checkpoint_name\"]}}",
             "{\"name\":\"prove_change\",\"description\":\"CodeCortex completion gate: combine CodeCortex quality_delta with situational_awareness/test evidence before claiming a coding task complete.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"}}}}"
         };
         for( const auto e : extras ) appendArrayItem( r.resp, "tools", e );
@@ -483,7 +484,14 @@ inline McpDispatchResult dispatchCodeCortexMcpLineCore( const std::string& line,
             rw::memory::MemoryServiceClient mem;
             rw::memory::RecallQuery q;
             q.query = task; q.project = ident.projectId; q.agentId = ident.agentId.empty() ? bridgeContext().hostName : ident.agentId; q.sessionId = ident.sessionId.empty() ? bridgeContext().connectionId : ident.sessionId; q.includeLessons = true; q.limit = 5;
-            const auto mr = mem.smartRecall( q );
+            auto mr = mem.smartRecall( q );
+            if( !( mr.ok && !mr.body.empty() ) )
+            {
+                // No external memory service: use this project's built-in memory (.codecortex/memory.jsonl).
+                const auto found = rw::memory::local::recall( rw::memory::local::load( primaryRoot( effectiveRoot ) ), task, 5 );
+                mr.ok = !found.empty();
+                mr.body = found.empty() ? std::string() : rw::memory::local::recallText( found );
+            }
             if( mr.ok && !mr.body.empty() )
             {
                 const std::string item = "{\"type\":\"text\",\"text\":\""
@@ -510,11 +518,17 @@ inline McpDispatchResult dispatchCodeCortexMcpLineCore( const std::string& line,
         if( task.empty() ) return { toolResult( id, "missing required field: task", true ), false, name };
         const auto ident = rw::project::identify( primaryRoot( effectiveRoot ) );
         rw::memory::RecallQuery q; q.query = task; q.project = ident.projectId; q.agentId = ident.agentId.empty() ? bridgeContext().hostName : ident.agentId; q.sessionId = ident.sessionId.empty() ? bridgeContext().connectionId : ident.sessionId; q.includeLessons = true; q.limit = 5;
-        rw::memory::MemoryServiceClient mem; const auto mr = mem.smartRecall( q );
-        if( mr.ok ) recordEvent( telemetryPath, effectiveRoot, runId, rw::telemetry::EventType::MemoryRecall,
-                                task, "memory_service_recalled", true );
-        finishTelemetry( mr.ok, "memory_service_recall" );
-        return { toolResult( id, mr.ok ? mr.body : mr.error, !mr.ok ), false, name };
+        rw::memory::MemoryServiceClient mem; auto mr = mem.smartRecall( q );
+        std::string how = "memory_service_recalled";
+        if( !mr.ok )
+        {
+            // No external memory service: answer from this project's built-in memory instead of failing.
+            const auto found = rw::memory::local::recall( rw::memory::local::load( primaryRoot( effectiveRoot ) ), task, 5 );
+            mr.ok = true; mr.body = rw::memory::local::recallText( found ); how = "local_memory_recalled";
+        }
+        recordEvent( telemetryPath, effectiveRoot, runId, rw::telemetry::EventType::MemoryRecall, task, how, true );
+        finishTelemetry( mr.ok, how );
+        return { toolResult( id, mr.body, false ), false, name };
     }
 
     if( name == "memory_checkpoint" )
@@ -523,17 +537,29 @@ inline McpDispatchResult dispatchCodeCortexMcpLineCore( const std::string& line,
         const std::string description = mcpStringArg( args, "description" ).value;
         std::string type = mcpStringArg( args, "type" ).value; if( type.empty() ) type = "fact";
         if( checkpoint.empty() ) return { toolResult( id, "missing required field: checkpoint_name", true ), false, name };
-        static constexpr std::string_view allowed[] = { "pattern", "preference", "architecture", "bug", "workflow", "fact" };
+        static constexpr std::string_view allowed[] = { "pattern", "preference", "architecture", "bug", "workflow", "fact", "lesson", "action" };
         bool okType = false; for( auto t : allowed ) if( type == t ) okType = true;
         if( !okType ) return { toolResult( id, "invalid memory type", true ), false, name };
         const auto ident = rw::project::identify( primaryRoot( effectiveRoot ) );
         rw::memory::RememberRequest req; req.project = ident.projectId; req.agentId = ident.agentId; req.type = type;
         req.content = checkpoint + ( description.empty() ? std::string() : ": " + description );
-        rw::memory::MemoryServiceClient mem; const auto mr = mem.remember( req );
+        rw::memory::MemoryServiceClient mem; auto mr = mem.remember( req );
+        std::string how = "memory_service_saved";
+        if( !mr.ok )
+        {
+            // No external memory service: save into this project's built-in memory (.codecortex/memory.jsonl),
+            // which the dashboard's Memories / Lessons / Actions pages read.
+            rw::memory::local::Entry e{ rw::telemetry::unixTimeMs(), type, checkpoint, description,
+                                        ident.projectName.empty() ? ident.projectId : ident.projectName };
+            mr.ok = rw::memory::local::append( primaryRoot( effectiveRoot ), e );
+            mr.body = mr.ok ? "Saved to this project's CodeCortex memory (" + type + "): " + checkpoint
+                            : "Could not write .codecortex/memory.jsonl in the project folder";
+            how = "local_memory_saved";
+        }
         if( mr.ok ) recordEvent( telemetryPath, effectiveRoot, runId, rw::telemetry::EventType::Checkpoint,
                                 checkpoint, "memory_type=" + type, true );
-        finishTelemetry( mr.ok, "memory_service_saved" );
-        return { toolResult( id, mr.ok ? mr.body : mr.error, !mr.ok ), false, name };
+        finishTelemetry( mr.ok, how );
+        return { toolResult( id, mr.ok ? mr.body : ( mr.error.empty() ? mr.body : mr.error ), !mr.ok ), false, name };
     }
 
     if( name == "prove_change" )
@@ -591,7 +617,8 @@ inline McpDispatchResult dispatchCodeCortexMcpLine( const std::string& line, int
                            : !policy.pinnedRoot.empty() ? policy.pinnedRoot
                            : !policy.defaultRoot.empty() ? policy.defaultRoot : policy.assumedRoot;
     std::int64_t coveredBytes = 0, coveredFiles = 0;
-    std::vector<std::pair<std::string, int>> perFolder;   // multi-project: which folder this answer is mostly about
+    std::vector<std::pair<std::string, int>> perFolder;
+    std::vector<std::string> coveredPathList;   // multi-project: which folder this answer is mostly about
     static std::unordered_set<std::string> creditedFiles;   // each file is credited once per session, not per answer
     if( ok && !root.empty() )
     {
@@ -621,6 +648,7 @@ inline McpDispatchResult dispatchCodeCortexMcpLine( const std::string& line, int
             const auto sz = std::filesystem::file_size( p, ec );
             if( ec || !creditedFiles.insert( p.lexically_normal().string() ).second ) return;
             coveredBytes += static_cast<std::int64_t>( sz ); ++coveredFiles;
+            if( coveredPathList.size() < 10 ) coveredPathList.push_back( rel );
         } );
     }
     const std::int64_t avoided = mt::tokensForBytes( static_cast<std::uint64_t>( coveredBytes ), mt::kSourceBytesPerToken );
@@ -675,6 +703,12 @@ inline McpDispatchResult dispatchCodeCortexMcpLine( const std::string& line, int
             e.estTokens = answerTokens;
             e.avoidedTokensEst = avoided;
             e.coveredFiles = coveredFiles;
+            e.paths = coveredPathList;
+            for( const char* key : { "task", "symbol", "query", "pattern", "trace" } )
+            {
+                std::string v = mcpStringArg( argsObj.empty() ? params : argsObj, key ).value;
+                if( !v.empty() ) { e.queryText = v.substr( 0, 160 ); break; }
+            }
             c.record( e );
         }
     }

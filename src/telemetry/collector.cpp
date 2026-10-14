@@ -138,6 +138,13 @@ std::string serialize( const Event& event )
     if( event.estTokens >= 0 ) out += ",\"est_tokens\":" + std::to_string( event.estTokens );
     if( event.avoidedTokensEst >= 0 ) out += ",\"avoided_tokens_est\":" + std::to_string( event.avoidedTokensEst );
     if( event.coveredFiles >= 0 ) out += ",\"covered_files\":" + std::to_string( event.coveredFiles );
+    if( !event.queryText.empty() ) { out += ",\"query\":"; out += jsonString( event.queryText ); }
+    if( !event.paths.empty() )
+    {
+        out += ",\"files\":[";
+        for( std::size_t i = 0; i < event.paths.size(); ++i ) { if( i ) out.push_back( ',' ); out += jsonString( event.paths[i] ); }
+        out += "]";
+    }
     if( event.attemptNumber > 0 ) out += ",\"attempt_number\":" + std::to_string( event.attemptNumber );
     if( !event.retryOfToolCallId.empty() ) { out += ",\"retry_of_tool_call_id\":"; out += jsonString( event.retryOfToolCallId ); }
     out += "}\n";

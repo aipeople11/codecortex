@@ -193,7 +193,8 @@ function renderOverview(){
   const lessons=scopedMemory(arr(state.memory.lessons,'lessons')), actions=scopedMemory(arr(state.memory.actions,'actions')), crystals=scopedMemory(arr(state.memory.crystals,'crystals'));
   $('memorySummary').innerHTML=state.memory.available
     ? `<div class="row"><span>Lessons</span><strong>${lessons.length}</strong></div><div class="row"><span>Actions</span><strong>${actions.length}</strong></div><div class="row"><span>Crystals</span><strong>${crystals.length}</strong></div>`
-    : `<div class="empty">${esc(state.memory.error||'CodeCortex Memory not connected')}</div>`;
+    : (()=>{const L=window.CodeCortexLocal; if(!L)return `<div class="empty">${esc(state.memory.error||'CodeCortex Memory not connected')}</div>`; const ev=contextEvents();
+        return `<div class="row"><span>Saved memories</span><strong>${L.items('memories',ev).length}</strong></div><div class="row"><span>Lessons</span><strong>${L.items('lessons',ev).length}</strong></div><div class="row"><span>Actions</span><strong>${L.items('actions',ev).length}</strong></div><div class="row"><span>Crystals</span><strong>${localCrystals().length}</strong></div><small class="muted">Built-in project memory (.codecortex folder). An external memory service is optional.</small>`;})();
 }
 
 function renderSessions(){
@@ -225,14 +226,17 @@ function renderSessionDetail(){
 }
 
 function renderMemories(){
+  if(!state.memory.available&&window.CodeCortexLocal)return window.CodeCortexLocal.render('memories','memoriesList','memoriesMeta',state.filters.memories,contextEvents());
   let items=scopedMemory(arr(state.memory.memories,'memories')); const q=state.filters.memories.toLowerCase(); if(q)items=items.filter(m=>JSON.stringify(m).toLowerCase().includes(q)); $('memoriesMeta').textContent=state.memory.available?`${items.length} memories`:'offline';
   $('memoriesList').innerHTML=items.slice(0,300).map(m=>`<article class="memory-item"><div class="item-top"><strong>${esc(m.title||m.type||'Memory')}</strong><span class="badge">${esc(m.type||'memory')}</span></div><p>${esc(m.content||m.fact||m.text||m.narrative||'')}</p><small>${esc(m.project||'')} ${esc(fmtTime(m.updatedAt||m.createdAt))}</small></article>`).join('') || `<div class="empty">${state.memory.available?'No memories yet.':esc(state.memory.error||'CodeCortex Memory unavailable.')}</div>`;
 }
 function renderLessons(){
+  if(!state.memory.available&&window.CodeCortexLocal)return window.CodeCortexLocal.render('lessons','lessonsList','lessonsMeta',state.filters.lessons,contextEvents());
   let items=scopedMemory(arr(state.memory.lessons,'lessons')); const q=state.filters.lessons.toLowerCase(); if(q)items=items.filter(m=>JSON.stringify(m).toLowerCase().includes(q)); $('lessonsMeta').textContent=state.memory.available?`${items.length} lessons`:'offline';
   $('lessonsList').innerHTML=items.slice(0,300).map(l=>`<article class="memory-item"><div class="item-top"><strong>${esc(l.title||l.type||'Lesson')}</strong><span class="badge">${l.confidence!=null?Math.round(Number(l.confidence)*100)+'%':'lesson'}</span></div><p>${esc(l.content||l.lesson||l.description||'')}</p><small>${esc(l.project||'')} ${esc(fmtTime(l.updatedAt||l.createdAt))}</small></article>`).join('') || `<div class="empty">${state.memory.available?'No lessons yet.':esc(state.memory.error||'CodeCortex Memory unavailable.')}</div>`;
 }
 function renderActions(){
+  if(!state.memory.available&&window.CodeCortexLocal)return window.CodeCortexLocal.render('actions','actionsList','actionsMeta',state.filters.actions,contextEvents());
   let items=scopedMemory(arr(state.memory.actions,'actions')); const q=state.filters.actions.toLowerCase(); if(q)items=items.filter(m=>JSON.stringify(m).toLowerCase().includes(q)); const frontier=new Set(arr(state.memory.frontier,'actions','frontier').map(x=>String(x.id||x)));
   $('actionsMeta').textContent=state.memory.available?`${items.length} actions`:'offline';
   $('actionsList').innerHTML=items.slice(0,300).map(a=>`<article class="memory-item ${frontier.has(String(a.id))?'frontier':''}"><div class="item-top"><strong>${esc(a.title||'Action')}</strong><span class="badge status-${esc(a.status||'pending')}">${esc(a.status||'pending')}</span></div><p>${esc(a.description||'')}</p><small>priority ${esc(a.priority??'—')} ${Array.isArray(a.tags)?'· '+esc(a.tags.join(', ')):''}</small></article>`).join('') || `<div class="empty">${state.memory.available?'No actions yet.':esc(state.memory.error||'CodeCortex Memory unavailable.')}</div>`;
@@ -271,20 +275,30 @@ function renderActivity(){
 }
 
 async function loadProfile(){
-  const sessions=arr(state.memory.sessions,'sessions');
-  const projects=[...new Set(sessions.map(s=>s.project).filter(Boolean))];
-  const select=$('profileProject'); const current=select.value||projects[0]||'';
-  select.innerHTML=projects.map(p=>`<option value="${esc(p)}" ${p===current?'selected':''}>${esc(p)}</option>`).join('')||'<option value="">Current repository</option>';
-  let remote=null; if(current&&state.memory.available)remote=await getJson('/api/memory/profile?project='+encodeURIComponent(current));
+  // Project selector: the workspace's folders (or this project), not only memory-service projects.
+  const ws=workspaceRoots(); const roots=ws.length?ws:[state.health.root||state.activeRoot||''].filter(Boolean);
+  const select=$('profileProject');
+  if(!state.profileRoot||!roots.some(r=>normRoot(r)===normRoot(state.profileRoot)))state.profileRoot=(ws.length&&state.activeProject&&state.activeProject!=='__all__')?state.activeProject:(roots[0]||'');
+  select.innerHTML=roots.map(r=>`<option value="${esc(r)}" ${normRoot(r)===normRoot(state.profileRoot)?'selected':''}>${esc(rootName(r))}</option>`).join('')||'<option value="">Current repository</option>';
+  const root=state.profileRoot;
+  const events=ws.length?state.events.filter(e=>normRoot(e.workspace_root)===normRoot(root)):contextEvents();
+  // Remote memory profile when that service is connected; otherwise derived from CodeCortex's own data.
+  let remote=null; if(state.memory.available&&root)remote=await getJson('/api/memory/profile?project='+encodeURIComponent(state.health.project_id||rootName(root)));
   const p=remote?.profile||remote;
-  const topFiles=Array.isArray(p?.topFiles)?p.topFiles:[]; const concepts=Array.isArray(p?.topConcepts)?p.topConcepts:[];
+  let topFiles=Array.isArray(p?.topFiles)?p.topFiles.map(f=>[f.file||f.path||'',f.frequency||0]):[];
+  let concepts=Array.isArray(p?.topConcepts)?p.topConcepts.map(c=>[c.concept||c.name||'',c.frequency||0]):[];
+  let source='MEMORY SERVICE';
+  if(!topFiles.length&&!concepts.length&&window.CodeCortexLocal){const d=window.CodeCortexLocal.profile(events); topFiles=d.files; concepts=d.concepts; source='DERIVED';}
+  const runs=new Set(events.map(e=>e.run_id).filter(Boolean)).size;
+  const saved=(window.CodeCortexLocal?.entries||[]).filter(m=>!ws.length||normRoot(m.project_root)===normRoot(root)).length;
+  const sameProject=normRoot(root)===normRoot(state.health.root);
   $('profileContent').innerHTML=`
-    <article class="profile-card"><span>Project</span><strong>${esc(state.health.project_name||state.activeProject||'—')}</strong></article><article class="profile-card"><span>Repository</span><strong>${esc(state.activeRoot||state.health.root||'—')}</strong></article>
+    <article class="profile-card"><span>Project</span><strong>${esc(rootName(root)||state.health.project_name||'—')}</strong></article><article class="profile-card"><span>Repository</span><strong>${esc((sameProject&&state.health.repo_id)||root||'—')}</strong></article>
     <article class="profile-card"><span>Edition</span><strong>${esc(state.health.edition||'community')}</strong></article>
     <article class="profile-card"><span>Organization</span><strong>${esc(state.health.organization||'—')}</strong></article>
-    <article class="profile-card"><span>Memory</span><strong>${memAvailable()?'connected':'offline'}</strong></article><article class="profile-card"><span>Local runs</span><strong>${runGroups().length}</strong></article><article class="profile-card"><span>Telemetry events</span><strong>${contextEvents().length}</strong></article>
-    <article class="panel profile-wide"><h3>Top files</h3>${topFiles.slice(0,10).map(f=>`<div class="row"><span>${esc(f.file||f.path||'')}</span><strong>${f.frequency||0}</strong></div>`).join('')||'<div class="empty">No memory profile file data.</div>'}</article>
-    <article class="panel profile-wide"><h3>Top concepts</h3>${concepts.slice(0,10).map(c=>`<div class="row"><span>${esc(c.concept||c.name||'')}</span><strong>${c.frequency||0}</strong></div>`).join('')||'<div class="empty">No memory profile concept data.</div>'}</article>`;
+    <article class="profile-card"><span>Memory</span><strong>${memAvailable()?'memory service':'built-in · '+saved+' saved'}</strong></article><article class="profile-card"><span>Local runs</span><strong>${runs}</strong></article><article class="profile-card"><span>Telemetry events</span><strong>${events.length}</strong></article>
+    <article class="panel profile-wide"><h3>Top files ${provenanceBadge(source)}</h3>${topFiles.map(([f,n])=>`<div class="row"><span>${esc(f)}</span><strong>${n}</strong></div>`).join('')||'<div class="empty">Files appear here as Claude asks CodeCortex about this project: the ones its answers cover most often.</div>'}</article>
+    <article class="panel profile-wide"><h3>Top concepts ${provenanceBadge(source)}</h3>${concepts.map(([c,n])=>`<div class="row"><span>${esc(c)}</span><strong>${n}</strong></div>`).join('')||'<div class="empty">The terms and symbols Claude searches for most in this project appear here.</div>'}</article>`;
 }
 
 function remoteReplaySessions(){ return arr(state.memory.replaySessions,'sessions'); }
@@ -348,7 +362,7 @@ async function renderAll(){
 async function load(forceMemory=false){
   try{
     const [h,t,p,runs]=await Promise.all([getJson('/api/health'),getJson('/api/evidence?limit=5000'),getJson('/api/productivity'),getJson('/api/evidence/runs?limit=100')]);
-    state.health=h; state.telemetryInfo=t||{}; state.productivity=p||{}; state.runIndex=runs||{}; state.events=Array.isArray(t?.events)?t.events:[]; renderContext(); await loadMemoryBundle(forceMemory); await renderAll();
+    state.health=h; state.telemetryInfo=t||{}; state.productivity=p||{}; state.runIndex=runs||{}; state.events=Array.isArray(t?.events)?t.events:[]; renderContext(); await loadMemoryBundle(forceMemory); if(window.CodeCortexLocal)await window.CodeCortexLocal.load(forceMemory); await renderAll();
   }catch(e){ state.health={ok:false,error:String(e)}; await renderAll(); }
 }
 
@@ -360,7 +374,7 @@ document.querySelectorAll('#nav button').forEach(b=>b.onclick=async()=>{
 $('projectContext').onchange=()=>{state.activeProject=$('projectContext').value; if(workspaceRoots().length>1){state.activeRoot=state.activeProject==='__all__'?(state.health.root||''):state.activeProject;} else {const c=projectContexts().find(x=>x.id===state.activeProject); state.activeRoot=c?.root||state.health.root||'';} state.selectedSession=''; renderAll();};
 $('refresh').onclick=()=>load(true);
 $('timelineRun').onchange=()=>renderTimeline();
-$('profileProject').onchange=loadProfile;
+$('profileProject').onchange=()=>{state.profileRoot=$('profileProject').value; loadProfile();};
 $('replayRun').onchange=()=>selectReplayValue($('replayRun').value);
 $('replayPrev').onclick=()=>stepReplay(-1); $('replayNext').onclick=()=>stepReplay(1); $('replayPlay').onclick=toggleReplay;
 
