@@ -11,6 +11,11 @@
   estimates and waste alerts (re-reads, repeated searches, retry loops).
 - **Dashboard:** new "Get started" checklist and "Tokens & cost" pages; retry chains drawn in the graph.
 - **Fixes:** dashboard files now ship in every download; callers/callees truncation is disclosed.
+- **Multi-project workspace:** up to 16 folders in one workspace; the dashboard's Project menu shows
+  "All projects" plus each folder, and the dashboard moves to the next free port if an older one is running.
+- **No more empty pages:** built-in project memory (`.codecortex/memory.jsonl`) powers Memories, Lessons and
+  Actions without an external service; Profile shows the workspace's projects, top files and top concepts;
+  lessons are also learned automatically from tools that only worked after retries.
 
 ## Local-First Release Candidate — 2026-09-26
 
