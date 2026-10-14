@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>CodeCortex 0.7.0 — Setup &amp; user guide</title>
+<meta name="description" content="Install, use and test CodeCortex with Claude: setup, a five-minute test, every dashboard page explained, and troubleshooting.">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap">
+<style>
+/* Layout: an app-style docs shell — slim header, a sticky tab bar, one panel per tab; the Dashboard tab is a master/detail browser (page list + detail card). */
+:root{
+  --bg:#f3f6f9; --surface:#ffffff; --surface-2:#f8fafc; --fg:#0f1f2e; --muted:#5a6c7c; --line:#dbe4eb;
+  --accent:#0b8a80; --accent-soft:#e2f3f0; --navy:#0b2239; --navy-2:#11324f; --warn:#a86400; --warn-soft:#fdf2df;
+  --ok:#16825d; --code-bg:#eef3f6; --shadow:0 6px 24px rgba(11,34,57,.07);
+  --f-body:"Instrument Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --f-mono:"JetBrains Mono",ui-monospace,Consolas,monospace;
+  color-scheme:light;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#0b141d; --surface:#111f2c; --surface-2:#0f1b27; --fg:#e3ecf2; --muted:#93a7b6; --line:#22374a;
+  --accent:#3cc9ba; --accent-soft:#11302d; --navy:#071320; --navy-2:#0c2133; --warn:#f0b450; --warn-soft:#342713;
+  --ok:#4fd1a0; --code-bg:#0e1a26; --shadow:0 6px 24px rgba(0,0,0,.3); color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0b141d; --surface:#111f2c; --surface-2:#0f1b27; --fg:#e3ecf2; --muted:#93a7b6; --line:#22374a;
+  --accent:#3cc9ba; --accent-soft:#11302d; --navy:#071320; --navy-2:#0c2133; --warn:#f0b450; --warn-soft:#342713;
+  --ok:#4fd1a0; --code-bg:#0e1a26; --shadow:0 6px 24px rgba(0,0,0,.3); color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--f-body);font-size:15.5px;line-height:1.6}
+img{max-width:100%}
+[hidden]{display:none!important}
+a{color:var(--accent)}
+code{font-family:var(--f-mono);font-size:.86em;background:var(--code-bg);padding:1px 6px;border-radius:5px;overflow-wrap:anywhere}
+button{font-family:inherit}
+:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+.top{background:linear-gradient(110deg,var(--navy),var(--navy-2));color:#e8f2f8;padding-inline:20px;padding-block:22px 18px}
+.top .in{max-width:1080px;margin:0 auto;display:flex;flex-wrap:wrap;gap:14px 24px;align-items:center;justify-content:space-between}
+.brand{display:flex;align-items:center;gap:12px;min-width:0}
+.logo{width:40px;height:40px;border-radius:11px;background:#3cc9ba;color:#052522;font:700 18px var(--f-mono);display:grid;place-items:center;flex:none}
+.brand h1{margin:0;font-size:22px;letter-spacing:-.01em;line-height:1.2}
+.brand p{margin:0;color:#a9c2d3;font-size:13.5px}
+.btn{display:inline-flex;align-items:center;gap:8px;background:#3cc9ba;color:#052522;font-weight:700;text-decoration:none;padding:10px 16px;border-radius:10px;white-space:nowrap}
+.tabbar{position:sticky;top:0;z-index:5;background:var(--surface);border-bottom:1px solid var(--line);box-shadow:var(--shadow)}
+.tabbar .in{max-width:1080px;margin:0 auto;padding-inline:12px;display:flex;gap:2px;overflow-x:auto;scrollbar-width:thin}
+.tab{appearance:none;border:0;background:none;color:var(--muted);font-weight:600;font-size:14.5px;padding:14px 14px 12px;border-bottom:3px solid transparent;cursor:pointer;white-space:nowrap}
+.tab:hover{color:var(--fg)}
+.tab[aria-selected="true"]{color:var(--accent);border-bottom-color:var(--accent)}
+main{max-width:1080px;margin:0 auto;padding-inline:20px;padding-block:28px 56px}
+h2{font-size:26px;letter-spacing:-.015em;margin:0 0 6px;text-wrap:balance}
+h3{font-size:17px;margin:26px 0 8px}
+.sub{color:var(--muted);margin:0 0 20px;max-width:70ch}
+p,li{max-width:72ch}
+.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:16px 18px;min-width:0}
+.card h4{margin:0 0 4px;font-size:15.5px}
+.card p{margin:0;color:var(--muted);font-size:14.5px}
+.card.link{cursor:pointer;text-align:left;font:inherit;color:inherit}
+.card.link:hover{border-color:var(--accent)}
+.kicker{font:600 11px var(--f-mono);letter-spacing:.1em;text-transform:uppercase;color:var(--accent);margin-bottom:6px}
+.tbl{overflow-x:auto;border:1px solid var(--line);border-radius:12px;background:var(--surface);margin:10px 0}
+table{border-collapse:collapse;width:100%;font-size:14.5px}
+th,td{text-align:left;vertical-align:top;padding:10px 14px;border-bottom:1px solid var(--line)}
+th{font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600;background:var(--surface-2)}
+tr:last-child td{border-bottom:0}
+td:first-child{font-weight:600}
+.tag{display:inline-block;font:600 11px var(--f-mono);letter-spacing:.04em;padding:2px 8px;border-radius:999px;background:var(--accent-soft);color:var(--accent);white-space:nowrap}
+.tag.est{background:var(--warn-soft);color:var(--warn)}
+.note{border-left:3px solid var(--warn);background:var(--warn-soft);padding:12px 16px;border-radius:0 10px 10px 0;margin:16px 0}
+.note p{margin:4px 0}
+.steps{list-style:none;padding:0;margin:12px 0;display:grid;gap:10px;counter-reset:s}
+.steps li{counter-increment:s;display:grid;grid-template-columns:32px 1fr;gap:12px;background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:14px 16px;max-width:none}
+.steps li::before{content:counter(s);width:28px;height:28px;border-radius:50%;background:var(--accent-soft);color:var(--accent);font-weight:700;display:grid;place-items:center;font-variant-numeric:tabular-nums}
+.steps li>div{min-width:0}
+.cmd{display:flex;gap:8px;align-items:center;margin-top:8px;background:var(--code-bg);border:1px solid var(--line);border-radius:8px;padding:8px 10px;min-width:0}
+.cmd code{background:none;padding:0;flex:1;min-width:0;overflow-x:auto;white-space:nowrap}
+.cmd button{font:600 12px var(--f-body);border:1px solid var(--line);background:var(--surface);color:var(--fg);border-radius:6px;padding:5px 10px;cursor:pointer}
+.seg{display:inline-flex;flex-wrap:wrap;gap:4px;background:var(--surface-2);border:1px solid var(--line);border-radius:12px;padding:4px;margin:6px 0 4px}
+.seg button{border:0;background:none;color:var(--muted);font-weight:600;font-size:14px;padding:8px 14px;border-radius:9px;cursor:pointer}
+.seg button[aria-selected="true"]{background:var(--surface);color:var(--fg);box-shadow:0 1px 3px rgba(0,0,0,.12)}
+.prompt{display:flex;gap:10px;align-items:flex-start;background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:8px 0}
+.prompt span{flex:1;min-width:0;font-style:italic}
+.prompt button{font:600 12px var(--f-body);border:1px solid var(--line);background:var(--surface-2);color:var(--fg);border-radius:6px;padding:4px 9px;cursor:pointer;flex:none}
+.browser{display:grid;grid-template-columns:250px 1fr;gap:16px;align-items:start}
+.side{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:10px;position:sticky;top:64px}
+.side input{width:100%;border:1px solid var(--line);background:var(--surface-2);color:var(--fg);border-radius:9px;padding:9px 11px;font:inherit;font-size:14px;margin-bottom:6px}
+.side ul{list-style:none;margin:0;padding:0;max-height:62vh;overflow-y:auto}
+.side li button{width:100%;text-align:left;border:0;background:none;color:var(--fg);padding:8px 10px;border-radius:8px;cursor:pointer;font-size:14.5px;display:flex;justify-content:space-between;gap:8px}
+.side li button:hover{background:var(--surface-2)}
+.side li button[aria-current="true"]{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.side small{color:var(--muted);font-size:11px;font-family:var(--f-mono);align-self:center}
+.detail{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:20px 22px;min-width:0;box-shadow:var(--shadow)}
+.detail h3{margin:0 0 2px;font-size:21px}
+.detail .lead{color:var(--muted);margin:0 0 14px}
+.detail dl{margin:0;display:grid;grid-template-columns:130px 1fr;gap:10px 16px}
+.detail dt{font-size:11.5px;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);font-weight:600;padding-top:3px}
+.detail dd{margin:0;min-width:0}
+.pager{display:flex;justify-content:space-between;gap:10px;margin-top:18px;padding-top:14px;border-top:1px solid var(--line)}
+.pager button{border:1px solid var(--line);background:var(--surface-2);color:var(--fg);border-radius:9px;padding:8px 12px;cursor:pointer;font-weight:600;font-size:13.5px}
+.mselect{display:none;width:100%;border:1px solid var(--line);background:var(--surface);color:var(--fg);border-radius:10px;padding:10px;font:inherit;margin-bottom:12px}
+@media(max-width:760px){.browser{grid-template-columns:1fr}.side{display:none}.mselect{display:block}.detail dl{grid-template-columns:1fr}.detail dt{padding-top:6px}}
+details.faq{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:12px 16px;margin:8px 0}
+details.faq summary{cursor:pointer;font-weight:600}
+details.faq p{margin:8px 0 2px}
+footer{max-width:1080px;margin:0 auto;padding-inline:20px;padding-block:18px 32px;font-size:13px;color:var(--muted);border-top:1px solid var(--line)}
+.mt{margin-top:12px}
+@media (prefers-reduced-motion:no-preference){.tab,.seg button,.card.link{transition:color .15s,border-color .15s,background .15s}}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="in">
+    <div class="brand">
+      <div class="logo" aria-hidden="true">CC</div>
+      <div><h1>CodeCortex 0.7.0</h1><p>Install, use and test CodeCortex with Claude. Everything in one place.</p></div>
+    </div>
+    <a class="btn" href="https://github.com/aipeople11/codecortex/releases/tag/v0.7.0">Download v0.7.0 →</a>
+  </div>
+</header>
+
+<nav class="tabbar" aria-label="Guide sections"><div class="in" role="tablist">
+  <button class="tab" role="tab" data-tab="start">Start here</button>
+  <button class="tab" role="tab" data-tab="install">Install</button>
+  <button class="tab" role="tab" data-tab="test">Test</button>
+  <button class="tab" role="tab" data-tab="dashboard">Dashboard pages</button>
+  <button class="tab" role="tab" data-tab="features">Memory · Tokens · Projects</button>
+  <button class="tab" role="tab" data-tab="help">Troubleshooting</button>
+  <button class="tab" role="tab" data-tab="changes">What's new</button>
+</div></nav>
+
+<main>
+
+<section class="panel" id="panel-start" role="tabpanel">
+  <div class="kicker">Start here</div>
+  <h2>What CodeCortex does</h2>
+  <p class="sub">CodeCortex runs on your computer and plugs into Claude through MCP. When Claude works on your code, it asks CodeCortex instead of reading every file: where things are, who calls what, what a change would break, which tests to run. Answers come from a map of your project, findings are remembered locally, and everything is recorded in a dashboard at <code>http://127.0.0.1:7331</code>. Nothing leaves your machine.</p>
+  <div class="grid">
+    <button class="card link" data-go="install"><div class="kicker">1 · 5 min</div><h4>Install it</h4><p>Claude Desktop, Claude Code or other AI tools.</p></button>
+    <button class="card link" data-go="test"><div class="kicker">2 · 5 min</div><h4>Try it</h4><p>Five prompts that prove it works end to end.</p></button>
+    <button class="card link" data-go="dashboard"><div class="kicker">3 · explore</div><h4>Read the dashboard</h4><p>What each of the 16 pages shows and how to test it.</p></button>
+    <button class="card link" data-go="help"><div class="kicker">If stuck</div><h4>Troubleshooting</h4><p>Common symptoms and the fix for each.</p></button>
+  </div>
+  <h3>Where it saves tokens</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>Situation</th><th>Saves tokens?</th></tr></thead>
+    <tbody>
+      <tr><td>Claude works on code saved on your computer</td><td><span class="tag">Yes</span> Targeted answers instead of whole files. First test: 3 answers ≈ 14,500 tokens versus ≈ 154,000 to read the same files.</td></tr>
+      <tr><td>Any other code folder on your laptop</td><td><span class="tag">Yes</span> Name the folder in your question.</td></tr>
+      <tr><td>Code pasted into the chat</td><td><span class="tag est">No</span> It is already in the conversation.</td></tr>
+      <tr><td>Research, emails, documents</td><td><span class="tag est">No</span> Claude does not call a code tool there; switch the extension off when not coding.</td></tr>
+    </tbody>
+  </table></div>
+  <p class="sub mt">CodeCortex <b>helps</b> Claude; it does not control it. Claude decides when to call it, so savings come from Claude choosing CodeCortex's short answers over reading whole files.</p>
+</section>
+
+<section class="panel" id="panel-install" role="tabpanel" hidden>
+  <div class="kicker">Install</div>
+  <h2>Set up CodeCortex</h2>
+  <p class="sub">Download from <a href="https://github.com/aipeople11/codecortex/releases/tag/v0.7.0">github.com/aipeople11/codecortex/releases/tag/v0.7.0</a>, then follow the steps for your AI tool.</p>
+  <div class="seg" role="tablist" aria-label="AI tool">
+    <button role="tab" aria-selected="true" data-seg="desktop">Claude Desktop</button>
+    <button role="tab" aria-selected="false" data-seg="code">Claude Code</button>
+    <button role="tab" aria-selected="false" data-seg="other">Other AI tools</button>
+  </div>
+  <div data-segpanel="desktop">
+    <ol class="steps">
+      <li><div>Download <code>codecortex-0.7.0-windows-x64.mcpb</code> (Windows) or <code>codecortex-0.7.0-macos-arm64.mcpb</code> (Apple Silicon Mac).</div></li>
+      <li><div>In Claude open <b>Settings → Extensions</b> and <b>drag the <code>.mcpb</code> onto that page</b>, then click <b>Install</b>. Double-clicking the file in Windows does not open Claude; if Windows asks which app to use, close that box.</div></li>
+      <li><div><b>If Install stays grey</b> (a known Claude Desktop bug in some builds): download <code>codecortex-0.7.0-windows-x64.zip</code>, extract it, then <b>Settings → Extensions → Advanced settings → Install unpacked extension</b> and pick the folder with <code>manifest.json</code> directly inside.</div></li>
+      <li><div>Click <b>Configure</b> on CodeCortex, add your project folder(s) (up to 16, not inside each other) and <b>Save</b>. Set <b>Read-only tools</b> to <b>Always allow</b>; leave tools that edit files on <b>Needs approval</b>.</div></li>
+      <li><div>Fully quit Claude (right-click its icon near the clock → <b>Quit</b>) and reopen it.</div></li>
+      <li><div>New chat: <b>Show CodeCortex status</b>. Then open the dashboard address it gives and start with <b>Get started</b>.</div></li>
+    </ol>
+  </div>
+  <div data-segpanel="code" hidden>
+    <ol class="steps">
+      <li><div>Download <code>codecortex-0.7.0-windows-x64.zip</code> (or the Mac/Linux file) and unzip it, e.g. to <code>C:\Tools\codecortex</code>.</div></li>
+      <li><div>In a terminal in that folder, run once (connects Claude Code and turns on per-prompt token tracking):
+        <div class="cmd"><code>bin\codecortex.exe install --host claude</code><button type="button" data-copy="bin\codecortex.exe install --host claude">Copy</button></div></div></li>
+      <li><div>Start Claude Code <b>inside your project folder</b> and ask <b>Show CodeCortex status</b>.</div></li>
+      <li><div>Open <code>http://127.0.0.1:7331</code>. After each prompt, <b>Tokens &amp; cost</b> shows its exact tokens and cost.</div></li>
+    </ol>
+  </div>
+  <div data-segpanel="other" hidden>
+    <ol class="steps">
+      <li><div>Download and unzip the release, as for Claude Code.</div></li>
+      <li><div>Codex, Gemini CLI and others are detected automatically:
+        <div class="cmd"><code>bin\codecortex.exe install</code><button type="button" data-copy="bin\codecortex.exe install">Copy</button></div></div></li>
+      <li><div>For any other MCP app, print a ready-made configuration and paste it into the app's MCP settings:
+        <div class="cmd"><code>bin\codecortex.exe install --generic</code><button type="button" data-copy="bin\codecortex.exe install --generic">Copy</button></div></div></li>
+    </ol>
+  </div>
+  <div class="note">
+    <p><b>Windows security warning.</b> The download is not code-signed yet. Choose <b>More info → Run anyway</b>, or ask IT to allow it.</p>
+    <p><b>Make Claude prefer it.</b> Add to Claude's preferences: <i>"For questions about my code, use CodeCortex tools before reading files directly."</i></p>
+  </div>
+</section>
+
+<section class="panel" id="panel-test" role="tabpanel" hidden>
+  <div class="kicker">Test</div>
+  <h2>Five-minute first test</h2>
+  <p class="sub">Type these in a new Claude chat (replace the parts in angle brackets), then check the dashboard with <b>Ctrl+F5</b>.</p>
+  <div class="prompt"><span>Show CodeCortex status</span><button data-copy="Show CodeCortex status">Copy</button></div>
+  <div class="prompt"><span>Use CodeCortex to find where login is handled in &lt;project&gt;.</span><button data-copy="Use CodeCortex to find where login is handled in my project.">Copy</button></div>
+  <div class="prompt"><span>Save to CodeCortex memory that login is handled in &lt;file&gt;.</span><button data-copy="Save to CodeCortex memory that login is handled in ">Copy</button></div>
+  <div class="prompt"><span>Add a CodeCortex action: write a test for login.</span><button data-copy="Add a CodeCortex action: write a test for login.">Copy</button></div>
+  <div class="prompt"><span>Before you change &lt;function&gt;, show me what else would be affected.</span><button data-copy="Before you change this function, use CodeCortex to show me what else would be affected.">Copy</button></div>
+  <h3>Full checklist</h3>
+  <div class="tbl"><table>
+    <thead><tr><th>#</th><th>Do</th><th>Expect</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Show CodeCortex status</td><td>Folders and dashboard address listed</td></tr>
+      <tr><td>2</td><td>Ask a "find where…" question</td><td>Tokens &amp; cost → CodeCortex answers +1; File reads avoided &gt; 0</td></tr>
+      <tr><td>3</td><td>Ask the identical question again</td><td>Repeats not resent increases</td></tr>
+      <tr><td>4</td><td>Save something to CodeCortex memory</td><td>Memories shows it; Get started counts it</td></tr>
+      <tr><td>5</td><td>New chat, ask about that topic</td><td>Claude's answer includes the saved fact</td></tr>
+      <tr><td>6</td><td>Add a CodeCortex action</td><td>Actions shows it</td></tr>
+      <tr><td>7</td><td>3–4 questions on one project</td><td>Profile → Top files and Top concepts filled</td></tr>
+      <tr><td>8</td><td>Open Graph, Sessions, Timeline, Activity</td><td>Your runs appear</td></tr>
+      <tr><td>9</td><td>Open Health</td><td>Status cards and wiring visible</td></tr>
+      <tr><td>10</td><td>(Claude Code) finish one prompt</td><td>Token usage by prompt gets a row with cost</td></tr>
+      <tr><td>11</td><td>(Several folders) switch the Project menu</td><td>Pages filter per project; All projects shows everything</td></tr>
+    </tbody>
+  </table></div>
+</section>
+
+<section class="panel" id="panel-dashboard" role="tabpanel" hidden>
+  <div class="kicker">Dashboard pages</div>
+  <h2>Every page, what it shows and how to test it</h2>
+  <p class="sub">Open <code>http://127.0.0.1:7331</code>. The <b>Project</b> menu at the top filters most pages (choose <b>All projects</b> with several folders). Number labels say where data comes from: <span class="tag">OBSERVED</span> <span class="tag">HOST-REPORTED</span> <span class="tag est">DERIVED / ESTIMATE</span>.</p>
+  <select class="mselect" id="pgSelect" aria-label="Choose a dashboard page"></select>
+  <div class="browser">
+    <aside class="side">
+      <input id="pgSearch" type="search" placeholder="Filter pages…" aria-label="Filter pages">
+      <ul id="pgList"></ul>
+    </aside>
+    <article class="detail" id="pgDetail" aria-live="polite"></article>
+  </div>
+</section>
+
+<section class="panel" id="panel-features" role="tabpanel" hidden>
+  <div class="kicker">Memory · Tokens · Projects</div>
+  <h2>How the main features work</h2>
+  <div class="grid">
+    <div class="card"><h4>Project memory</h4>
+      <p>Claude saves findings with <i>"Save to CodeCortex memory…"</i>. They go to <code>.codecortex/memory.jsonl</code> in the project folder (first folder with several), are recalled automatically in later chats, and show on Memories, Lessons and Actions. Types: fact, architecture, pattern, preference, bug, workflow, lesson, action. An external service is optional (<code>CODECORTEX_MEMORY_URL</code>).</p></div>
+    <div class="card"><h4>Tokens and cost</h4>
+      <p><b>Claude Code:</b> exact per-prompt input, output and cache tokens, cost at list price. <b>Claude Desktop:</b> only CodeCortex's own share (Desktop shares no usage with extensions). Own rates: copy <code>pricing.json</code> and set <code>CODECORTEX_PRICING_FILE</code>.</p></div>
+    <div class="card"><h4>Token savers</h4>
+      <p>Identical repeated answers are not resent; search answers default to 3,000 tokens (Claude can ask for more; change with <code>CODECORTEX_DEFAULT_BUDGET_TOKENS</code>); waste alerts flag re-reads, repeated searches and retry loops.</p></div>
+    <div class="card"><h4>Several projects</h4>
+      <p>Add up to 16 folders in Configure (not nested). CodeCortex combines them so search and call-following work across all. The dashboard shows "workspace: N projects" and an <b>All projects</b> menu. Quality-delta / prove-change run one project at a time.</p></div>
+  </div>
+  <h3>Prompts that use these features</h3>
+  <div class="prompt"><span>What does CodeCortex remember about authentication?</span><button data-copy="What does CodeCortex remember about authentication?">Copy</button></div>
+  <div class="prompt"><span>Save a CodeCortex lesson: the retry loop must not call the API twice.</span><button data-copy="Save a CodeCortex lesson: ">Copy</button></div>
+  <div class="prompt"><span>Use CodeCortex across all my projects to find where orders are created.</span><button data-copy="Use CodeCortex across all my projects to find where orders are created.">Copy</button></div>
+</section>
+
+<section class="panel" id="panel-help" role="tabpanel" hidden>
+  <div class="kicker">Troubleshooting</div>
+  <h2>Something looks wrong</h2>
+  <p class="sub">Click a symptom to see the fix.</p>
+  <details class="faq"><summary>Windows asks which app should open the .mcpb</summary><p>Close that box. Drag the file onto Claude → Settings → Extensions instead.</p></details>
+  <details class="faq"><summary>The Install button stays grey</summary><p>A Claude Desktop bug in some builds. Download the Windows zip, extract it, and use Settings → Extensions → Advanced settings → <b>Install unpacked extension</b>.</p></details>
+  <details class="faq"><summary>"No manifest.json found in extension folder"</summary><p>Pick the folder that has <code>manifest.json</code> directly inside; Windows sometimes creates a folder inside a folder when extracting.</p></details>
+  <details class="faq"><summary>Claude says it has no CodeCortex tool</summary><p>Fully quit Claude (tray icon → Quit), reopen it and start a new chat.</p></details>
+  <details class="faq"><summary>The dashboard is frozen or shows an old session</summary><p>Quit Claude, end any <code>codecortex.exe</code> in Task Manager, reopen Claude and ask "Show CodeCortex status" for the current dashboard address (it moves to 7332, 7333… if an older copy still holds 7331).</p></details>
+  <details class="faq"><summary>A dashboard page is empty</summary><p>Press Ctrl+F5. With several folders choose <b>All projects</b>. Most pages fill as Claude uses CodeCortex; the Dashboard pages tab says what fills each one.</p></details>
+  <details class="faq"><summary>Tokens say "Not reported by host"</summary><p>Expected in Claude Desktop. For exact per-prompt numbers use Claude Code and run <code>codecortex install --host claude</code> once.</p></details>
+  <details class="faq"><summary>Claude uses the wrong project</summary><p>Settings → Extensions → CodeCortex → Configure → change the folders → Save, then fully quit and reopen Claude.</p></details>
+  <h3>Limits</h3>
+  <ul>
+    <li>It helps Claude; it cannot stop Claude reading files directly or reduce non-code chats.</li>
+    <li>Claude Desktop shares no conversation token usage with extensions.</li>
+    <li>Costs are list-price estimates; your bill depends on your plan.</li>
+    <li>Downloads are not code-signed yet.</li>
+  </ul>
+</section>
+
+<section class="panel" id="panel-changes" role="tabpanel" hidden>
+  <div class="kicker">What's new</div>
+  <h2>Changes in 0.7.0</h2>
+  <div class="tbl"><table>
+    <thead><tr><th>Area</th><th>Change</th></tr></thead>
+    <tbody>
+      <tr><td>Install</td><td>Windows build and download; Claude Desktop extension (.mcpb) for Windows and Mac; the Windows zip also works as an unpacked extension.</td></tr>
+      <tr><td>Tokens</td><td>Per-prompt tokens and cost (Claude Code); CodeCortex's share and savings; repeat guard; smaller default answers; waste alerts.</td></tr>
+      <tr><td>Projects</td><td>Up to 16 folders in one workspace; All projects menu; dashboard moves to the next free port if an older one is running.</td></tr>
+      <tr><td>Memory</td><td>Built-in project memory: Memories, Lessons and Actions work with no extra service; lessons learned automatically from retries.</td></tr>
+      <tr><td>Dashboard</td><td>Get started and Tokens &amp; cost pages; Profile per project with top files and concepts; Health page fixed; retry chains in Graph.</td></tr>
+      <tr><td>Fixes</td><td>Dashboard files ship in every download; callers/callees lists disclose when cut short; Windows and Mac build fixes.</td></tr>
+    </tbody>
+  </table></div>
+  <h3>For maintainers</h3>
+  <ul>
+    <li>Source and releases: <a href="https://github.com/aipeople11/codecortex">github.com/aipeople11/codecortex</a>. This guide lives in <code>docs/index.html</code>.</li>
+    <li><b>Dashboard-only changes</b> (HTML/JS/CSS/<code>pricing.json</code>): copy into the installed extension's <code>share/codecortex/ui</code> folder and press Ctrl+F5 — no build.</li>
+    <li><b>Program changes</b> (C++): GitHub → Actions → Release → Run workflow → <code>v0.7.0</code>, then reinstall the extension from the new zip.</li>
+  </ul>
+</section>
+
+</main>
+<footer>CodeCortex created by Saurabh Verma (MIT licence). Windows build, Claude extension, token &amp; cost tracking, multi-project support, built-in memory and dashboard improvements contributed by Hafeez Izaz.</footer>
+
+<script>
+(function(){
+  var PAGES=[
+    {id:'get-started',name:'Get started',group:'Start',lead:'A live setup checklist with example prompts.',
+     rows:[['What it shows','CodeCortex running, project folder, connected to your AI tool, token & cost tracking, price table, project memory — each ticked or with the exact fix.'],
+           ['How it works','Reads the dashboard\'s own health data and recorded events.'],
+           ['Test it','Before using Claude, "Connected to your AI tool" is unticked; after one CodeCortex question it ticks within seconds.'],
+           ['Amber is normal when','Token tracking in Claude Desktop (not available there).']]},
+    {id:'overview',name:'Overview',group:'Start',lead:'The latest piece of work at a glance.',
+     rows:[['What it shows','Tokens, tool calls, repeated work, duration, current tool, failures, sessions, memories; run signal; memory summary; productivity and verification evidence; a Safe command center for read-only checks (analyze, impact, callers, tests, doctor).'],
+           ['Test it','Ask one CodeCortex question → Tool calls and Tokens change. In the command center pick Doctor → Run.'],
+           ['Empty when','"No run telemetry yet" until Claude uses CodeCortex here. With several folders choose All projects.']]},
+    {id:'how',name:'How it works',group:'Start',lead:'A plain-English explanation of CodeCortex for new users.',
+     rows:[['What it shows','Static explainer of the architecture and evidence types. Nothing to test.']]},
+    {id:'tokens',name:'Tokens & cost',group:'Usage',lead:'What each prompt cost, and what CodeCortex saved.',
+     rows:[['What it shows','Conversation tokens and cost (Claude Code), CodeCortex answers, file reads avoided, repeats not resent, waste alerts; per-prompt table; every CodeCortex answer; alerts with tips.'],
+           ['How it works','Claude Code: exact usage read at the end of each prompt. Each CodeCortex answer records its estimated size and the size of the files it covered. Cost = tokens × list price (pricing.json, 13 Oct 2026).'],
+           ['Test it','Ask the same question twice → Repeats not resent increases. In Claude Code, finish one prompt → a row appears with cost.'],
+           ['Empty when','"Not reported by host" in Claude Desktop — expected.']]},
+    {id:'graph',name:'Graph',group:'Usage',lead:'A map of what Claude did and how your code connects.',
+     rows:[['What it shows','Runs, tool calls, searches, reads, edits, failures and retries (linked as RETRIED_AS); code, architecture and dependency views.'],
+           ['Test it','After a few questions nodes appear; search a symbol to expand callers and callees.'],
+           ['Empty when','No activity yet in the selected project.']]},
+    {id:'sessions',name:'Sessions',group:'History',lead:'Every recorded run, one per task.',
+     rows:[['What it shows','Each run with tool and event counts; click one for files, tests, tokens and tools used.'],
+           ['Test it','Ask two different tasks → two sessions; click one for details.']]},
+    {id:'timeline',name:'Timeline',group:'History',lead:'Every step of a chosen run, in order.',
+     rows:[['What it shows','Events of one run with relative timing.'],['Test it','Pick a run in the menu → its steps list from first to last.']]},
+    {id:'activity',name:'Activity',group:'History',lead:'A live feed of the latest events.',
+     rows:[['What it shows','Newest events first; keep it open while Claude works.']]},
+    {id:'crystals',name:'Crystals',group:'History',lead:'Snapshots of finished runs.',
+     rows:[['What it shows','What was done, files affected, tests seen.'],['Empty when','A run becomes a snapshot only when it finishes (a new task starts or a proof check completes).']]},
+    {id:'replay',name:'Replay',group:'History',lead:'Step through a past run like a recording.',
+     rows:[['What it shows','Play, previous and next through one run — useful to review or demo how a task was done.']]},
+    {id:'audit',name:'Audit',group:'History',lead:'A governance log.',
+     rows:[['What it shows','Tool calls, run start and finish, token events (plus memory-service changes when that service is connected).']]},
+    {id:'memories',name:'Memories',group:'Memory',lead:'Everything saved to CodeCortex memory for this project.',
+     rows:[['What it shows','Saved items, newest first, with search.'],
+           ['How it works','Saved by Claude\'s memory_checkpoint tool into <project>/.codecortex/memory.jsonl; recalled automatically in later chats. An external memory service is used instead if configured.'],
+           ['Test it','"Save to CodeCortex memory that …" → appears after Ctrl+F5. In a new chat ask about it → Claude\'s answer includes it.']]},
+    {id:'lessons',name:'Lessons',group:'Memory',lead:'Saved and automatically learned lessons.',
+     rows:[['What it shows','Saved bugs, patterns, workflows and lessons, plus learned ones: a tool that only worked after retries, or one that keeps failing.'],
+           ['Test it','"Save a CodeCortex lesson: …" → appears with its type.']]},
+    {id:'actions',name:'Actions',group:'Memory',lead:'Follow-up to-dos.',
+     rows:[['What it shows','Items saved with type "action".'],['Test it','"Add a CodeCortex action: write a test for login." → appears here.']]},
+    {id:'profile',name:'Profile',group:'Memory',lead:'A per-project summary.',
+     rows:[['What it shows','Project, repository, memory, runs, events, Top files (covered most by CodeCortex answers) and Top concepts (terms and symbols asked about most). The menu lists every project in your workspace.'],
+           ['Test it','Ask 3–4 questions about one project → its Top files and Top concepts fill in; switch projects in the menu.'],
+           ['Empty when','No questions yet for that project, or only activity from before 0.7.0.']]},
+    {id:'health',name:'Health',group:'System',lead:'Is every part of CodeCortex working?',
+     rows:[['What it shows','Status cards (dashboard, MCP, code graph, telemetry, host observation, token tracking, memory service, project, repository, graph view, saved runs), the runtime wiring chain and raw status data.'],
+           ['How to read it','Green = working. Amber is normal for Host run observation and Token telemetry in Claude Desktop, and for CodeCortex Memory (the external service; built-in memory works regardless).'],
+           ['Test it','Developer console, MCP and Repository graph should be green.']]}
+  ];
+  var esc=function(s){var d=document.createElement('div');d.textContent=s;return d.innerHTML;};
+  var list=document.getElementById('pgList'), detail=document.getElementById('pgDetail'), sel=document.getElementById('pgSelect'), search=document.getElementById('pgSearch');
+  var current=PAGES[0].id;
+  function renderList(){
+    var q=(search.value||'').toLowerCase();
+    list.innerHTML=PAGES.filter(function(p){return !q||(p.name+' '+p.lead+' '+p.rows.map(function(r){return r[1];}).join(' ')).toLowerCase().indexOf(q)>=0;})
+      .map(function(p){return '<li><button data-pg="'+p.id+'"'+(p.id===current?' aria-current="true"':'')+'>'+esc(p.name)+'<small>'+esc(p.group)+'</small></button></li>';}).join('')||'<li class="muted">No match</li>';
+  }
+  function show(id){
+    var i=PAGES.findIndex(function(p){return p.id===id;}); if(i<0)i=0; var p=PAGES[i]; current=p.id;
+    var prev=PAGES[i-1], next=PAGES[i+1];
+    detail.innerHTML='<div class="kicker">'+esc(p.group)+'</div><h3>'+esc(p.name)+'</h3><p class="lead">'+esc(p.lead)+'</p><dl>'+
+      p.rows.map(function(r){return '<dt>'+esc(r[0])+'</dt><dd>'+esc(r[1])+'</dd>';}).join('')+'</dl>'+
+      '<div class="pager">'+(prev?'<button data-pg="'+prev.id+'">← '+esc(prev.name)+'</button>':'<span></span>')+(next?'<button data-pg="'+next.id+'">'+esc(next.name)+' →</button>':'<span></span>')+'</div>';
+    sel.value=p.id; renderList();
+  }
+  sel.innerHTML=PAGES.map(function(p){return '<option value="'+p.id+'">'+esc(p.group+' · '+p.name)+'</option>';}).join('');
+  sel.addEventListener('change',function(){show(sel.value);});
+  search.addEventListener('input',renderList);
+  document.addEventListener('click',function(e){var b=e.target.closest('[data-pg]'); if(b){show(b.getAttribute('data-pg'));}});
+  show(current);
+
+  var tabs=[].slice.call(document.querySelectorAll('.tab'));
+  function openTab(name,push){
+    if(!document.getElementById('panel-'+name))name='start';
+    tabs.forEach(function(t){var on=t.getAttribute('data-tab')===name;t.setAttribute('aria-selected',on?'true':'false');t.tabIndex=on?0:-1;});
+    document.querySelectorAll('.panel').forEach(function(p){p.hidden=p.id!=='panel-'+name;});
+    if(push){try{history.replaceState(null,'','#'+name);}catch(e){}}
+    window.scrollTo({top:0});
+  }
+  tabs.forEach(function(t){t.addEventListener('click',function(){openTab(t.getAttribute('data-tab'),true);});});
+  document.querySelector('.tabbar .in').addEventListener('keydown',function(e){
+    if(e.key!=='ArrowRight'&&e.key!=='ArrowLeft')return;
+    var i=tabs.findIndex(function(t){return t.getAttribute('aria-selected')==='true';});
+    var n=tabs[(i+(e.key==='ArrowRight'?1:tabs.length-1))%tabs.length]; n.focus(); n.click();
+  });
+  document.querySelectorAll('[data-go]').forEach(function(c){c.addEventListener('click',function(){openTab(c.getAttribute('data-go'),true);});});
+  window.addEventListener('hashchange',function(){openTab((location.hash||'').replace('#',''),false);});
+  openTab((location.hash||'').replace('#',''),false);
+
+  document.querySelectorAll('[data-seg]').forEach(function(b){b.addEventListener('click',function(){
+    document.querySelectorAll('[data-seg]').forEach(function(x){x.setAttribute('aria-selected',x===b?'true':'false');});
+    document.querySelectorAll('[data-segpanel]').forEach(function(p){p.hidden=p.getAttribute('data-segpanel')!==b.getAttribute('data-seg');});
+  });});
+
+  document.querySelectorAll('[data-copy]').forEach(function(b){b.addEventListener('click',function(){
+    var t=b.getAttribute('data-copy'), label=b.textContent;
+    function done(){b.textContent='Copied';setTimeout(function(){b.textContent=label;},1400);}
+    function fallback(){var el=b.previousElementSibling;var r=document.createRange();r.selectNodeContents(el);var s=getSelection();s.removeAllRanges();s.addRange(r);b.textContent='Press Ctrl+C';}
+    try{navigator.clipboard.writeText(t).then(done,fallback);}catch(e){fallback();}
+  });});
+})();
+</script>
+</body>
+</html>

@@ -6,6 +6,22 @@ CodeCortex is a **local-first developer-intelligence layer for coding agents**. 
 
 **Know the code. Remember the journey. Control the work. Prove the result.**
 
+## 📘 Setup & user guide
+
+**[Open the guide →](https://aipeople11.github.io/codecortex/)**  ·  [⬇ Download v0.7.0](https://github.com/aipeople11/codecortex/releases/tag/v0.7.0)
+
+| I want to… | Go to |
+|---|---|
+| Understand what CodeCortex does and where it saves tokens | [Start here](https://aipeople11.github.io/codecortex/#start) |
+| Install it for Claude Desktop, Claude Code or another AI tool | [Install](https://aipeople11.github.io/codecortex/#install) |
+| Check it works in five minutes | [Test](https://aipeople11.github.io/codecortex/#test) |
+| Understand a dashboard page (Overview, Tokens & cost, Graph, Memories, Profile, Health…) | [Dashboard pages](https://aipeople11.github.io/codecortex/#dashboard) |
+| Use project memory, token tracking or several projects | [Memory · Tokens · Projects](https://aipeople11.github.io/codecortex/#features) |
+| Fix something that looks wrong | [Troubleshooting](https://aipeople11.github.io/codecortex/#help) |
+| See what changed in this release | [What's new](https://aipeople11.github.io/codecortex/#changes) |
+
+<sub>The guide's source is [`docs/index.html`](docs/index.html). Created by Saurabh Verma; contributions by Hafeez Izaz.</sub>
+
 ## Understand CodeCortex in the UI
 
 The Developer Console includes a **How it works** page that explains the local-first MCP architecture, evidence sources, North-Star outcomes, and graph node meanings for non-technical and technical users.
