@@ -70,7 +70,7 @@
     return alerts.sort((a,b)=>b.ts-a.ts).slice(0,40);
   }
 
-  function card(label,value,source,sub){ return `<article><span>${esc(label)}</span><b>${esc(value)}</b><small class="metric-source">${esc(source)}${sub?' · '+esc(sub):''}</small></article>`; }
+  function card(label,value,source,sub){ return `<article><span>${esc(label)}</span><b${String(value).length>12?' class="long"':''}>${esc(value)}</b><small class="metric-source">${esc(source)}${sub?' · '+esc(sub):''}</small></article>`; }
 
   function render(){
     if(typeof contextEvents!=='function')return;

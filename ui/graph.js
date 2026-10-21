@@ -508,5 +508,14 @@
   function activate(){ensureDom();resizeCanvas();wake();}
   function zoom(dir){const factor=dir>0?1.18:.85;sim.zoom=Math.max(.25,Math.min(3.5,sim.zoom*factor));renderGraph();}
 
-  window.CodeCortexGraph={update,activate,recenter,zoom};
+  // Read-only view of the current graph for the optional 3D view (see local.js). Selection goes through select().
+  function data(){
+    return{nodes:sim.nodes,edges:sim.edges,byId:sim.byId,visible,colorFor,glyphFor,short,
+      edgeColor:t=>EDGE_COLORS[t]||'#7890A4',
+      get selected(){return sim.selected;},
+      select(n){sim.selected=n;renderSidebar();renderGraph();},
+      showTooltip};
+  }
+
+  window.CodeCortexGraph={update,activate,recenter,zoom,data};
 })();

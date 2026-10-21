@@ -236,6 +236,15 @@ jobs:
           python3 scripts/build_mcpb.py --binary build/codecortex --ui ui --skills skills --hooks hooks \
             --version "$version" --platform darwin --out "dist/${asset}.mcpb"
           ( cd dist && shasum -a 256 "${asset}.mcpb" > "${asset}.mcpb.sha256" )
+          # Unpacked-extension download for Mac, matching the Windows zip: when Claude Desktop's Install button
+          # stays grey, users pick this folder in Settings > Extensions > Advanced > Install unpacked extension.
+          # It is the .mcpb's own contents (manifest.json at the root), so both installs are identical.
+          ext="${asset}-extension"
+          rm -rf "dist/${ext}" && mkdir -p "dist/${ext}"
+          unzip -q "dist/${asset}.mcpb" -d "dist/${ext}"
+          test -f "dist/${ext}/manifest.json" || { echo "manifest.json missing from the .mcpb" >&2; exit 1; }
+          find "dist/${ext}" -type f -name codecortex -exec chmod +x {} +
+          ( cd dist && ditto -c -k --keepParent "${ext}" "${ext}.zip" && shasum -a 256 "${ext}.zip" > "${ext}.zip.sha256" )
 
       - uses: actions/upload-artifact@v4
         with:
@@ -252,6 +261,8 @@ jobs:
           path: |
             dist/${{ steps.package.outputs.asset }}.mcpb
             dist/${{ steps.package.outputs.asset }}.mcpb.sha256
+            dist/${{ steps.package.outputs.asset }}-extension.zip
+            dist/${{ steps.package.outputs.asset }}-extension.zip.sha256
           if-no-files-found: error
 
   # ─── windows-x64: the first prebuilt Windows download ──────────────────────────────────────────────────

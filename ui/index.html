@@ -9,27 +9,34 @@
 </head>
 <body>
   <header class="topbar">
+    <button type="button" id="navToggle" class="navtoggle no-simple" aria-label="Collapse or expand the sidebar" aria-controls="nav" aria-expanded="true" title="Collapse / expand menu"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg></button>
     <div class="brand"><img src="/codecortex-logo-header.png" alt="CodeCortex" class="brand-logo" /><span class="sub">Developer Intelligence Console</span></div>
-    <div class="context-bar"><label>Project <select id="projectContext" class="context-select"></select></label><span id="repoContext" class="context-meta">repository —</span><span id="sessionContext" class="context-meta">session —</span><div id="healthPill" class="pill">checking…</div></div>
+    <div class="context-bar"><label>Project <select id="projectContext" class="context-select"></select></label><span id="repoContext" class="context-meta">repository —</span><span id="sessionContext" class="context-meta">session —</span><div id="healthPill" class="pill">checking…</div><div class="viewmode no-simple" role="group" aria-label="Wording"><button type="button" data-mode="detailed" title="Technical wording">Detailed</button><button type="button" data-mode="simple" title="Plain-language wording">Simple</button></div><button type="button" id="themeToggle" class="themebtn no-simple" aria-label="Switch between light and dark theme" title="Light / dark theme">◐</button></div>
   </header>
-  <nav id="nav">
-    <button data-view="start">Get started</button>
-    <button data-view="overview" class="active">Overview</button>
-    <button data-view="how-it-works">How it works</button>
-    <button data-view="usage">Tokens &amp; cost</button>
-    <button data-view="graph">Graph</button>
-    <button data-view="sessions">Sessions</button>
-    <button data-view="memories">Memories</button>
-    <button data-view="lessons">Lessons</button>
-    <button data-view="actions">Actions</button>
-    <button data-view="crystals">Crystals</button>
-    <button data-view="timeline">Timeline</button>
-    <button data-view="audit">Audit</button>
-    <button data-view="activity">Activity</button>
-    <button data-view="profile">Profile</button>
-    <button data-view="replay">Replay</button>
-    <button data-view="health">Health</button>
+  <nav id="nav" aria-label="Sections">
+    <div class="nav-label">Start</div>
+    <button data-view="start"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 22V4M5 4h12l-2 4 2 4H5"/></svg><span class="lb">Get started</span></button>
+    <button data-view="overview" class="active"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3h8v8H3zM13 3h8v5h-8zM13 11h8v10h-8zM3 14h8v7H3z"/></svg><span class="lb">Overview</span></button>
+    <button data-view="how-it-works"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9.5"/><path d="M12 16v-4.5M12 8h.01"/></svg><span class="lb">How it works</span></button>
+    <div class="nav-label">Work</div>
+    <button data-view="usage"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 21V11M12 21V3M19 21v-7"/></svg><span class="lb">Tokens &amp; cost</span></button>
+    <button data-view="graph"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="6" cy="12" r="2.6"/><circle cx="18" cy="6" r="2.6"/><circle cx="18" cy="18" r="2.6"/><path d="M8.3 10.8l7.4-3.6M8.3 13.2l7.4 3.6"/></svg><span class="lb">Graph</span></button>
+    <button data-view="sessions"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l9 5-9 5-9-5zM3 13l9 5 9-5"/></svg><span class="lb">Sessions</span></button>
+    <button data-view="timeline"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9.5"/><path d="M12 7v5l3 2"/></svg><span class="lb">Timeline</span></button>
+    <button data-view="replay"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9.5"/><path d="M10 8.5v7l6-3.5z"/></svg><span class="lb">Replay</span></button>
+    <div class="nav-label">Memory</div>
+    <button data-view="memories"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h12v18l-6-4-6 4z"/></svg><span class="lb">Memories</span></button>
+    <button data-view="lessons"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18h6M10 22h4M12 2a6 6 0 00-4 10.5V15h8v-2.5A6 6 0 0012 2z"/></svg><span class="lb">Lessons</span></button>
+    <button data-view="actions"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h16v16H4zM8 12l3 3 5-6"/></svg><span class="lb">Actions</span></button>
+    <button data-view="crystals"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h12l4 6-10 12L2 9zM2 9h20"/></svg><span class="lb">Crystals</span></button>
+    <div class="nav-label">System</div>
+    <button data-view="health"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg><span class="lb">Health</span></button>
+    <button data-view="audit"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6zM9 12l2 2 4-4"/></svg><span class="lb">Audit</span></button>
+    <button data-view="activity"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg><span class="lb">Activity</span></button>
+    <button data-view="profile"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 4-6 8-6s8 2 8 6"/></svg><span class="lb">Profile</span></button>
+    <div class="nav-more" id="navMoreToggle" role="button" tabindex="0" aria-expanded="false" title="More pages"><svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.2"/><circle cx="12" cy="12" r="1.2"/><circle cx="19" cy="12" r="1.2"/></svg><span class="lb">More</span><svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg></div>
   </nav>
+  <div id="navScrim" class="nav-scrim"></div>
   <main>
     <section id="start" class="view">
       <div class="section-head"><div><div class="eyebrow">GET STARTED</div><h2>Is CodeCortex set up? Check the list below.</h2></div><span class="truth-label">Updates live</span></div>

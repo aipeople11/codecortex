@@ -357,6 +357,7 @@ async function renderAll(){
   renderContext();
   if(window.CodeCortexTokens)window.CodeCortexTokens.render();
   if(window.CodeCortexStart)window.CodeCortexStart.render();
+  if(window.CodeCortexViz)window.CodeCortexViz.render();
   if(window.CodeCortexGraph)window.CodeCortexGraph.update(contextEvents(),{projectId:state.activeProject,root:state.activeRoot});
 }
 async function load(forceMemory=false){
