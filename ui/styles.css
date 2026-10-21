@@ -192,11 +192,8 @@ body.nav-collapsed nav#nav .nav-label{font-size:0;height:1px;margin:10px 12px;ba
 .eyebrow{display:inline-block;padding:3px 10px;border-radius:999px;background:var(--rd-accent-soft)}
 @keyframes cc-rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
 @media (prefers-reduced-motion:no-preference){
-  .view.active{animation:cc-rise .38s cubic-bezier(.2,.8,.2,1) both}
-  .view.active .metrics article{animation:cc-rise .45s cubic-bezier(.2,.8,.2,1) both}
-  .view.active .metrics article:nth-child(2){animation-delay:.04s}.view.active .metrics article:nth-child(3){animation-delay:.08s}.view.active .metrics article:nth-child(4){animation-delay:.12s}.view.active .metrics article:nth-child(n+5){animation-delay:.16s}
-  .view.active .viz-grid .panel{animation:cc-rise .5s cubic-bezier(.2,.8,.2,1) both}
-  .view.active .viz-grid .panel:nth-child(2){animation-delay:.06s}.view.active .viz-grid .panel:nth-child(3){animation-delay:.12s}.view.active .viz-grid .panel:nth-child(4){animation-delay:.18s}
+  /* Only when the user switches page (.entering is added for 0.6 s), never on the 1.5 s data refresh. */
+  .view.entering{animation:cc-rise .32s cubic-bezier(.2,.8,.2,1)}
 }
 @media (prefers-reduced-motion:reduce){body,.panel,.metrics article,nav#nav button,nav#nav .lb{transition:none}}
 @media(max-width:900px){
@@ -314,8 +311,5 @@ nav#nav button{font-size:13.5px;padding:9px 12px;border-radius:10px}
 .viz-grid .panel{padding:20px 22px}
 
 /* Smooth view changes */
-@media (prefers-reduced-motion:no-preference){
-  .view.active{animation:cc-rise .32s cubic-bezier(.2,.8,.2,1) both}
-}
 @media(max-width:900px){main{padding:20px 16px 56px}.panel{padding:18px}}
 }

@@ -191,9 +191,10 @@
           if(out!==src){ orig.set(t,{src:src,applied:out}); t.data=out; } else if(o){ orig.delete(t); }
         } else if(o){ if(t.data===o.applied)t.data=o.src; orig.delete(t); }
       });
-      document.querySelectorAll('.simple-intro').forEach(e=>e.remove());
-      if(simple)document.querySelectorAll('main > section.view').forEach(s=>{
-        const msg=INTRO[s.id]; if(!msg)return; const p=document.createElement('p'); p.className='simple-intro no-simple'; p.textContent=msg; s.insertBefore(p,s.firstChild);
+      if(!simple) document.querySelectorAll('.simple-intro').forEach(e=>e.remove());
+      else document.querySelectorAll('main > section.view').forEach(s=>{
+        const msg=INTRO[s.id]; if(!msg||s.querySelector(':scope > .simple-intro'))return;   // add once, never re-create
+        const p=document.createElement('p'); p.className='simple-intro no-simple'; p.textContent=msg; s.insertBefore(p,s.firstChild);
       });
     } finally { if(obs)obs.takeRecords(); busy=false; }
   }
@@ -233,8 +234,9 @@
     };
     Object.keys(series).forEach(id=>{
       const el=$(id), card=el&&el.closest('article'); if(!card)return;
-      const old=card.querySelector('.vz-spark'); if(old)old.remove();
-      card.insertAdjacentHTML('beforeend',spark(runs.map(series[id])));
+      const svg=spark(runs.map(series[id])); if(card.dataset.spark===svg)return;   // unchanged: leave it alone
+      card.dataset.spark=svg; const old=card.querySelector('.vz-spark'); if(old)old.remove();
+      card.insertAdjacentHTML('beforeend',svg);
     });
   }
   function areaChart(ev){
@@ -289,9 +291,10 @@
       const a=answers.reduce((x,e)=>x+n(e.est_tokens),0), v=answers.reduce((x,e)=>x+n(e.avoided_tokens_est),0);
       tokPanel=`<article class="panel"><h2>What CodeCortex saved</h2><p class="muted">Estimates. Your AI app does not share usage here.</p>`+(answers.length?barChart([['Answers CodeCortex gave',a],['Reading those files fully',v]]):'<div class="empty">Savings appear once your AI uses CodeCortex.</div>')+`</article>`;
     }
-    host.innerHTML=`<article class="panel"><h2>Activity over time</h2><p class="muted">Events recorded in this project</p>${areaChart(ev)}</article>`+
+    const html=`<article class="panel"><h2>Activity over time</h2><p class="muted">Events recorded in this project</p>${areaChart(ev)}</article>`+
       `<article class="panel"><h2>What happened</h2><p class="muted">Count of each kind of step</p>${barChart([['Tool calls',count('tool_call')],['Files read',count('file_read')],['Searches',count('search')],['Edits',count('edit')],['Tests',count('test')],['Memory recalls',count('memory_recall')],['CodeCortex answers',answers.length]])}</article>`+
       tokPanel+`<article class="panel"><h2>Latest activity</h2>${feed(ev)}</article>`;
+    if(host.dataset.sig!==html){ host.dataset.sig=html; host.innerHTML=html; }   // redraw only when data changed
     tiles();
   }
   window.CodeCortexViz={render};
@@ -451,6 +454,11 @@
     sync();
   });
   const nav=document.getElementById('nav'), more=document.getElementById('navMoreToggle');
+  if(nav&&!matchMedia('(prefers-reduced-motion: reduce)').matches){
+    nav.addEventListener('click',e=>{ const btn=e.target.closest('button[data-view]'); if(!btn)return;
+      requestAnimationFrame(()=>{ const v=document.getElementById(btn.dataset.view); if(!v)return;
+        v.classList.remove('entering'); void v.offsetWidth; v.classList.add('entering'); setTimeout(()=>v.classList.remove('entering'),600); }); });
+  }
   if(more&&nav){
     const setMore=o=>{nav.classList.toggle('more-open',o);more.setAttribute('aria-expanded',String(o));try{localStorage.setItem('codecortex.navmore',o?'1':'0');}catch(e){}};
     let o=false; try{o=localStorage.getItem('codecortex.navmore')==='1';}catch(e){}
