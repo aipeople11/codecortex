@@ -27,6 +27,8 @@
   function totalTokens(e){ const t=tokensOf(e); return t.input+t.output+t.cacheRead+t.cacheWrite; }
   // USD for one token_usage event, or null when the model is not in the price table.
   function costOf(e){
+    // Claude Code's own cost for the request (OpenTelemetry) beats any estimate from our price table.
+    if(Number.isFinite(e.cost_usd_micros)&&e.cost_usd_micros>=0)return e.cost_usd_micros/1e6;
     const m=priceFor(e.model); if(!m)return null;
     const rate=(String(e.detail||'').includes('tier=long_prompt')&&m.long_prompt)?Object.assign({},m,m.long_prompt):m;
     const t=tokensOf(e), unit=Number(pricing.unit_tokens)||1e6;
@@ -72,10 +74,47 @@
 
   function card(label,value,source,sub){ return `<article><span>${esc(label)}</span><b${String(value).length>12?' class="long"':''}>${esc(value)}</b><small class="metric-source">${esc(source)}${sub?' · '+esc(sub):''}</small></article>`; }
 
+  // Once exact OpenTelemetry usage is arriving, the older transcript-based usage for the same period would
+  // count the same requests twice, so it is left out from the first OpenTelemetry event onwards.
+  function withoutDoubleCount(list){
+    const isOtel=e=>String(e.detail||'')==='claude_code_otel';
+    const first=list.filter(e=>e.type==='token_usage'&&isOtel(e)).reduce((m,e)=>Math.min(m,e.ts_ms||Infinity),Infinity);
+    if(!Number.isFinite(first))return list;
+    return list.filter(e=>!(e.type==='token_usage'&&String(e.detail||'').startsWith('claude_code_transcript')&&(e.ts_ms||0)>=first));
+  }
+
+  // ---- "Exact usage" card: one-click turn on/off for the local OpenTelemetry receiver ----
+  let otel=null, otelSig='', otelBusy=false;
+  function otelRefresh(){
+    fetch('/api/otel',{cache:'no-store'}).then(r=>r.ok?r.json():null).then(j=>{ otel=j; drawOtel(); }).catch(()=>{});
+  }
+  function otelAct(kind){
+    if(otelBusy)return; otelBusy=true; drawOtel(true);
+    fetch('/api/otel/'+kind,{method:'POST',headers:{'X-CodeCortex':'1'}}).then(r=>r.json()).then(j=>{ otel=j; }).catch(()=>{ otel=Object.assign({},otel||{},{ok:false,message:'Could not reach CodeCortex.'}); })
+      .finally(()=>{ otelBusy=false; drawOtel(); });
+  }
+  function drawOtel(force){
+    const host=$('otelCard'); if(!host||!otel)return;
+    const sig=JSON.stringify(otel)+otelBusy; if(sig===otelSig&&!force)return; otelSig=sig;
+    const o=otel;
+    let status, body, button='';
+    if(o.managed){ status='Managed by your organisation'; body='Claude Code’s telemetry settings are controlled by IT, so CodeCortex will not change them.'; }
+    else if(o.events>0){ status='Receiving'; body=`${fmtInt(o.events)} request(s) recorded with Claude Code’s own token counts and cost. Last: ${esc(fmtTime(o.last_event_ms))}.`; button='off'; }
+    else if(o.enabled&&o.configured){ status='On, waiting for Claude Code'; body='Reopen Claude Code once, then send a message. Usage will appear here.'; button='off'; }
+    else if(o.conflict){ status='Needs attention'; body=esc(o.conflict); }
+    else { status='Off'; body='Get the exact tokens and cost that Claude Code itself reports for every request, instead of estimates. Everything stays on this computer: nothing is sent anywhere, and your prompts and code are never stored.'; button='on'; }
+    host.innerHTML=`<div class="truth-note otel-card"><b>Exact usage from Claude Code</b> <span class="muted">· ${esc(status)}</span><br>${body}${o.message?`<br><small class="muted">${esc(o.message)}</small>`:''}`+
+      (button==='on'?`<br><button type="button" class="primary" data-otel="enable"${otelBusy?' disabled':''}>Turn on</button>`:'')+
+      (button==='off'?`<br><button type="button" data-otel="disable"${otelBusy?' disabled':''}>Turn off</button>`:'')+`</div>`;
+  }
+  document.addEventListener('click',ev=>{ const b=ev.target.closest&&ev.target.closest('[data-otel]'); if(b)otelAct(b.getAttribute('data-otel')); });
+  setInterval(otelRefresh,4000); otelRefresh();
+
   function render(){
     if(typeof contextEvents!=='function')return;
     loadPricing();
-    const ev=contextEvents();
+    const ev=withoutDoubleCount(contextEvents());
+    if(!$('otelCard')&&$('usageCards')){ const d=document.createElement('div'); d.id='otelCard'; $('usageCards').parentNode.insertBefore(d,$('usageCards')); drawOtel(true); }
     const usage=ev.filter(e=>e.type==='token_usage'), answers=ev.filter(e=>e.type==='context_returned');
     const turns=promptTurns(ev), cost=sumCost(usage);
     const hostTotal=usage.reduce((s,e)=>s+totalTokens(e),0);
@@ -93,7 +132,9 @@
     const view=$('usage'); if(!view)return;
     $('usageCards').innerHTML=[
       card('Conversation tokens',usage.length?fmtInt(hostTotal):'Not reported by host','HOST-REPORTED',usage.length?`${turns.length} prompt(s)`:'Claude Code only'),
-      card('Estimated cost',usage.length?fmtUsd(cost.unknown&&!cost.total?null:cost.total)+(cost.unknown?' +':''):'—','ESTIMATE',pricing?`list price · ${pricing.retrieved||''}`:'price table loading'),
+      usage.some(e=>Number.isFinite(e.cost_usd_micros)&&e.cost_usd_micros>=0)
+        ? card('Reported cost',fmtUsd(cost.total)+(cost.unknown?' +':''),'HOST-REPORTED','as Claude Code reports it; older requests use list price')
+        : card('Estimated cost',usage.length?fmtUsd(cost.unknown&&!cost.total?null:cost.total)+(cost.unknown?' +':''):'—','ESTIMATE',pricing?`list price · ${pricing.retrieved||''}`:'price table loading'),
       card('CodeCortex answers',answers.length?fmtInt(ccxTotal):'—','DERIVED',`${answers.length} answer(s)`),
       card('File reads avoided',avoided?'~'+fmtInt(avoided):'—','DERIVED','size of the files those answers covered'),
       card('Repeats not resent',repeatSaved?'~'+fmtInt(repeatSaved):'0','DERIVED','identical answers skipped'),

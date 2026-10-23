@@ -78,6 +78,10 @@ struct Event
     std::int64_t cacheWrite5mTokens = -1;
     std::int64_t cacheWrite1hTokens = -1;
     std::int64_t requestCount = -1;          // API requests folded into this TokenUsage event
+    // OpenTelemetry (host-reported by Claude Code through the local OTLP receiver). -1 / empty = not reported.
+    std::int64_t costUsdMicros = -1;         // cost of this request as Claude Code reports it, in millionths of a US dollar
+    std::string requestId;                   // API request id: dedupe against the transcript reader, correlation
+    std::string promptId;                    // groups every event of one user prompt
     // ContextReturned: CodeCortex's OWN answer. estTokens is an ESTIMATE (bytes / rate, or the answer's own
     // est_tokens= header); avoidedTokensEst is the estimated size of the files the answer covers, i.e. what
     // reading them whole would have cost. Both are labelled "derived" — never mixed with host-reported counts.

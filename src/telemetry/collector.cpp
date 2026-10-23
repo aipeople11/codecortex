@@ -134,6 +134,9 @@ std::string serialize( const Event& event )
     if( event.cacheWrite5mTokens >= 0 ) out += ",\"cache_write_5m_tokens\":" + std::to_string( event.cacheWrite5mTokens );
     if( event.cacheWrite1hTokens >= 0 ) out += ",\"cache_write_1h_tokens\":" + std::to_string( event.cacheWrite1hTokens );
     if( event.requestCount >= 0 ) out += ",\"requests\":" + std::to_string( event.requestCount );
+    if( event.costUsdMicros >= 0 ) out += ",\"cost_usd_micros\":" + std::to_string( event.costUsdMicros );
+    if( !event.requestId.empty() ) { out += ",\"request_id\":"; out += jsonString( event.requestId ); }
+    if( !event.promptId.empty() ) { out += ",\"prompt_id\":"; out += jsonString( event.promptId ); }
     if( event.responseBytes >= 0 ) out += ",\"response_bytes\":" + std::to_string( event.responseBytes );
     if( event.estTokens >= 0 ) out += ",\"est_tokens\":" + std::to_string( event.estTokens );
     if( event.avoidedTokensEst >= 0 ) out += ",\"avoided_tokens_est\":" + std::to_string( event.avoidedTokensEst );

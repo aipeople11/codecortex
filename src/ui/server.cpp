@@ -10,6 +10,7 @@
 #include "enterprise/edition.h"
 #include "evidence/evidence_service.h"
 #include "infra/jsonesc.h"
+#include "otel_setup.h"
 
 #include <array>
 #include <cerrno>
@@ -439,7 +440,33 @@ int runServer( const ServerConfig& cfg )
         }
         const ParsedRequest parsed = parseRequestLine( req );
         const std::string& target = parsed.target;
-        if( target.empty() || parsed.method != "GET" ) respond( fd, "400 Bad Request", "text/plain; charset=utf-8", "bad request\n" );
+        if( target.empty() ) respond( fd, "400 Bad Request", "text/plain; charset=utf-8", "bad request\n" );
+        else if( parsed.method == "GET" && target == "/api/otel" )
+            respond( fd, "200 OK", "application/json; charset=utf-8", rw::otelsetup::statusJson() );
+        else if( parsed.method == "POST" && ( target == "/api/otel/enable" || target == "/api/otel/disable" ) )
+        {
+            // A change to Claude Code's settings: only from our own dashboard page. A custom header cannot be sent
+            // cross-site without a preflight (which this server never answers), the Host check blocks DNS rebinding,
+            // and a foreign Origin is refused.
+            std::string lowered = req;
+            for( char& c : lowered ) if( c >= 'A' && c <= 'Z' ) c = static_cast<char>( c - 'A' + 'a' );
+            const bool hostOk = lowered.find( "\r\nhost: 127.0.0.1" ) != std::string::npos || lowered.find( "\r\nhost: localhost" ) != std::string::npos;
+            const auto originAt = lowered.find( "\r\norigin:" );
+            bool originOk = true;
+            if( originAt != std::string::npos )
+            {
+                const auto lineEnd = lowered.find( "\r\n", originAt + 2 );
+                const std::string originLine = lowered.substr( originAt, lineEnd == std::string::npos ? std::string::npos : lineEnd - originAt );
+                originOk = originLine.find( "://127.0.0.1" ) != std::string::npos || originLine.find( "://localhost" ) != std::string::npos;
+            }
+            const bool headerOk = lowered.find( "\r\nx-codecortex: 1" ) != std::string::npos;
+            if( !hostOk || !originOk || !headerOk )
+                respond( fd, "403 Forbidden", "application/json; charset=utf-8", "{\"ok\":false,\"message\":\"Not allowed from this page.\"}" );
+            else
+                respond( fd, "200 OK", "application/json; charset=utf-8",
+                         target == "/api/otel/enable" ? rw::otelsetup::enable( cfg.telemetryPath ) : rw::otelsetup::disable() );
+        }
+        else if( parsed.method != "GET" ) respond( fd, "400 Bad Request", "text/plain; charset=utf-8", "bad request\n" );
         else if( target == "/api/health" ) respond( fd, "200 OK", "application/json; charset=utf-8", healthJson( cfg ) );
         else if( target == "/api/telemetry" ) respond( fd, "200 OK", "application/json; charset=utf-8", telemetryJson( cfg.telemetryPath ) );
         else if( target == "/api/evidence" )

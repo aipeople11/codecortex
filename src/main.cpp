@@ -49,7 +49,8 @@
 #include "codecortex_mcp_bridge.h"
 #include "compactlegend.h"         // P1 (L7): the --legend=compact dialect layer for every XML verb (runWithCompactLegend)
 #include "mcpserver.h"             // the optional remote MCP transport (--listen), picked below
-#include "telemetry/collector.h"      // CodeCortex invocation/tool telemetry
+#include "telemetry/collector.h"
+#include "telemetry/otlp_receiver.h"      // CodeCortex invocation/tool telemetry
 #include "ui/server.h"                // CodeCortex Developer Console
 #include "editplan.h"              // CLI-first versioned multi-edit transactions
 #include "wrap.h"
@@ -4206,6 +4207,11 @@ static int dispatchMain( const rw::Config& cfg, char** argv )
 
     if( cfg.mcp )
     {
+        // Optional, OFF by default: local-only OpenTelemetry receiver (CODECORTEX_OTLP=1 or ~/.codecortex/otlp.enabled).
+        if( rw::telemetry::otlp::enabledByEnvOrMarker() )
+        {
+            rw::telemetry::otlp::startOnce( std::string( makeUiConfig().telemetryPath ) );
+        }
         if( cfg.mcpUi )
         {
             rw::ui::ServerConfig uc = makeUiConfig();
