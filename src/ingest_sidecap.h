@@ -1216,11 +1216,72 @@ struct MemberMacroReparse
 // macroreparse::adoptsReparse says it holds strictly fewer error bytes. The returned health then describes the ADOPTED
 // tree (errNodes/errBytes measured on it, wsBytes on the original bytes) and carries macroBlanked; otherwise it is the
 // first parse's, byte for byte what measureFileHealth always returned. A clean first parse pays one comparison.
+// JSX WIDE-ENTITY RE-PARSE. The JavaScript/TypeScript grammars accept a numeric character reference of at most 5
+// decimal digits, so valid text such as `<h1>&#129504; Title</h1>` (an emoji, code point above 65535, 6 digits) is
+// not an entity to them and the parse of the WHOLE component collapses into error nodes (one real file measured
+// err_ratio 0.586), after which the component and its functions are not found. Same recipe as the member-macro
+// re-parse: blank each such reference with spaces (same length, so every offset and line is unchanged), parse that
+// copy, and adopt it only when it holds STRICTLY FEWER error bytes. Names, spans and bodies still read the original
+// bytes. A clean first parse never reaches this; a file without a 6-7 digit reference returns at the scan.
+inline FileHealth adoptWideEntityReparse( TSParser* parser, std::string_view bytes, TreeGuard& tree, MemberMacroReparse& work,
+                                          const FileHealth& first )
+{
+    work.blanked.assign( bytes );
+    bool any = false;
+    for( std::size_t i = 0; i + 3 < bytes.size(); ++i )
+    {
+        if( bytes[i] != '&' || bytes[i + 1] != '#' )
+        {
+            continue;
+        }
+        std::size_t j = i + 2;
+        while( j < bytes.size() && bytes[j] >= '0' && bytes[j] <= '9' )
+        {
+            ++j;
+        }
+        const std::size_t digits = j - ( i + 2 );
+        if( digits >= 6 && digits <= 7 && j < bytes.size() && bytes[j] == ';' )
+        {
+            for( std::size_t k = i; k <= j; ++k )
+            {
+                work.blanked[k] = ' ';
+            }
+            any = true;
+            i = j;
+        }
+    }
+    if( !any )
+    {
+        return first;
+    }
+    PROFILE_SCOPE_DESCRIBE( "ingest/extractFile: wide-entity re-parse" );
+    TreeGuard second( parseTree( parser, work.blanked ) );
+    if( second.get() == nullptr )
+    {
+        return first;
+    }
+    const FileHealth reparsed = measureFileHealth( ts_tree_root_node( second.get() ), bytes );
+    if( !macroreparse::adoptsReparse( first.errBytes, reparsed.errBytes ) )
+    {
+        return first;
+    }
+    tree = std::move( second );
+    return reparsed;
+}
+
 inline FileHealth measureHealthAdoptingMemberMacroReparse( TSParser* parser, Lang lang, std::string_view bytes, TreeGuard& tree, MemberMacroReparse& work )
 {
     const FileHealth first = measureFileHealth( ts_tree_root_node( tree.get() ), bytes );
     work.spans.clear();
-    if( first.errBytes == 0 || !macroreparse::isMacroReparseLang( lang ) )
+    if( first.errBytes == 0 )
+    {
+        return first;
+    }
+    if( lang == Lang::JavaScript || lang == Lang::TypeScript )
+    {
+        return adoptWideEntityReparse( parser, bytes, tree, work, first );
+    }
+    if( !macroreparse::isMacroReparseLang( lang ) )
     {
         return first;
     }

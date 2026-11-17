@@ -53,17 +53,21 @@ inline constexpr std::uint32_t kNoTraceFile = UINT32_MAX;
 // mention-anchor precedent, src/mention.h) — first ascending fileId on a tie. kNoTraceFile ⇒ out of corpus.
 inline std::uint32_t traceMatchFile( const IngestResult& ing, std::string_view rawPath )
 {
-    // split the frame path into whole '/'-components (drop empties so a leading '/' or '//' is harmless)
+    // split the frame path into whole '/'-components (drop empties so a leading '/' or '//' is harmless).
+    // A Windows trace separates components with '\' (C:\proj\src\a.cpp), so '\' splits too: without it the
+    // whole path was one segment that no indexed file matches and every Windows frame was reported
+    // "outside every root".
+    const auto isSep = []( char c ) noexcept { return c == '/' || c == '\\'; };
     std::vector<std::string> segments;
     std::size_t p = 0;
     while( p < rawPath.size() )
     {
-        while( p < rawPath.size() && rawPath[p] == '/' )
+        while( p < rawPath.size() && isSep( rawPath[p] ) )
         {
             ++p;
         }
         const std::size_t s = p;
-        while( p < rawPath.size() && rawPath[p] != '/' )
+        while( p < rawPath.size() && !isSep( rawPath[p] ) )
         {
             ++p;
         }

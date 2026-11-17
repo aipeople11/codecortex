@@ -75,4 +75,5 @@ For a dashboard that stays up independently of an MCP host session, run:
 codecortex dashboard /path/to/repository
 ```
 
-The dashboard remains loopback-only at `http://127.0.0.1:7331`.
+The dashboard remains loopback-only at `http://127.0.0.1:7331`. If another CodeCortex is already running it moves to
+the next free port (7332, 7333, ...): ask the assistant for `codecortex_status` to see the exact address.

@@ -62,4 +62,4 @@ Optional first check in Codex:
 Show CodeCortex status
 ```
 
-Dashboard default: `http://127.0.0.1:7331`.
+Dashboard default: `http://127.0.0.1:7331` (the next free port if that one is taken; `codecortex_status` shows the exact address).

@@ -800,7 +800,12 @@ if(CODECORTEX_TESTS)
   target_link_libraries(codecortex_test_otlp_json PRIVATE doctest::doctest)
   add_test(NAME codecortex.otlp_json COMMAND codecortex_test_otlp_json)
 
-  add_executable(codecortex_test_session_metertest/verify_session_meter.cpp)
+  add_executable(codecortex_test_reflex test/verify_reflex.cpp)
+  target_include_directories(codecortex_test_reflex PRIVATE src/infra third_party src)
+  target_link_libraries(codecortex_test_reflex PRIVATE doctest::doctest)
+  add_test(NAME codecortex.reflex COMMAND codecortex_test_reflex)
+
+  add_executable(codecortex_test_session_meter test/verify_session_meter.cpp)
   target_include_directories(codecortex_test_session_meter PRIVATE src/infra third_party src)
   target_link_libraries(codecortex_test_session_meter PRIVATE doctest::doctest)
   add_test(NAME codecortex.session_meter COMMAND codecortex_test_session_meter)

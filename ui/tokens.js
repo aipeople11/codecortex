@@ -86,7 +86,7 @@
   // ---- "Exact usage" card: one-click turn on/off for the local OpenTelemetry receiver ----
   let otel=null, otelSig='', otelBusy=false;
   function otelRefresh(){
-    fetch('/api/otel',{cache:'no-store'}).then(r=>r.ok?r.json():null).then(j=>{ otel=j; drawOtel(); }).catch(()=>{});
+    fetch('/api/otel',{cache:'no-store'}).then(r=>r.ok?r.json():{unavailable:true}).then(j=>{ otel=j; drawOtel(); }).catch(()=>{ otel={unavailable:true}; drawOtel(); });
   }
   function otelAct(kind){
     if(otelBusy)return; otelBusy=true; drawOtel(true);
@@ -98,7 +98,8 @@
     const sig=JSON.stringify(otel)+otelBusy; if(sig===otelSig&&!force)return; otelSig=sig;
     const o=otel;
     let status, body, button='';
-    if(o.managed){ status='Managed by your organisation'; body='Claude Code’s telemetry settings are controlled by IT, so CodeCortex will not change them.'; }
+    if(o.unavailable){ status='Not in this version'; body='This CodeCortex program is older than this dashboard, so the exact-usage switch cannot work yet. Install the latest CodeCortex build, then reopen this page.'; }
+    else if(o.managed){ status='Managed by your organisation'; body='Claude Code’s telemetry settings are controlled by IT, so CodeCortex will not change them.'; }
     else if(o.events>0){ status='Receiving'; body=`${fmtInt(o.events)} request(s) recorded with Claude Code’s own token counts and cost. Last: ${esc(fmtTime(o.last_event_ms))}.`; button='off'; }
     else if(o.enabled&&o.configured){ status='On, waiting for Claude Code'; body='Reopen Claude Code once, then send a message. Usage will appear here.'; button='off'; }
     else if(o.conflict){ status='Needs attention'; body=esc(o.conflict); }
@@ -110,10 +111,77 @@
   document.addEventListener('click',ev=>{ const b=ev.target.closest&&ev.target.closest('[data-otel]'); if(b)otelAct(b.getAttribute('data-otel')); });
   setInterval(otelRefresh,4000); otelRefresh();
 
+  // ---- Overview headline: what CodeCortex saved, with vs without, in plain words ----
+  let svSig='';
+  function drawSavings(answers){
+    const host=$('overview'); if(!host)return;
+    let box=$('savingsHero');
+    if(!box){ box=document.createElement('div'); box.id='savingsHero'; const first=host.firstElementChild; host.insertBefore(box,first&&first.nextSibling); }
+    let withTok=0, without=0, repeats=0, first=Infinity;
+    answers.forEach(a=>{
+      const est=n(a.est_tokens), avoid=n(a.avoided_tokens_est), m=/tokens_saved=(\d+)/.exec(String(a.detail||''));
+      withTok+=est; without+=Math.max(avoid,est);
+      if(m){ const s=Number(m[1])||0; repeats+=s; without+=s; }
+      if(a.ts_ms)first=Math.min(first,a.ts_ms);
+    });
+    const saved=Math.max(0,without-withTok), pct=without?Math.round(100*saved/without):0;
+    const p=priceFor('claude-sonnet-5-5')||priceFor('claude-sonnet-5'), unit=pricing&&Number(pricing.unit_tokens)||1e6;
+    const usd=p&&saved?saved*p.input/unit:null;
+    const sig=[answers.length,withTok,without,repeats,!!p].join('|'); if(sig===svSig)return; svSig=sig;
+    if(!answers.length){
+      box.innerHTML=`<article class="panel sv-hero"><div class="sv-head"><div class="eyebrow">WHAT CODECORTEX DOES FOR YOU</div><h2>It gives your AI only the part of your code it needs, instead of whole files.</h2><p class="muted">That means fewer tokens used, lower cost and faster answers. This page shows how much it saved. <b>No data yet.</b> Ask your AI something about your code and the numbers appear here within seconds.</p></div>
+        <div class="sv-try"><span>Try asking:</span><code>Where is login handled in this project?</code><code>What would break if I change the main function?</code><code>Find where errors are logged.</code></div></article>`;
+      return;
+    }
+    const w=Math.max(4,Math.round(100*withTok/Math.max(1,without)));
+    box.innerHTML=`<article class="panel sv-hero"><div class="sv-head"><div class="eyebrow">WHAT CODECORTEX SAVED YOU</div><h2>${saved?`About ${esc(fmtInt(saved))} tokens saved (${pct}% less)`:'Answers so far were already small'}${usd!=null?` · ≈ ${esc(fmtUsd(usd))}`:''}</h2>
+      <p class="muted">Instead of reading whole files, your AI asked CodeCortex and got just the relevant code. Based on ${esc(fmtInt(answers.length))} answer(s)${Number.isFinite(first)?` since ${esc(fmtTime(first))}`:''}. These are estimates from file sizes, not billing figures.</p></div>
+      <div class="sv-bars">
+        <div class="sv-row"><span class="sv-label">Without CodeCortex<small>reading the whole files</small></span><div class="sv-track"><i class="sv-bar sv-without" data-w="100"></i></div><b>~${esc(fmtInt(without))}</b></div>
+        <div class="sv-row"><span class="sv-label">With CodeCortex<small>only what was needed</small></span><div class="sv-track"><i class="sv-bar sv-with" data-w="${w}"></i></div><b>~${esc(fmtInt(withTok))}</b></div>
+      </div>${repeats?`<p class="muted sv-note">Includes ~${esc(fmtInt(repeats))} tokens not re-sent because the same answer was already given.</p>`:''}</article>`;
+    // The dashboard's content policy forbids inline styles, so bar widths are applied from script.
+    box.querySelectorAll('[data-w]').forEach(el=>{ el.style.width=el.getAttribute('data-w')+'%'; });
+  }
+
+  // ---- Token categories: input vs output (and the cache parts of input), tokens, share and cost ----
+  let splitSig='';
+  function drawSplit(usage,answers){
+    const view=$('usage'), cards=$('usageCards'); if(!view||!cards)return;
+    let box=$('tokenSplit');
+    if(!box){ box=document.createElement('div'); box.id='tokenSplit'; cards.insertAdjacentElement('afterend',box); }
+    const cats=[
+      {k:'input',name:'Input: new',what:'Fresh text sent to the AI: your question, file contents, tool results.',cls:'vz1',t:0,c:0},
+      {k:'cacheRead',name:'Input: reused (cache read)',what:'Earlier context the AI reused at a big discount.',cls:'vz0',t:0,c:0},
+      {k:'cacheWrite',name:'Input: stored (cache write)',what:'Context saved so the next request can reuse it.',cls:'vz3',t:0,c:0},
+      {k:'output',name:'Output',what:'What the AI wrote back: answers, code, tool calls. Costs the most per token.',cls:'vz2',t:0,c:0}];
+    let priced=true;
+    usage.forEach(e=>{
+      const t=tokensOf(e), m=priceFor(e.model);
+      const rate=m?((String(e.detail||'').includes('tier=long_prompt')&&m.long_prompt)?Object.assign({},m,m.long_prompt):m):null, u=pricing&&Number(pricing.unit_tokens)||1e6;
+      cats[0].t+=t.input; cats[1].t+=t.cacheRead; cats[2].t+=t.cacheWrite; cats[3].t+=t.output;
+      if(rate){ cats[0].c+=t.input*rate.input/u; cats[1].c+=t.cacheRead*rate.cache_read/u; cats[2].c+=t.w5*rate.cache_write_5m/u+t.w1*rate.cache_write_1h/u; cats[3].c+=t.output*rate.output/u; } else priced=false;
+    });
+    const total=cats.reduce((s,c)=>s+c.t,0);
+    const sig=JSON.stringify([cats.map(c=>c.t),answers.length,priced,!!pricing]); if(sig===splitSig)return; splitSig=sig;
+    if(!total){
+      const est=answers.reduce((s,a)=>s+n(a.est_tokens),0);
+      box.innerHTML=`<article class="panel"><h2>Input vs output</h2><p class="muted"><b>Input</b> is what your AI reads. <b>Output</b> is what it writes back.${est?` CodeCortex has sent about <b>~${esc(fmtInt(est))} input tokens</b> (estimate) in ${esc(fmtInt(answers.length))} answer(s).`:''} The exact input/output split for the whole conversation needs <b>Claude Code</b>; Claude Desktop does not share it.</p></article>`;
+      return;
+    }
+    box.innerHTML=`<article class="panel"><h2>Input vs output</h2><p class="muted">Where the tokens went. Input is what the AI reads, output is what it writes.</p>
+      <div class="sv-stack">${cats.filter(c=>c.t).map(c=>`<i class="sv-seg ${c.cls}" data-w="${Math.max(1,Math.round(100*c.t/total))}" title="${esc(c.name)}"></i>`).join('')}</div>
+      <div class="tw"><table class="usage-table"><thead><tr><th>Category</th><th>What it is</th><th>Tokens</th><th>Share</th><th>Cost</th></tr></thead><tbody>`+
+      cats.map(c=>`<tr><td><i class="sv-dot ${c.cls}"></i> ${esc(c.name)}</td><td>${esc(c.what)}</td><td>${esc(fmtInt(c.t))}</td><td>${Math.round(100*c.t/total)}%</td><td>${priced?esc(fmtUsd(c.c)):'—'}</td></tr>`).join('')+
+      `</tbody></table></div></article>`;
+    box.querySelectorAll('[data-w]').forEach(el=>{ el.style.width=el.getAttribute('data-w')+'%'; });
+  }
+
   function render(){
     if(typeof contextEvents!=='function')return;
     loadPricing();
     const ev=withoutDoubleCount(contextEvents());
+    drawSavings(ev.filter(e=>e.type==='context_returned'));
     if(!$('otelCard')&&$('usageCards')){ const d=document.createElement('div'); d.id='otelCard'; $('usageCards').parentNode.insertBefore(d,$('usageCards')); drawOtel(true); }
     const usage=ev.filter(e=>e.type==='token_usage'), answers=ev.filter(e=>e.type==='context_returned');
     const turns=promptTurns(ev), cost=sumCost(usage);
@@ -130,8 +198,9 @@
     }
 
     const view=$('usage'); if(!view)return;
+    drawSplit(usage,answers);
     $('usageCards').innerHTML=[
-      card('Conversation tokens',usage.length?fmtInt(hostTotal):'Not reported by host','HOST-REPORTED',usage.length?`${turns.length} prompt(s)`:'Claude Code only'),
+      card('Conversation tokens',usage.length?fmtInt(hostTotal):'—',usage.length?'HOST-REPORTED':'NEEDS CLAUDE CODE',usage.length?`${turns.length} prompt(s)`:'Claude Desktop does not share usage; Claude Code does'),
       usage.some(e=>Number.isFinite(e.cost_usd_micros)&&e.cost_usd_micros>=0)
         ? card('Reported cost',fmtUsd(cost.total)+(cost.unknown?' +':''),'HOST-REPORTED','as Claude Code reports it; older requests use list price')
         : card('Estimated cost',usage.length?fmtUsd(cost.unknown&&!cost.total?null:cost.total)+(cost.unknown?' +':''):'—','ESTIMATE',pricing?`list price · ${pricing.retrieved||''}`:'price table loading'),

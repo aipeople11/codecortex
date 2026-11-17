@@ -580,6 +580,9 @@ inline std::string whereisText( const std::string& root, const std::string& symb
     if( res.hits.empty() )
     {
         res.nearMiss = didYouMean( getIndex( root ).ing, sel );
+        // A zero over the COMMITTED trees while the working-tree index defines the name = an uncommitted
+        // symbol, not a missing one. Lazy like the near-miss: computed only on the zero.
+        res.workingTreeOnly = !resolveAllByNameQualified( getIndex( root ).ing, sel ).empty();
     }
     return captureXml( [ & ]( std::FILE* f ) { crossref::writeWhereisPage( f, res, maxHits, page.limit, page.offset ); } );
 }
@@ -3712,6 +3715,26 @@ inline std::string mcpNoBaselineMessage( const rw::quality::BaselineSelection& b
 inline QualityDeltaOutcome computeQualityDelta( const std::string& root )
 {
     QualityDeltaOutcome oc;
+
+    // Reject a missing baseline before the expensive ingest/graph build.
+    // A real baseline sidecar must still flow through selectBaseline below:
+    // existence alone does not imply that the sidecar is readable or current.
+    // A HEAD-less repository with an existing sidecar must also retain the
+    // original detailed error semantics (symlink/foreign/stale/unreadable).
+    const std::string earlySidecar = qualityBaselinePath( root );
+    std::error_code earlyEc;
+    const auto earlyStatus = std::filesystem::symlink_status( earlySidecar, earlyEc );
+    const bool earlySidecarPresent = std::filesystem::exists( earlyStatus )
+                                  || std::filesystem::is_symlink( earlyStatus );
+    const bool earlyAbsent = !earlySidecarPresent
+                          && ( !earlyEc || earlyEc == std::errc::no_such_file_or_directory );
+    if( earlyAbsent && rw::quality::gitHeadSha( root ).empty() )
+    {
+        oc.ok = false;
+        oc.errMsg = "no " + std::string( rw::quality::kBaselineFile )
+                  + " and no git HEAD to auto-compare against — run the quality_baseline verb BEFORE the change you want to measure";
+        return oc;
+    }
 
     // rebuild ing/graph from disk with root exactly as invoked → baseline keys match the CLI key-for-key.
     // Phase-M: serialize this working-tree ingest against a concurrent qsnap-prefetch worker (ingest() writes

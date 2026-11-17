@@ -32,6 +32,7 @@
 #include <cstdlib>         // ::realpath — the workspace-pin canonicalization (mcpCanonRoot)
 #include <climits>         // PATH_MAX
 #include "infra/os.h"      // rw::os::getcwd — R2a: the launch-cwd assumed root (resolved once at startup)
+#include "mcp_stdio_quarantine.h" // protocol firewall: suppress accidental handler stdout during stdio dispatch
 
 namespace rw
 {
@@ -2350,7 +2351,9 @@ inline int runMcp( int topK, bool stable = false, bool noRedact = false,
             timingsOn ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const std::uint64_t rebuildAtStart = timingsOn ? mcpRebuildCounter().load( std::memory_order_relaxed ) : 0;
 
+        McpStdoutQuarantine stdoutQuarantine;
         const McpDispatchResult r = dispatchMcpLine( line, topK, stable, noRedact, policy );
+        (void)stdoutQuarantine.finish();
         if( r.isNotification )
         {
             continue;

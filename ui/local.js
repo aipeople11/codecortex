@@ -502,7 +502,7 @@
     activity:['A live feed of what is happening right now.','New lines appear at the top as your AI works.','Keep this open and ask your AI something.','Empty until your AI uses CodeCortex.'],
     profile:['A summary of one project: the files and topics your AI asked about most.','Use the menu to switch project. “Top files” and “Top concepts” show where the attention went.','Ask three or four questions about one project, then open this page.','Empty for a project until you have asked about it.'],
     replay:['Step through a past piece of work like a recording.','Use ▶ to play, ◀ and ▶| to go step by step.','Choose your latest session, then press ▶.','Empty until a piece of work has been recorded.'],
-    health:['Whether each part of CodeCortex is working.','Green = working. Amber = needs a look, but is often normal. For example, Claude Desktop does not share usage data.','The Dashboard, Connection and Code map items should be green.','Amber on “Usage counting” or “Seeing what your AI does” is normal in Claude Desktop.']
+    health:['Whether each part of CodeCortex is working.','Green = working. Amber = needs a look.','The Dashboard, Connection and Code map items should be green.','Optional items (usage counting, seeing what your AI does, the shared memory service) appear here only when your AI app or setup provides them.']
   };
   const LABELS=['What this shows','How to read it','Try it','If it looks empty'];
   function build(id){

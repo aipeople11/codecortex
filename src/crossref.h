@@ -1421,6 +1421,10 @@ struct WhereResult
     //             what tells the reader which of the two zeros they are holding.
     std::string           seedSpec;
     std::string           nearMiss;
+    //   workingTreeOnly  the scan found nothing in any COMMITTED tree, yet the index (built from the working
+    //             tree) defines this exact name: the symbol exists but is uncommitted. whereis reads git trees
+    //             only, so without this note the zero reads as "no such symbol" (reported in testing).
+    bool                  workingTreeOnly = false;
 
     // The --with-history lane: a non-owning view of the caller's oracle index (nullptr ⇒ not asked for) plus
     // THIS symbol's verdict, resolved once at compute time so emission stays a pure print. Views at the seam:
@@ -2231,11 +2235,13 @@ inline void writeWhereisPage( std::FILE* out, const WhereResult& res, std::size_
                        "impact, around, lego and edit_check accept. A file:name spelling is searched as a LITERAL "
                        "string, no tree contains it, and the result is a true but useless hits=\"0\" shaped exactly "
                        "like a name this repo never had. When that is what happened, a selector-note element says so "
-                       "and its retry= is the bare name to re-run with. That element has three reasons, and r= names which: "
+                       "and its retry= is the bare name to re-run with. That element has four reasons, and r= names which: "
                        "qualified-selector (a file:name spelling was searched literally), line-seed (an @FILE:LINE selector "
                        "was RESOLVED to the definition enclosing that line before the scan, so sym= is that definition's "
                        "name and spec= is what you typed), and near-miss (the scan found nothing and the INDEX holds a name "
-                       "one or two edits away — the tree zero is still a measurement, the note only says which zero it is). "
+                       "one or two edits away — the tree zero is still a measurement, the note only says which zero it is), "
+                       "and working-tree-only (the scan found nothing in any committed tree but the working tree defines "
+                       "this exact name, i.e. it is uncommitted; retry= names find_symbol, which reads the working tree). "
                        "Its absence beside hits=\"0\" means the zero "
                        "IS a measurement. "
                        // §B12.2 — the SCOPE of "every ref", stated in the payload. Only the help text said "local".
@@ -2307,6 +2313,13 @@ inline void writeWhereisPage( std::FILE* out, const WhereResult& res, std::size_
     {
         rw::emitTo( out, "<selector-note r=\"near-miss\" spec=\"{}\" retry=\"{}\"/>",
                       ex( res.sym ).c_str(), ex( res.nearMiss ).c_str() );
+    }
+    if( res.hits.empty() && res.workingTreeOnly )
+    {
+        // Same element and attribute names as the notes above (dialect parity); retry= names the verb that
+        // answers for the working tree.
+        rw::emitTo( out, "<selector-note r=\"working-tree-only\" spec=\"{}\" retry=\"find_symbol\"/>",
+                      ex( res.sym ).c_str() );
     }
 
     // The history lane, when it was asked for: what the probe did, then this symbol's own verdict.

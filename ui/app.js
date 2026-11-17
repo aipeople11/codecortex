@@ -25,7 +25,7 @@ function provenanceLabel(source, fallback='OBSERVED'){
 }
 function provenanceClass(label){ return String(label||'not available').toLowerCase().replaceAll('_','-').replaceAll(' ','-'); }
 function provenanceBadge(label){ label=label||'NOT AVAILABLE'; return `<span class="provenance-badge ${provenanceClass(label)}">${esc(label)}</span>`; }
-function setMetricSource(id,label){ const el=$(id); if(el)el.textContent=label||'NOT AVAILABLE'; }
+function setMetricSource(id,label){ const el=$(id); if(el)el.textContent=(!label||label==='NOT AVAILABLE')?'no data yet':label; }
 function runEvidence(events){
   const ev=events||[], tools=ev.filter(e=>e.type==='tool_call'), reads=ev.filter(e=>e.type==='file_read'), searches=ev.filter(e=>e.type==='search');
   const repeatedCount=list=>{const counts=new Map();list.forEach(e=>{const k=String(e.target||'').trim();if(k)counts.set(k,(counts.get(k)||0)+1)});return [...counts.values()].reduce((n,c)=>n+Math.max(0,c-1),0)};
@@ -149,14 +149,14 @@ function renderOverview(){
   ['tokensSource','toolCallsSource','repeatSource','durationSource','currentToolSource','toolFailuresSource'].forEach(id=>setMetricSource(id,'NOT AVAILABLE'));
   if(!run){
     $('runId').textContent='No run telemetry yet';
-    $('tokens').textContent='Not reported by host'; $('toolCalls').textContent='—'; $('repeat').textContent='—'; $('duration').textContent='—'; $('currentTool').textContent='—'; $('toolFailures').textContent='—';
+    $('tokens').textContent='—'; $('toolCalls').textContent='—'; $('repeat').textContent='—'; $('duration').textContent='—'; $('currentTool').textContent='—'; $('toolFailures').textContent='—';
     $('productivitySignal').innerHTML='<div class="empty">Observed productivity signals will appear when run telemetry is available.</div>';
     $('verificationStatus').innerHTML='<div class="empty">Impact, test and proof evidence will appear here.</div>';
   } else {
     $('runId').textContent=run.start.run_id;
     const x=runEvidence(run.events), tokens=x.inputTokens+x.outputTokens, finish=run.events.find(e=>e.type==='run_finished');
     const tokenSource=x.tokenEvents.length?provenanceLabel(x.tokenEvents.slice().reverse().find(e=>e.source)?.source,'PROVIDER-REPORTED'):'NOT AVAILABLE';
-    $('tokens').textContent=x.tokenEvents.length?fmtInt(tokens):'Not reported by host'; setMetricSource('tokensSource',tokenSource);
+    $('tokens').textContent=x.tokenEvents.length?fmtInt(tokens):'—'; setMetricSource('tokensSource',tokenSource);
     $('toolCalls').textContent=String(x.tools.length); setMetricSource('toolCallsSource',x.tools.length?'OBSERVED':'NOT AVAILABLE');
     $('currentTool').textContent=x.tools.length?(x.tools[x.tools.length-1].target||'Observed tool'):(finish?'Run finished':'No tool observed'); setMetricSource('currentToolSource',x.tools.length?'OBSERVED':'NOT AVAILABLE');
     $('toolFailures').textContent=String(x.failures); setMetricSource('toolFailuresSource',x.tools.length?'OBSERVED':'NOT AVAILABLE');
@@ -331,15 +331,18 @@ function renderHealth(){
     ['MCP',dep.mcp_active===true,dep.mcp_active===true?`${dep.mcp_transport||'connected'} · ${dep.mcp_local_only!==false?'local':'non-loopback'}`:'UI-only process'],
     ['Repository graph',state.health.capabilities?.graph===true,'deterministic local code intelligence'],
     ['Telemetry',state.telemetryInfo.available===true,state.telemetryInfo.available===true?(state.telemetryInfo.source||state.health.telemetry||'available'):(state.telemetryInfo.source||state.health.telemetry||'not configured')],
-    ['Host run observation',hostObserved,hostObserved?'host lifecycle/tool events captured':'conditional: host adapter/hooks not reporting'],
-    ['Token telemetry',tokenObserved,tokenObserved?'host/provider reported usage':'not reported by host'],
-    ['CodeCortex Memory',memAvailable(),state.health.memory?.error||'connected'],
+    // The 4th field marks a card OPTIONAL: when it is off, that is expected (the AI app does not share this,
+    // or an optional service is not set up), so the card is not shown at all; it appears once it works.
+    ['Host run observation',hostObserved,hostObserved?'host lifecycle/tool events captured':'conditional: host adapter/hooks not reporting',true],
+    ['Token telemetry',tokenObserved,tokenObserved?'host/provider reported usage':'not reported by host',true],
+    ['CodeCortex Memory',memAvailable(),state.health.memory?.error||'connected',true],
     ['Project',!!state.activeProject,state.health.project_name||state.activeProject||'unknown'],
     ['Repository',!!state.activeRoot,state.activeRoot||state.health.root||'unknown'],
     ['Graph UI',!!window.CodeCortexGraph,'neural graph runtime loaded'],
     ['Run snapshots',localCrystals().length>0,`${localCrystals().length} completed runs`]
   ];
-  $('healthCards').innerHTML=statuses.map(([name,ok,detail])=>`<div class="status-card ${ok?'ok':'warn'}"><span>${esc(name)}</span><strong>${ok?'●':'○'} ${ok?'ready':'attention'}</strong><small>${esc(detail)}</small></div>`).join('');
+  $('healthCards').innerHTML=statuses.filter(([,ok,,optional])=>ok||!optional).map(([name,ok,detail])=>
+    `<div class="status-card ${ok?'ok':'warn'}"><span>${esc(name)}</span><strong>${ok?'●':'○'} ${ok?'ready':'attention'}</strong><small>${esc(detail)}</small></div>`).join('');
   const steps=[
     ['Coding host',hostObserved?'observed':'connected through MCP','Codex / Claude / Gemini / generic MCP host'],
     ['CodeCortex MCP',dep.mcp_active?dep.mcp_transport||'active':'not active in this process','single local intelligence surface'],

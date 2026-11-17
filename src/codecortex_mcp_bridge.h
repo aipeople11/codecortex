@@ -8,6 +8,7 @@
 #include "project_identity.h"
 #include "telemetry/collector.h"
 #include "telemetry/session_meter.h"
+#include "telemetry/reflex.h"
 #include "ui/server.h"
 
 #include <algorithm>
@@ -219,6 +220,29 @@ inline void recordEvent( std::string_view telemetryPath, std::string_view root, 
     e.detail.assign( detail );
     e.success = success;
     c.record( e );
+
+    // The dashboard log above belongs to the folder CodeCortex was started in. When this call is about a different
+    // project folder (the assistant passed its own `path`), also keep a copy in THAT project's .codecortex so each
+    // project carries its own history. Skipped when a log file is pinned by CODECORTEX_TELEMETRY_FILE, when the
+    // folder does not exist (never create a folder at a mistyped path) and when it is the same file.
+    const char* pinned = std::getenv( "CODECORTEX_TELEMETRY_FILE" );
+    if( !( pinned && *pinned ) )
+    {
+        const std::string projectRoot = primaryRoot( root );
+        std::error_code ec;
+        if( !projectRoot.empty() && std::filesystem::is_directory( projectRoot, ec ) )
+        {
+            const std::string mirror = telemetryPathFor( projectRoot );
+            std::error_code same;
+            const bool isSameFile = std::filesystem::exists( mirror, same ) && std::filesystem::exists( std::string( telemetryPath ), same )
+                                    && std::filesystem::equivalent( mirror, std::string( telemetryPath ), same );
+            if( mirror != telemetryPath && !isSameFile )
+            {
+                rw::telemetry::Collector m( mirror );
+                if( m.enabled() ) m.record( e );
+            }
+        }
+    }
 }
 
 inline void finishActiveRun( std::string_view telemetryPath, bool success, std::string_view reason = {} )
@@ -566,8 +590,12 @@ inline McpDispatchResult dispatchCodeCortexMcpLineCore( const std::string& line,
     {
         McpDispatchResult q = dispatchMcpLine( replaceToolName( line, name, "quality_delta" ), topK, stable, noRedact, policy );
         McpDispatchResult s = dispatchMcpLine( replaceToolName( line, name, "situational_awareness" ), topK, stable, noRedact, policy );
-        const std::string qt = mcpdetail::findString( q.resp, "text" );
-        const std::string st = mcpdetail::findString( s.resp, "text" );
+        // A refusal can arrive as a JSON-RPC error (reason under "message") with no "text" at all; without this
+        // fallback the combined answer showed only the section headings and hid the reason.
+        std::string qt = mcpdetail::findString( q.resp, "text" );
+        if( qt.empty() ) qt = mcpdetail::findString( q.resp, "message" );
+        std::string st = mcpdetail::findString( s.resp, "text" );
+        if( st.empty() ) st = mcpdetail::findString( s.resp, "message" );
         const bool ok = q.resp.find( "\"error\"" ) == std::string::npos && s.resp.find( "\"error\"" ) == std::string::npos;
         recordEvent( telemetryPath, effectiveRoot, runId, rw::telemetry::EventType::ProofCheck,
                      "change proof", "analysis_gate_only; test execution must be separately observed", ok );
@@ -677,6 +705,18 @@ inline McpDispatchResult dispatchCodeCortexMcpLine( const std::string& line, int
     }
     meter.answersTokens += answerTokens;
     meter.avoidedTokens += avoided;
+
+    // Runtime reflexes (bench/benchpack): retry storm, no-progress repeats and huge answers get one short corrective
+    // note appended to the result. Advice only: the answer itself is never changed or withheld.
+    if( name != "codecortex_status" )
+    {
+        const bool suppressed = detail.rfind( "repeat_suppressed", 0 ) == 0;
+        if( const auto note = rw::telemetry::reflex::sessionMonitor().afterCall( name, ok, answerTokens, suppressed ) )
+        {
+            const std::string item = "{\"type\":\"text\",\"text\":\"" + mcpdetail::jsonEscape( note->text ) + "\"}";
+            if( appendArrayItem( r.resp, "content", item ) ) detail += " reflex=" + note->code;
+        }
+    }
 
     if( !telemetryPath.empty() && !ctx.activeRunId.empty() && name != "codecortex_status" )
     {
@@ -807,7 +847,9 @@ inline int runCodeCortexMcp( int topK, bool stable, bool noRedact,
             const std::string caps = mcpdetail::findObject( mcpdetail::findObject( line, "params" ), "capabilities" );
             clientHasRoots = caps.find( "\"roots\"" ) != std::string::npos;
         }
+        McpStdoutQuarantine stdoutQuarantine;
         const auto r = dispatchCodeCortexMcpLine( line, topK, stable, noRedact, policy, telemetryPath );
+        (void)stdoutQuarantine.finish();
         if( !r.isNotification )
         {
             std::fputs( r.resp.c_str(), stdout ); std::fputc( '\n', stdout ); std::fflush( stdout );

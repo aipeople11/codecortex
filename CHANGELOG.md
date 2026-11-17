@@ -1,5 +1,27 @@
 # Changelog
 
+## [Unreleased] — contributions by Hafeez Izaz
+
+- **OpenTelemetry (opt-in, local only):** receiver on 127.0.0.1:4318 with a one-click Turn on / Turn off card on
+  the Tokens & cost page; prompts, replies and account ids are dropped on read.
+- **Runtime reflexes:** retry storms, no-progress loops and huge answers add one short corrective note.
+- **Benchmark pack:** 50 failure scenarios in 8 suites (specification; no runner yet).
+- **MCP stdio guard:** stray stdout bytes written during a tool call are held back, so the client only receives
+  valid JSON-RPC.
+- **quality_delta:** with no baseline and no git HEAD it refuses at once instead of after the client's timeout.
+- **from_trace on Windows:** `C:\` paths, drive-letter colons and the MSVC `path(line): error` shape now map to
+  symbols.
+- **JSX/TSX:** a 6-7 digit character reference (for example an emoji `&#129504;`) no longer fails the whole
+  component; kParserVer 120.
+- **Run log per project:** a tool call on a second project folder is also logged in that folder's `.codecortex`.
+- **prove_change:** shows the refusal reason instead of only section headings.
+- **whereis:** a zero over committed trees for a symbol the working tree defines now says
+  `r="working-tree-only"` instead of looking like a missing symbol.
+- **Dashboard status page:** optional items that are off (usage and activity not shared by the AI app, the
+  optional shared memory service) are no longer shown as amber "needs a look"; they appear only when working.
+- **Docs and setup:** dashboard port can move to 7332/7333; `CONNECT_GEMINI_CODEX.bat` registers the build with
+  Gemini CLI and Codex CLI.
+
 ## [0.7.0] — 2026-10-13
 
 - **Windows:** first prebuilt Windows download (zip) and Windows build fixes (Winsock include order, dashboard

@@ -368,11 +368,40 @@ inline std::optional<ParsedFrame> parseNode( std::string_view line )
 inline std::optional<ParsedFrame> parseCompiler( std::string_view line )
 {
     const std::string_view t = trim( line );
-    const std::size_t c1 = t.find( ':' );
+    // A Windows drive letter ("C:\proj\a.cpp:12: error") puts a colon at index 1 that is not the line separator;
+    // searching from index 2 keeps the drive prefix inside the path instead of cutting the path down to "C".
+    const std::size_t colonFrom = ( t.size() >= 3
+                                    && ( ( t[0] >= 'A' && t[0] <= 'Z' ) || ( t[0] >= 'a' && t[0] <= 'z' ) )
+                                    && t[1] == ':' && ( t[2] == '\\' || t[2] == '/' ) ) ? 2 : 0;
+    const std::size_t c1 = t.find( ':', colonFrom );
     if( c1 == std::string_view::npos )
     {
         return std::nullopt;
     }
+
+    // MSVC shape: `path(line): error C2065: ...` or `path(line,col): error ...` (the line sits in parentheses).
+    {
+        const std::string_view head = t.substr( 0, c1 );
+        if( head.size() > 3 && head.back() == ')' )
+        {
+            const std::size_t open = head.rfind( '(' );
+            if( open != std::string_view::npos && open > 0 )
+            {
+                const std::string_view inner = head.substr( open + 1, head.size() - open - 2 );
+                const std::size_t comma = inner.find( ',' );
+                const std::string_view lineDigits = ( comma == std::string_view::npos ) ? inner : inner.substr( 0, comma );
+                if( isDigits( lineDigits ) && looksLikePath( head.substr( 0, open ) ) )
+                {
+                    ParsedFrame msvc;
+                    msvc.format = FrameFormat::Compiler;
+                    msvc.path.assign( head.substr( 0, open ) );
+                    msvc.line = toUint( lineDigits, msvc.lineOverflowed );
+                    return msvc;
+                }
+            }
+        }
+    }
+
     const std::string_view path = t.substr( 0, c1 );
     if( !looksLikePath( path ) )
     {

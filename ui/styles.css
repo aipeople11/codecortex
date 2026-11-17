@@ -161,6 +161,28 @@ svg.vz-chart{display:block;width:100%;height:auto}svg.vz-spark{display:block;wid
 
 /* ===== Modern pass: collapsible icon sidebar, glow, motion ===== */
 :root{--navw:236px}
+/* Overview headline: what CodeCortex saved */
+.sv-hero{margin:0 0 16px;display:grid;gap:14px}
+.sv-hero h2{font-size:clamp(18px,2.4vw,24px);line-height:1.25;margin:4px 0 6px}
+.sv-hero p{margin:0;max-width:78ch}
+.sv-bars{display:grid;gap:10px}
+.sv-row{display:grid;grid-template-columns:minmax(150px,220px) 1fr minmax(90px,auto);gap:12px;align-items:center}
+.sv-label{font-weight:600}.sv-label small{display:block;font-weight:400;color:var(--rd-muted)}
+.sv-track{height:16px;border-radius:99px;background:var(--rd-panel2);border:1px solid var(--rd-line);overflow:hidden}
+.sv-bar{display:block;height:100%;border-radius:99px;width:0;transition:width .5s ease}
+.sv-without{background:var(--vz4)}.sv-with{background:var(--vz0)}
+.sv-row b{text-align:right;font-variant-numeric:tabular-nums}
+.sv-try{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.sv-try span{color:var(--rd-muted)}
+.sv-try code{background:var(--rd-accent-soft);color:var(--rd-accent);padding:4px 10px;border-radius:99px}
+.sv-note{font-size:13px}
+.sv-stack{display:flex;height:18px;border-radius:99px;overflow:hidden;border:1px solid var(--rd-line);background:var(--rd-panel2);margin:10px 0 12px}
+.sv-seg{display:block;height:100%}
+.sv-seg.vz0,.sv-dot.vz0{background:var(--vz0)}.sv-seg.vz1,.sv-dot.vz1{background:var(--vz1)}
+.sv-seg.vz2,.sv-dot.vz2{background:var(--vz2)}.sv-seg.vz3,.sv-dot.vz3{background:var(--vz3)}
+.sv-dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:4px}
+.otel-card button{margin-top:8px}
+@media(max-width:700px){.sv-row{grid-template-columns:1fr auto}.sv-track{grid-column:1/-1;order:3}}
 body{grid-template-columns:var(--navw) minmax(0,1fr);transition:grid-template-columns .28s cubic-bezier(.2,.8,.2,1);background-color:var(--rd-bg);background-image:radial-gradient(900px 420px at 85% -80px,rgba(60,201,186,.13),transparent 70%),radial-gradient(700px 380px at 10% -120px,rgba(115,87,232,.10),transparent 70%);background-repeat:no-repeat}
 body.nav-collapsed{--navw:68px}
 .topbar{justify-content:flex-start;gap:14px;box-shadow:0 1px 0 rgba(60,201,186,.35),0 8px 28px rgba(7,26,43,.25)}
